@@ -37,6 +37,7 @@ public class MatchResult {
     private long matchMillis;
     private double gpxEntriesLength;
     private long gpxEntriesMillis;
+    private List<Tracepoint> tracepoints;
 
     public MatchResult(List<EdgeMatch> edgeMatches) {
         setEdgeMatches(edgeMatches);
@@ -122,5 +123,19 @@ public class MatchResult {
 
     public void setGraph(Graph graph) {
         this.graph = graph;
+    }
+
+    /**
+     * Returns tracepoints with 1:1 correspondence to original input observations.
+     * Similar to OSRM's tracepoints output.
+     *
+     * @return list of tracepoints, one per original input observation
+     */
+    public List<Tracepoint> getTracepoints() {
+        return tracepoints;
+    }
+
+    public void setTracepoints(List<Tracepoint> tracepoints) {
+        this.tracepoints = tracepoints;
     }
 }

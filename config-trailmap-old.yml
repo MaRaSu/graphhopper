@@ -1,0 +1,129 @@
+# Trailmap GraphHopper Configuration
+#
+# This configuration enables Trailmap-specific routing profiles using the
+# GravelScale encoded value for adventure/gravel cycling.
+#
+# GravelScale is computed from multiple OSM tags (surface, tracktype, smoothness,
+# mtb:scale, etc.) into a single difficulty rating for gravel cycling.
+
+graphhopper:
+  # OpenStreetMap input file
+  datareader.file: ""
+
+  # Local folder for graph data
+  graph.location: ../data/graph-cache
+
+  ##### Routing Profiles ####
+
+  profiles:
+    # Standard profiles
+    - name: car
+      custom_model_files: [car.json]
+
+    - name: foot
+      custom_model_files: [foot.json, foot_elevation.json]
+
+    - name: bike
+      custom_model_files: [bike.json, bike_elevation.json]
+
+    # Trailmap Gravel Profile
+    # Uses gravel_scale for unified difficulty assessment
+    - name: gravel
+      custom_model_files: [trailmap_gravel.json, bike_elevation.json]
+
+    # MTB profile (uses GraphHopper's built-in mtb_rating)
+    - name: mtb
+      custom_model_files: [mtb.json, bike_elevation.json]
+
+    # Racing bike profile
+    - name: racingbike
+      custom_model_files: [racingbike.json, bike_elevation.json]
+
+  # Speed mode (CH) - enable for faster routing at cost of flexibility
+  profiles_ch:
+    - profile: car
+
+  # Hybrid mode (LM) - good balance of speed and flexibility
+  profiles_lm: []
+
+  #### Encoded Values ####
+
+  # Include gravel_scale for Trailmap gravel profiles
+  # The gravel_scale encoder combines multiple OSM tags into a unified difficulty scale:
+  # - 0-  : Paved (asphalt, concrete)
+  # - 0   : Well-maintained unpaved (cycleways, grade1)
+  # - 0+  : Good gravel (compacted, fine_gravel, grade2)
+  # - 1   : Standard gravel
+  # - 2   : Rougher gravel
+  # - 3   : Difficult/uncertain
+  # - 4   : Not rideable (walking)
+  # - unknown : Missing data
+  # - ferry : Ferry routes
+
+  graph.encoded_values: |
+    car_access, car_average_speed, country, road_class, roundabout, max_speed,
+    foot_access, foot_average_speed, foot_priority, foot_road_access, hike_rating, average_slope,
+    bike_access, bike_average_speed, bike_priority, bike_road_access, bike_network, mtb_rating, mtb_network,
+    racingbike_access, racingbike_average_speed, racingbike_priority,
+    mtb_access, mtb_average_speed, mtb_priority,
+    gravel_scale, road_environment, surface, smoothness, track_type
+
+  #### Elevation ####
+
+  # Enable elevation for accurate cycling profiles
+  graph.elevation.provider: gmted
+  # graph.elevation.cache_dir: ./srtmprovider/
+
+  #### Subnetworks ####
+
+  prepare.min_network_size: 200
+  prepare.subnetworks.threads: 1
+
+  #### Routing ####
+
+  routing.snap_preventions_default: tunnel, bridge, ferry
+  routing.non_ch.max_waypoint_distance: 1000000
+
+  #### Storage ####
+
+  graph.dataaccess.default_type: RAM_STORE
+
+  # Required parameter - empty means import all highway types
+  import.osm.ignored_highways: ""
+
+# Dropwizard server configuration
+server:
+  application_connectors:
+    - type: http
+      port: 8989
+      bind_host: localhost
+      max_request_header_size: 50k
+  request_log:
+    appenders: []
+  admin_connectors:
+    - type: http
+      port: 8990
+      bind_host: localhost
+
+logging:
+  appenders:
+    - type: file
+      time_zone: UTC
+      current_log_filename: logs/graphhopper.log
+      log_format: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+      archive: true
+      archived_log_filename_pattern: ./logs/graphhopper-%d.log.gz
+      archived_file_count: 30
+      never_block: true
+    - type: console
+      time_zone: UTC
+      log_format: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+  loggers:
+    "com.graphhopper.osm_warnings":
+      level: DEBUG
+      additive: false
+      appenders:
+        - type: file
+          currentLogFilename: logs/osm_warnings.log
+          archive: false
+          logFormat: "[%level] %msg%n"

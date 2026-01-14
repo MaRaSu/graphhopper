@@ -1,23 +1,31 @@
 const config = {
-    routingApi: location.origin + '/',
-    geocodingApi: '',
-    defaultTiles: 'OpenStreetMap',
+    routingApi: location.origin + "/",
+    geocodingApi: "",
+    defaultTiles: "OpenStreetMap",
     keys: {
         graphhopper: "",
         maptiler: "missing_api_key",
         omniscale: "missing_api_key",
         thunderforest: "missing_api_key",
-        kurviger: "missing_api_key"
+        kurviger: "missing_api_key",
     },
     routingGraphLayerAllowed: true,
     request: {
         details: [
-            'road_class',
-            'road_environment',
-            'max_speed',
-            'average_speed',
+            "road_class",
+            "road_environment",
+            "average_speed",
+            "gravel_scale",
+            "gravel_scale_num",
+            "gravel_base_priority",
+            "mtb_scale",
+            "mtb_scale_num",
+            "mtb_base_priority",
+            "predicted_surface",
+            "predicted_highway",
+            //'urban_density',
         ],
-        snapPreventions: ['ferry'],
+        snapPreventions: ["ferry"],
     },
     profile_group_mapping: {},
-}
+};

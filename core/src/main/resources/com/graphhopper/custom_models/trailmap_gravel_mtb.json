@@ -1,0 +1,40 @@
+{
+  "distance_influence": 60,
+  "priority": [
+    { "if": "true", "multiply_by": "1.0" },
+    { "if": "!bike_access && (!backward_bike_access || roundabout)", "multiply_by": "0" },
+    { "else_if": "!bike_access && backward_bike_access", "multiply_by": "0.2" },
+    { "if": "road_environment == FERRY", "multiply_by": "0.5" },
+    { "if": "gravel_scale == FERRY", "multiply_by": "0.5" },
+    { "if": "gravel_scale == ZERO_MINUS && predicted_highway != CYCLEWAY", "multiply_by": "0.78" },
+    { "if": "gravel_scale == ZERO_MINUS && predicted_highway == CYCLEWAY", "multiply_by": "0.8" },
+    { "if": "gravel_scale == ZERO", "multiply_by": "1.2" },
+    { "if": "gravel_scale == ZERO_PLUS", "multiply_by": "1.2" },
+    { "if": "gravel_scale == ONE", "multiply_by": "1.2" },
+    { "if": "gravel_scale == ONE && predicted_highway == GOOD_TRACK", "multiply_by": "1.1" },
+    { "if": "gravel_scale == TWO", "multiply_by": "1.1" },
+    { "if": "gravel_scale == TWO && mtb_scale == ONE", "multiply_by": "1.0" },
+    { "if": "gravel_scale == THREE", "multiply_by": "0.8" },
+    { "if": "gravel_scale == FOUR", "multiply_by": "0.5" },
+    { "if": "gravel_scale == UNKNOWN", "multiply_by": "0.5" },
+
+    { "if": "predicted_highway == MAJOR_ROAD", "multiply_by": "0.5" }
+  ],
+  "speed": [
+    { "if": "true", "limit_to": "26" },
+    { "if": "gravel_scale == ZERO", "limit_to": "23" },
+    { "if": "gravel_scale == ZERO_PLUS", "limit_to": "21" },
+    { "if": "gravel_scale == ONE", "limit_to": "18" },
+    { "if": "gravel_scale == TWO", "limit_to": "12" },
+    { "if": "gravel_scale == TWO && mtb_scale == ONE", "limit_to": "10" },
+    { "if": "gravel_scale == THREE", "limit_to": "10" },
+    { "if": "gravel_scale == FOUR", "limit_to": "4" },
+    { "if": "gravel_scale == UNKNOWN", "limit_to": "10" },
+    { "if": "gravel_scale == FERRY", "limit_to": "15" },
+    { "if": "road_environment == FERRY", "limit_to": "15" },
+
+    { "if": "predicted_highway == FOOTWAY", "limit_to": "4" },
+
+    { "if": "!bike_access && backward_bike_access", "limit_to": "4" }
+  ]
+}

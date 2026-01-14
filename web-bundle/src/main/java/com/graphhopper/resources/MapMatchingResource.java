@@ -101,7 +101,8 @@ public class MapMatchingResource {
             @QueryParam("gpx.route") @DefaultValue("true") boolean withRoute,
             @QueryParam("gpx.track") @DefaultValue("true") boolean withTrack,
             @QueryParam("traversal_keys") @DefaultValue("false") boolean enableTraversalKeys,
-            @QueryParam("gps_accuracy") @DefaultValue("10") double gpsAccuracy) {
+            @QueryParam("gps_accuracy") @DefaultValue("10") double gpsAccuracy,
+            @QueryParam("tracepoints") @DefaultValue("false") boolean enableTracepoints) {
         boolean writeGPX = "gpx".equalsIgnoreCase(outType);
         if (gpx.trk.isEmpty()) {
             throw new IllegalArgumentException("No tracks found in GPX document. Are you using waypoints or routes instead?");
@@ -186,6 +187,25 @@ public class MapMatchingResource {
                     }
                     map.putPOJO("traversal_keys", traversalKeylist);
                 }
+
+                if (enableTracepoints && matchResult.getTracepoints() != null) {
+                    ArrayNode tracepointsArray = map.putArray("tracepoints");
+                    for (Tracepoint tp : matchResult.getTracepoints()) {
+                        ObjectNode tpNode = tracepointsArray.addObject();
+                        tpNode.put("original_index", tp.getOriginalIndex());
+                        tpNode.put("original_lat", tp.getOriginalPoint().getLat());
+                        tpNode.put("original_lon", tp.getOriginalPoint().getLon());
+                        tpNode.put("matched", tp.isMatched());
+                        tpNode.put("filtered", tp.isFiltered());
+                        if (tp.isMatched()) {
+                            tpNode.put("snapped_lat", tp.getSnappedPoint().getLat());
+                            tpNode.put("snapped_lon", tp.getSnappedPoint().getLon());
+                            tpNode.put("distance", tp.getDistance());
+                            tpNode.put("edge_id", tp.getEdgeId());
+                        }
+                    }
+                }
+
                 return Response.ok(map).
                         header("X-GH-Took", "" + Math.round(sw.getMillisDouble())).
                         build();

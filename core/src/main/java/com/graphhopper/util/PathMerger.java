@@ -147,7 +147,7 @@ public class PathMerger {
         }
 
         if (!fullPoints.isEmpty() && fullPoints.is3D)
-            calcAscendDescend(responsePath, fullPoints);
+            calcAscendDescend2(responsePath, fullPoints);
 
         if (enableInstructions) {
             fullInstructions = updateInstructionsWithContext(fullInstructions);
@@ -242,6 +242,37 @@ public class PathMerger {
             lastEle = ele;
 
         }
+        responsePath.setAscend(ascendMeters);
+        responsePath.setDescend(descendMeters);
+    }
+
+    /**
+     * Calculate ascend/descend using hysteresis to filter small elevation fluctuations.
+     * Only counts elevation changes when they exceed minElevationChange from the last
+     * "registered" elevation point. This prevents accumulating noise from DEM data
+     * and produces results more consistent with other routing engines.
+     */
+    private void calcAscendDescend2(final ResponsePath responsePath, final PointList pointList) {
+        final double minElevationChange = 2.0; // meters - hysteresis threshold
+
+        double ascendMeters = 0;
+        double descendMeters = 0;
+        double lastRegisteredEle = pointList.getEle(0);
+
+        for (int i = 1; i < pointList.size(); ++i) {
+            double ele = pointList.getEle(i);
+            double change = ele - lastRegisteredEle;
+
+            if (change > minElevationChange) {
+                ascendMeters += change;
+                lastRegisteredEle = ele;
+            } else if (change < -minElevationChange) {
+                descendMeters += Math.abs(change);
+                lastRegisteredEle = ele;
+            }
+            // else: small change, don't update lastRegisteredEle - accumulate until threshold crossed
+        }
+
         responsePath.setAscend(ascendMeters);
         responsePath.setDescend(descendMeters);
     }

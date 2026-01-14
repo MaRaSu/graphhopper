@@ -45,6 +45,8 @@ import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import com.graphhopper.util.shapes.GHPoint;
+
 import static com.graphhopper.util.DistancePlaneProjection.DIST_PLANE;
 
 /**
@@ -75,6 +77,23 @@ public class MapMatching {
     private QueryGraph queryGraph;
 
     private Map<String, Object> statistics = new HashMap<>();
+
+    /**
+     * Helper class to hold filtered observations along with the mapping from original indices.
+     */
+    static class FilterResult {
+        final List<Observation> filteredObservations;
+        final Map<Integer, Integer> originalToFilteredIndex; // original index -> filtered index
+        final Set<Integer> filteredOutIndices; // original indices that were filtered out
+
+        FilterResult(List<Observation> filteredObservations,
+                     Map<Integer, Integer> originalToFilteredIndex,
+                     Set<Integer> filteredOutIndices) {
+            this.filteredObservations = filteredObservations;
+            this.originalToFilteredIndex = originalToFilteredIndex;
+            this.filteredOutIndices = filteredOutIndices;
+        }
+    }
 
     public static MapMatching fromGraphHopper(GraphHopper graphHopper, PMap hints) {
         Router router = routerFromGraphHopper(graphHopper, hints);
@@ -196,7 +215,9 @@ public class MapMatching {
     }
 
     public MatchResult match(List<Observation> observations) {
-        List<Observation> filteredObservations = filterObservations(observations);
+        // Filter observations and track which original indices were kept
+        FilterResult filterResult = filterObservationsWithTracking(observations);
+        List<Observation> filteredObservations = filterResult.filteredObservations;
         statistics.put("filteredObservations", filteredObservations.size());
 
         // Snap observations to links. Generates multiple candidate snaps per observation.
@@ -231,7 +252,68 @@ public class MapMatching {
         result.setGPXEntriesLength(gpxLength(observations));
         result.setGraph(queryGraph);
         result.setWeighting(queryGraphWeighting);
+
+        // Build tracepoints with 1:1 correspondence to input observations
+        List<Tracepoint> tracepoints = buildTracepoints(observations, filterResult, seq);
+        result.setTracepoints(tracepoints);
+
         return result;
+    }
+
+    /**
+     * Builds tracepoints array with 1:1 correspondence to original input observations.
+     * Similar to OSRM's tracepoints output.
+     *
+     * For points that went through Viterbi: uses the snap from the matching result.
+     * For filtered points (too close to previous): computes snap separately.
+     */
+    private List<Tracepoint> buildTracepoints(List<Observation> originalObservations,
+                                               FilterResult filterResult,
+                                               List<SequenceState<State, Observation, Path>> seq) {
+        List<Tracepoint> tracepoints = new ArrayList<>(originalObservations.size());
+
+        for (int i = 0; i < originalObservations.size(); i++) {
+            Observation obs = originalObservations.get(i);
+            GHPoint originalPoint = obs.getPoint();
+
+            if (filterResult.filteredOutIndices.contains(i)) {
+                // This observation was filtered out (too close to previous)
+                // Compute snap separately - this doesn't affect the route
+                List<Snap> snaps = findCandidateSnaps(originalPoint.getLat(), originalPoint.getLon());
+                if (!snaps.isEmpty()) {
+                    Snap snap = snaps.get(0); // closest snap
+                    GHPoint snappedPoint = new GHPoint(
+                            snap.getSnappedPoint().getLat(),
+                            snap.getSnappedPoint().getLon()
+                    );
+                    double distance = snap.getQueryDistance();
+                    int edgeId = snap.getClosestEdge().getEdge();
+                    tracepoints.add(new Tracepoint(i, originalPoint, true, snappedPoint, distance, edgeId));
+                } else {
+                    // No snap candidates found
+                    tracepoints.add(new Tracepoint(i, originalPoint, true));
+                }
+            } else {
+                // This observation went through Viterbi matching
+                Integer filteredIndex = filterResult.originalToFilteredIndex.get(i);
+                if (filteredIndex != null && filteredIndex < seq.size()) {
+                    SequenceState<State, Observation, Path> seqState = seq.get(filteredIndex);
+                    Snap snap = seqState.state.getSnap();
+                    GHPoint snappedPoint = new GHPoint(
+                            snap.getSnappedPoint().getLat(),
+                            snap.getSnappedPoint().getLon()
+                    );
+                    double distance = snap.getQueryDistance();
+                    int edgeId = snap.getClosestEdge().getEdge();
+                    tracepoints.add(new Tracepoint(i, originalPoint, false, snappedPoint, distance, edgeId));
+                } else {
+                    // Shouldn't happen, but handle gracefully
+                    tracepoints.add(new Tracepoint(i, originalPoint, false));
+                }
+            }
+        }
+
+        return tracepoints;
     }
 
     /**
@@ -273,6 +355,51 @@ public class MapMatching {
             }
         }
         return filtered;
+    }
+
+    /**
+     * Filters observations and tracks which original indices were kept vs filtered out.
+     * This is needed to build tracepoints with 1:1 correspondence to input.
+     */
+    FilterResult filterObservationsWithTracking(List<Observation> observations) {
+        List<Observation> filtered = new ArrayList<>();
+        Map<Integer, Integer> originalToFilteredIndex = new HashMap<>();
+        Set<Integer> filteredOutIndices = new HashSet<>();
+
+        Observation prevEntry = null;
+        double acc = 0.0;
+        int last = observations.size() - 1;
+        int filteredIndex = 0;
+
+        for (int i = 0; i <= last; i++) {
+            Observation observation = observations.get(i);
+            if (i == 0 || i == last || distanceCalc.calcDist(
+                    prevEntry.getPoint().getLat(), prevEntry.getPoint().getLon(),
+                    observation.getPoint().getLat(), observation.getPoint().getLon()) > 2 * measurementErrorSigma) {
+                if (i > 0) {
+                    Observation prevObservation = observations.get(i - 1);
+                    acc += distanceCalc.calcDist(
+                            prevObservation.getPoint().getLat(), prevObservation.getPoint().getLon(),
+                            observation.getPoint().getLat(), observation.getPoint().getLon());
+                    acc -= distanceCalc.calcDist(
+                            prevEntry.getPoint().getLat(), prevEntry.getPoint().getLon(),
+                            observation.getPoint().getLat(), observation.getPoint().getLon());
+                }
+                observation.setAccumulatedLinearDistanceToPrevious(acc);
+                filtered.add(observation);
+                originalToFilteredIndex.put(i, filteredIndex);
+                filteredIndex++;
+                prevEntry = observation;
+                acc = 0.0;
+            } else {
+                filteredOutIndices.add(i);
+                Observation prevObservation = observations.get(i - 1);
+                acc += distanceCalc.calcDist(
+                        prevObservation.getPoint().getLat(), prevObservation.getPoint().getLon(),
+                        observation.getPoint().getLat(), observation.getPoint().getLon());
+            }
+        }
+        return new FilterResult(filtered, originalToFilteredIndex, filteredOutIndices);
     }
 
     public List<Snap> findCandidateSnaps(final double queryLat, final double queryLon) {
