@@ -1,0 +1,11 @@
+{
+  "distance_influence": 30,
+  "priority": [
+    { "if": "piste_type == NORDIC", "multiply_by": "1.0" },
+    { "else": "", "multiply_by": "0.2" }
+  ],
+  "speed": [
+    { "if": "piste_type == NORDIC", "limit_to": "12" },
+    { "else": "", "limit_to": "4" }
+  ]
+}

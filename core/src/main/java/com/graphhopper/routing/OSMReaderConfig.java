@@ -23,6 +23,7 @@ import java.util.List;
 
 public class OSMReaderConfig {
     private List<String> ignoredHighways = new ArrayList<>();
+    private List<String> trailmapExtraWays = new ArrayList<>();
     private boolean parseWayNames = true;
     private String preferredLanguage = "";
     private double maxWayPointDistance = 0.5;
@@ -34,6 +35,8 @@ public class OSMReaderConfig {
     private double longEdgeSamplingDistance = Double.MAX_VALUE;
     private int workerThreads = 2;
     private double defaultElevation = 0;
+    private boolean areaRoutingEnabled = false;
+    private String areaRoutingRulesFile = "";
 
     public List<String> getIgnoredHighways() {
         return ignoredHighways;
@@ -50,6 +53,19 @@ public class OSMReaderConfig {
      */
     public OSMReaderConfig setIgnoredHighways(List<String> ignoredHighways) {
         this.ignoredHighways = ignoredHighways;
+        return this;
+    }
+
+    public List<String> getTrailmapExtraWays() {
+        return trailmapExtraWays;
+    }
+
+    /**
+     * Sets the tag keys that shall be used to accept ways even without a highway tag.
+     * This is useful for including ways like piste:type that don't have a highway tag.
+     */
+    public OSMReaderConfig setTrailmapExtraWays(List<String> trailmapExtraWays) {
+        this.trailmapExtraWays = trailmapExtraWays;
         return this;
     }
 
@@ -166,6 +182,32 @@ public class OSMReaderConfig {
      */
     public OSMReaderConfig setDefaultElevation(double defaultElevation) {
         this.defaultElevation = defaultElevation;
+        return this;
+    }
+
+    public boolean isAreaRoutingEnabled() {
+        return areaRoutingEnabled;
+    }
+
+    /**
+     * Enables routing through area polygons (parking lots, plazas, etc.) by including
+     * their boundary edges in the routing graph.
+     */
+    public OSMReaderConfig setAreaRoutingEnabled(boolean areaRoutingEnabled) {
+        this.areaRoutingEnabled = areaRoutingEnabled;
+        return this;
+    }
+
+    public String getAreaRoutingRulesFile() {
+        return areaRoutingRulesFile;
+    }
+
+    /**
+     * Sets the path to a JSON file containing rules for which area types are passable.
+     * Only used when areaRoutingEnabled is true.
+     */
+    public OSMReaderConfig setAreaRoutingRulesFile(String areaRoutingRulesFile) {
+        this.areaRoutingRulesFile = areaRoutingRulesFile;
         return this;
     }
 }

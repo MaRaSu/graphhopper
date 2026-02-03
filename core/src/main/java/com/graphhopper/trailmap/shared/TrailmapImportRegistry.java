@@ -103,6 +103,24 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
             );
         }
 
+        // === Piste Type ===
+        if (PisteType.KEY.equals(name)) {
+            return ImportUnit.create(name,
+                props -> PisteType.create(),
+                (lookup, props) -> new PisteTypeParser(
+                    lookup.getEnumEncodedValue(PisteType.KEY, PisteType.class))
+            );
+        }
+
+        // === MTB Winter ===
+        if (MtbWinter.KEY.equals(name)) {
+            return ImportUnit.create(name,
+                props -> MtbWinter.create(),
+                (lookup, props) -> new MtbWinterParser(
+                    lookup.getEnumEncodedValue(MtbWinter.KEY, MtbWinter.class))
+            );
+        }
+
         // === Route Issues ===
         // All issue flags are set by a single RouteIssuesParser.
         // The parser is registered with issue_biking_blocked and declares dependencies

@@ -300,6 +300,7 @@ public class GraphHopperBundle implements ConfiguredBundle<GraphHopperBundleConf
         environment.jersey().register(RouteResource.class);
         environment.jersey().register(IsochroneResource.class);
         environment.jersey().register(MapMatchingResource.class);
+        environment.jersey().register(ConvertResource.class);
 
         if (configuration.getGraphHopperConfiguration().has("gtfs.file")) {
             // These are pt-specific implementations of /route and /isochrone, but the same API.

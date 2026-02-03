@@ -581,6 +581,13 @@ public class GraphHopper {
 
         osmReaderConfig.setIgnoredHighways(Arrays.stream(ghConfig.getString("import.osm.ignored_highways", String.join(",", osmReaderConfig.getIgnoredHighways()))
                 .split(",")).map(String::trim).collect(Collectors.toList()));
+        // Trailmap extra ways (optional, defaults to empty)
+        osmReaderConfig.setTrailmapExtraWays(Arrays.stream(
+                ghConfig.getString("import.osm.trailmap_extra_ways", "")
+                .split(",")).map(String::trim).filter(s -> !s.isEmpty()).collect(Collectors.toList()));
+        // Area routing (optional, disabled by default)
+        osmReaderConfig.setAreaRoutingEnabled(ghConfig.getBool("import.osm.area_routing.enabled", false));
+        osmReaderConfig.setAreaRoutingRulesFile(ghConfig.getString("import.osm.area_routing.rules_file", ""));
         osmReaderConfig.setParseWayNames(ghConfig.getBool("datareader.instructions", osmReaderConfig.isParseWayNames()));
         osmReaderConfig.setPreferredLanguage(ghConfig.getString("datareader.preferred_language", osmReaderConfig.getPreferredLanguage()));
         osmReaderConfig.setMaxWayPointDistance(ghConfig.getDouble(Routing.INIT_WAY_POINT_MAX_DISTANCE, osmReaderConfig.getMaxWayPointDistance()));
@@ -646,10 +653,21 @@ public class GraphHopper {
         return Collections.emptyList();
     }
 
+    /**
+     * Creates the area way filter for routing through area polygons.
+     * Override in subclass to provide custom implementation (e.g., TrailmapAreaWayFilter).
+     * Default implementation returns NONE (no areas routed through).
+     */
+    protected AreaWayFilter createAreaWayFilter(OSMReaderConfig config) {
+        return AreaWayFilter.NONE;
+    }
+
     protected OSMParsers buildOSMParsers(Map<String, PMap> encodedValuesWithProps,
                                          Map<String, ImportUnit> activeImportUnits,
                                          Map<String, List<String>> restrictionVehicleTypesByProfile,
-                                         List<String> ignoredHighways) {
+                                         List<String> ignoredHighways,
+                                         List<String> trailmapExtraWays,
+                                         OSMReaderConfig osmReaderConfig) {
         ImportUnitSorter sorter = new ImportUnitSorter(activeImportUnits);
         Map<String, ImportUnit> sortedImportUnits = new LinkedHashMap<>();
         sorter.sort().forEach(name -> sortedImportUnits.put(name, activeImportUnits.get(name)));
@@ -666,7 +684,13 @@ public class GraphHopper {
 
         OSMParsers osmParsers = new OSMParsers();
         ignoredHighways.forEach(osmParsers::addIgnoredHighway);
+        trailmapExtraWays.forEach(osmParsers::addTrailmapExtraWay);
         sortedParsers.forEach(osmParsers::addWayTagParser);
+
+        // Configure area routing if enabled
+        if (osmReaderConfig.isAreaRoutingEnabled()) {
+            osmParsers.setAreaWayFilter(createAreaWayFilter(osmReaderConfig));
+        }
 
         if (maxSpeedCalculator != null) {
             maxSpeedCalculator.checkEncodedValues(encodingManager);
@@ -909,7 +933,8 @@ public class GraphHopper {
                 deque.addAll(importUnit.getRequiredImportUnits());
         }
         encodingManager = buildEncodingManager(encodedValuesWithProps, activeImportUnits, restrictionVehicleTypesByProfile);
-        osmParsers = buildOSMParsers(encodedValuesWithProps, activeImportUnits, restrictionVehicleTypesByProfile, osmReaderConfig.getIgnoredHighways());
+        osmParsers = buildOSMParsers(encodedValuesWithProps, activeImportUnits, restrictionVehicleTypesByProfile,
+                osmReaderConfig.getIgnoredHighways(), osmReaderConfig.getTrailmapExtraWays(), osmReaderConfig);
     }
 
     protected void postImportOSM() {
@@ -1346,6 +1371,20 @@ public class GraphHopper {
 
     public GHResponse route(GHRequest request) {
         return createRouter().route(request);
+    }
+
+    /**
+     * Convert exploration waypoints to normalized waypoints for client editing.
+     *
+     * <p>This endpoint takes the exploration waypoints from a non-finalized
+     * exploration round-trip and produces normalized waypoints that can be
+     * edited by the client.
+     *
+     * @param request Convert request containing profile and exploration waypoints
+     * @return Convert response with normalized waypoints
+     */
+    public ConvertResponse convert(ConvertRequest request) {
+        return createRouter().convert(request);
     }
 
     private Router createRouter() {

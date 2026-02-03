@@ -69,10 +69,43 @@ graphhopper:
     - name: mtb2
       custom_model_files: [trailmap_mtb2.json, bike_elevation.json]
 
+    # Exploration profiles for round-trip routing
+    # These profiles favor quality over directness, used by exploration mode
+    - name: gravel_explore
+      custom_model_files: [trailmap_gravel_explore.json, bike_elevation.json]
+
+    - name: mtb_explore
+      custom_model_files: [trailmap_mtb_explore.json, bike_elevation.json]
+
+    - name: roadbike_explore
+      custom_model_files: [trailmap_roadbike_explore.json, bike_elevation.json]
+
+    - name: gravel_easy_explore
+      custom_model_files: [trailmap_gravel_easy_explore.json, bike_elevation.json]
+
+    - name: gravel_mtb_explore
+      custom_model_files: [trailmap_gravel_mtb_explore.json, bike_elevation.json]
+
+    - name: mtb2_explore
+      custom_model_files: [trailmap_mtb2_explore.json, bike_elevation.json]
+
+    - name: trailmap_foot_explore
+      custom_model_files: [trailmap_foot_explore.json, foot_elevation.json]
+
     # Trailmap Foot Profile
     # For walking and hiking
     - name: trailmap_foot
       custom_model_files: [trailmap_foot.json, foot_elevation.json]
+
+    # Trailmap Nordic Ski Profile
+    # For cross-country skiing on groomed Nordic trails
+    - name: nordic_ski
+      custom_model_files: [trailmap_nordic_ski.json]
+
+    # Trailmap Winter MTB Profile
+    # For fat biking on winter trails (avoids Nordic ski tracks)
+    - name: winter_mtb
+      custom_model_files: [trailmap_winter_mtb.json, bike_elevation.json]
 
   #   Uncomment the following in-built profiles if you want more profiles. After you start GraphHopper it will print which encoded values you'll have to add to graph.encoded_values in this config file.
   #
@@ -142,7 +175,7 @@ graphhopper:
     bike_access, bike_average_speed, bike_priority, bike_road_access, bike_network, mtb_rating, road_environment,
     gravel_scale, gravel_scale_num, gravel_base_priority,
     mtb_scale, mtb_scale_num, mtb_base_priority,
-    predicted_surface, predicted_highway,
+    predicted_surface, predicted_highway, piste_type, mtb_winter,
     issue_biking_blocked, issue_foot_blocked, issue_narrow, issue_poor_visibility,
     issue_vegetation, issue_mud, issue_unknown_path, issue_unknown_track, issue_ferry
 
@@ -252,6 +285,15 @@ graphhopper:
   # import.osm.ignored_highways: footway,construction,cycleway,path,steps # use if you only have motorized-only vehicle profiles
   # import.osm.ignored_highways: motorway,trunk # use if you only have non-motorized vehicle profiles
 
+  # Trailmap extra ways: accept ways with these tags even without a highway tag (e.g., piste routes)
+  import.osm.trailmap_extra_ways: piste:type
+
+  # Area routing: include boundary edges of area polygons (parking lots, plazas, etc.) in routing graph
+  # This enables routing through areas where trails/ways connect only to area boundaries
+  import.osm.area_routing.enabled: true
+  # Path relative to classpath (bundled in JAR) - use full path for custom rules file
+  import.osm.area_routing.rules_file: com/graphhopper/trailmap/areas/area_routing_rules.json
+
   # configure the memory access, use RAM_STORE for well equipped servers (default and recommended)
   graph.dataaccess.default_type: RAM_STORE
 
@@ -309,3 +351,5 @@ logging:
           currentLogFilename: logs/osm_warnings.log
           archive: false
           logFormat: "[%level] %msg%n"
+    "com.graphhopper.trailmap.roundtrip.scoring":
+      level: DEBUG

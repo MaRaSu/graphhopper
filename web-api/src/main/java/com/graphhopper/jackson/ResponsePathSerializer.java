@@ -116,6 +116,9 @@ public class ResponsePathSerializer {
                 jsonPath.put("descend", p.getDescend());
             }
             jsonPath.putPOJO("snapped_waypoints", pointsEncoded ? encodePolyline(p.getWaypoints(), enableElevation, pointsMultiplier) : p.getWaypoints().toLineString(enableElevation));
+            if (p.hasExplorationWaypoints()) {
+                jsonPath.putPOJO("exploration_waypoints", pointsEncoded ? encodePolyline(p.getExplorationWaypoints(), enableElevation, pointsMultiplier) : p.getExplorationWaypoints().toLineString(enableElevation));
+            }
             if (p.getFare() != null) {
                 jsonPath.put("fare", NumberFormat.getCurrencyInstance(Locale.ROOT).format(p.getFare()));
             }

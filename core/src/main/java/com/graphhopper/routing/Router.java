@@ -19,6 +19,8 @@
 package com.graphhopper.routing;
 
 import com.carrotsearch.hppc.cursors.IntCursor;
+import com.graphhopper.ConvertRequest;
+import com.graphhopper.ConvertResponse;
 import com.graphhopper.GHRequest;
 import com.graphhopper.GHResponse;
 import com.graphhopper.ResponsePath;
@@ -34,6 +36,11 @@ import com.graphhopper.routing.util.*;
 import com.graphhopper.routing.weighting.Weighting;
 import com.graphhopper.routing.weighting.custom.CustomWeighting;
 import com.graphhopper.routing.weighting.custom.FindMinMax;
+import com.graphhopper.trailmap.roundtrip.EnhancedRoundTripRouting;
+import com.graphhopper.trailmap.roundtrip.EnhancedRoundTripResult;
+import com.graphhopper.trailmap.roundtrip.exploration.ExplorationRoundTripRouting;
+import com.graphhopper.trailmap.roundtrip.exploration.ExplorationRoundTripResult;
+import com.graphhopper.trailmap.roundtrip.exploration.RouteConversionService;
 import com.graphhopper.storage.BaseGraph;
 import com.graphhopper.storage.Graph;
 import com.graphhopper.storage.RoutingCHGraph;
@@ -106,6 +113,10 @@ public class Router {
             if (ROUND_TRIP.equalsIgnoreCase(request.getAlgorithm())) {
                 if (!(solver instanceof FlexSolver))
                     throw new IllegalArgumentException("algorithm=round_trip only works with a flexible algorithm");
+                // Trailmap: Check if enhanced round-trip is requested
+                if (useEnhancedRoundTrip(request)) {
+                    return routeEnhancedRoundTrip(request, (FlexSolver) solver);
+                }
                 return routeRoundTrip(request, (FlexSolver) solver);
             } else if (ALT_ROUTE.equalsIgnoreCase(request.getAlgorithm())) {
                 return routeAlt(request, solver);
@@ -228,6 +239,229 @@ public class Router {
         ghRsp.getHints().putObject("visited_nodes.sum", result.visitedNodes);
         ghRsp.getHints().putObject("visited_nodes.average", (float) result.visitedNodes / (snaps.size() - 1));
         return ghRsp;
+    }
+
+    // ========================================================================
+    // Trailmap: Enhanced Round-Trip Routing
+    // ========================================================================
+
+    /**
+     * Check if enhanced round-trip mode is requested.
+     * Enhanced mode is triggered by any of the enhanced round-trip parameters.
+     */
+    private boolean useEnhancedRoundTrip(GHRequest request) {
+        return request.getHints().has("round_trip.shape") ||
+               request.getHints().has("round_trip.quality_profile") ||
+               request.getHints().has("round_trip.return_metrics") ||
+               request.getHints().has("round_trip.max_attempts") ||
+               request.getHints().has("round_trip.max_fixes") ||
+               request.getHints().has("round_trip.mode");
+    }
+
+    /**
+     * Check if exploration round-trip mode is requested.
+     */
+    private boolean useExplorationMode(GHRequest request) {
+        String mode = request.getHints().getString("round_trip.mode", "");
+        return "exploration".equalsIgnoreCase(mode);
+    }
+
+    /**
+     * Route using enhanced round-trip with geometry shapes and quality scoring.
+     */
+    protected GHResponse routeEnhancedRoundTrip(GHRequest request, FlexSolver solver) {
+        // Trailmap: Check for exploration mode
+        if (useExplorationMode(request)) {
+            return routeExplorationRoundTrip(request, solver);
+        }
+
+        GHResponse ghRsp = new GHResponse();
+        StopWatch sw = new StopWatch().start();
+
+        // Create enhanced round-trip router
+        EnhancedRoundTripRouting enhancedRouting = new EnhancedRoundTripRouting(
+            graph,
+            locationIndex,
+            solver.weighting,
+            solver.createSnapFilter()
+        );
+
+        // Generate route with path calculator factory
+        // (factory takes snaps and creates path calculator with proper QueryGraph)
+        EnhancedRoundTripResult result = enhancedRouting.route(request, snaps -> {
+            QueryGraph queryGraph = QueryGraph.create(graph, snaps);
+            return solver.createPathCalculator(queryGraph);
+        });
+
+        ghRsp.addDebugInfo("enhancedRoundTrip:" + sw.stop().getSeconds() + "s");
+
+        if (!result.isSuccess()) {
+            ghRsp.addError(new IllegalArgumentException(result.getFailureReason()));
+            return ghRsp;
+        }
+
+        // Add route to response
+        ResponsePath responsePath = result.getPath();
+        ghRsp.add(responsePath);
+
+        // Add quality metrics to response hints if requested
+        if (result.shouldIncludeMetrics() && result.getScore() != null) {
+            ghRsp.getHints().putObject("quality", result.getScore().toMap());
+        }
+
+        return ghRsp;
+    }
+
+    /**
+     * Route using exploration round-trip with two-phase approach:
+     * 1. Generate route using exploration profile (quality-focused)
+     * 2. Normalize to minimal waypoints using standard profile
+     */
+    protected GHResponse routeExplorationRoundTrip(GHRequest request, FlexSolver solver) {
+        GHResponse ghRsp = new GHResponse();
+        StopWatch sw = new StopWatch().start();
+
+        // Derive exploration profile name
+        String standardProfileName = request.getProfile();
+        String exploreProfileName = standardProfileName + "_explore";
+
+        // Check if exploration profile exists
+        Profile exploreProfile = profilesByName.get(exploreProfileName);
+        if (exploreProfile == null) {
+            ghRsp.addError(new IllegalArgumentException(
+                "Exploration profile '" + exploreProfileName + "' not found. " +
+                "Available profiles: " + profilesByName.keySet()));
+            return ghRsp;
+        }
+
+        // Create exploration round-trip router
+        ExplorationRoundTripRouting explorationRouting = new ExplorationRoundTripRouting(
+            graph,
+            locationIndex,
+            solver.createSnapFilter(),
+            encodingManager,
+            profilesByName,
+            pathDetailsBuilderFactory
+        );
+
+        // Create weightings for both profiles
+        PMap exploreHints = new PMap(request.getHints());
+        exploreHints.putObject(CustomModel.KEY, request.getCustomModel());
+        Weighting exploreWeighting = weightingFactory.createWeighting(exploreProfile, exploreHints, false);
+
+        // Generate route with two path calculator factories and weightings for detail extraction
+        ExplorationRoundTripResult result = explorationRouting.route(request,
+            // Exploration profile factory
+            snaps -> {
+                QueryGraph queryGraph = QueryGraph.create(graph, snaps);
+                return new FlexiblePathCalculator(queryGraph,
+                    new RoutingAlgorithmFactorySimple(),
+                    exploreWeighting,
+                    solver.getAlgoOpts());
+            },
+            // Standard profile factory (for normalization)
+            snaps -> {
+                QueryGraph queryGraph = QueryGraph.create(graph, snaps);
+                return solver.createPathCalculator(queryGraph);
+            },
+            exploreWeighting,
+            solver.weighting
+        );
+
+        ghRsp.addDebugInfo("explorationRoundTrip:" + sw.stop().getSeconds() + "s");
+
+        if (!result.isSuccess() && result.getNormalizedWaypoints().isEmpty()) {
+            ghRsp.addError(new IllegalArgumentException(result.getFailureReason()));
+            return ghRsp;
+        }
+
+        // Add route to response
+        ResponsePath responsePath = result.getPath();
+        if (responsePath != null) {
+            ghRsp.add(responsePath);
+        }
+
+        // Add exploration-specific metrics
+        ghRsp.getHints().putObject("exploration.waypoint_count", result.getNormalizedWaypoints().size());
+        ghRsp.getHints().putObject("exploration.match_percentage", result.getNormalizationMatchPercentage());
+
+        // Add quality metrics if requested
+        if (result.shouldIncludeMetrics() && result.getScore() != null) {
+            ghRsp.getHints().putObject("quality", result.getScore().toMap());
+        }
+
+        return ghRsp;
+    }
+
+    /**
+     * Convert exploration waypoints to normalized waypoints.
+     *
+     * <p>This method recreates the exploration route from snapped waypoints,
+     * then runs normalization to produce minimal waypoints for client editing.
+     *
+     * @param request Convert request with profile and exploration waypoints
+     * @return Convert response with normalized waypoints
+     */
+    public ConvertResponse convert(ConvertRequest request) {
+        // Derive exploration profile name
+        String standardProfileName = request.getProfile();
+        String exploreProfileName = standardProfileName + "_explore";
+
+        // Check if standard profile exists
+        Profile standardProfile = profilesByName.get(standardProfileName);
+        if (standardProfile == null) {
+            return ConvertResponse.failure("Profile '" + standardProfileName + "' not found. " +
+                "Available profiles: " + profilesByName.keySet());
+        }
+
+        // Check if exploration profile exists
+        Profile exploreProfile = profilesByName.get(exploreProfileName);
+        if (exploreProfile == null) {
+            return ConvertResponse.failure("Exploration profile '" + exploreProfileName + "' not found. " +
+                "Available profiles: " + profilesByName.keySet());
+        }
+
+        // Create weighting and edge filter for snapping
+        PMap standardHints = new PMap();
+        standardHints.putObject(CustomModel.KEY, request.getCustomModel());
+        Weighting standardWeighting = weightingFactory.createWeighting(standardProfile, standardHints, false);
+        EdgeFilter edgeFilter = new DefaultSnapFilter(
+            standardWeighting,
+            encodingManager.getBooleanEncodedValue(Subnetwork.key(standardProfileName))
+        );
+
+        // Create conversion service
+        RouteConversionService conversionService = new RouteConversionService(
+            graph, locationIndex, edgeFilter);
+
+        // Create exploration weighting
+        PMap exploreHints = new PMap();
+        exploreHints.putObject(CustomModel.KEY, request.getCustomModel());
+        Weighting exploreWeighting = weightingFactory.createWeighting(exploreProfile, exploreHints, false);
+
+        // Create algorithm options
+        AlgorithmOptions algoOpts = new AlgorithmOptions().setAlgorithm(Parameters.Algorithms.DIJKSTRA_BI);
+
+        // Perform conversion
+        return conversionService.convert(
+            request.getWaypoints(),
+            // Exploration profile factory
+            snaps -> {
+                QueryGraph queryGraph = QueryGraph.create(graph, snaps);
+                return new FlexiblePathCalculator(queryGraph,
+                    new RoutingAlgorithmFactorySimple(),
+                    exploreWeighting,
+                    algoOpts);
+            },
+            // Standard profile factory
+            snaps -> {
+                QueryGraph queryGraph = QueryGraph.create(graph, snaps);
+                return new FlexiblePathCalculator(queryGraph,
+                    new RoutingAlgorithmFactorySimple(),
+                    standardWeighting,
+                    algoOpts);
+            }
+        );
     }
 
     protected GHResponse routeAlt(GHRequest request, Solver solver) {

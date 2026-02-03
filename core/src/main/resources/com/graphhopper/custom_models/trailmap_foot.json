@@ -3,7 +3,7 @@
   "priority": [
     { "if": "true", "multiply_by": "1.0" },
     { "if": "!foot_access", "multiply_by": "0" },
-    { "if": "road_environment == FERRY", "multiply_by": "0.5" },
+    { "if": "road_environment == FERRY", "multiply_by": "0.1" },
 
     { "if": "predicted_highway == CYCLEWAY", "multiply_by": "1" },
     { "if": "predicted_highway == OUTDOOR_WAY", "multiply_by": "1.3" },

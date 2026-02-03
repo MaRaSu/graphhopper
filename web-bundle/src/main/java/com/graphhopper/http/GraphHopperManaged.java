@@ -21,6 +21,7 @@ package com.graphhopper.http;
 import com.graphhopper.GraphHopper;
 import com.graphhopper.GraphHopperConfig;
 import com.graphhopper.gtfs.GraphHopperGtfs;
+import com.graphhopper.trailmap.TrailmapGraphHopper;
 import com.graphhopper.trailmap.shared.TrailmapImportRegistry;
 import io.dropwizard.lifecycle.Managed;
 import org.slf4j.Logger;
@@ -35,7 +36,8 @@ public class GraphHopperManaged implements Managed {
         if (configuration.has("gtfs.file")) {
             graphHopper = new GraphHopperGtfs(configuration);
         } else {
-            graphHopper = new GraphHopper();
+            // Use TrailmapGraphHopper for area routing support
+            graphHopper = new TrailmapGraphHopper();
         }
         // Use TrailmapImportRegistry to enable gravel_scale and other Trailmap encoders
         graphHopper.setImportRegistry(new TrailmapImportRegistry());

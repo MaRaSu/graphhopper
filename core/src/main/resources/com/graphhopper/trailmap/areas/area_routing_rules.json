@@ -1,0 +1,161 @@
+{
+  "description": "Trailmap area routing rules - defines which OSM area polygons are passable",
+  "rules": [
+    {
+      "name": "parking_lots",
+      "description": "Parking lots at trailheads and other locations",
+      "required_tags": {
+        "amenity": "parking"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit_or_closed",
+      "access": {
+        "foot": true,
+        "bike": true,
+        "car": false
+      }
+    },
+    {
+      "name": "pedestrian_areas",
+      "description": "Pedestrian plazas and squares with explicit area=yes",
+      "required_tags": {
+        "highway": "pedestrian",
+        "area": "yes"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit",
+      "access": {
+        "foot": true,
+        "bike": true,
+        "car": false
+      }
+    },
+    {
+      "name": "parks",
+      "description": "Public parks with foot access",
+      "required_tags": {
+        "leisure": "park"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit_or_closed",
+      "access": {
+        "foot": true,
+        "bike": false,
+        "car": false
+      }
+    },
+    {
+      "name": "recreation_ground",
+      "description": "Recreation grounds and sports fields",
+      "required_tags": {
+        "landuse": "recreation_ground"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit_or_closed",
+      "access": {
+        "foot": true,
+        "bike": false,
+        "car": false
+      }
+    },
+    {
+      "name": "squares",
+      "description": "Town squares and plazas",
+      "required_tags": {
+        "place": "square"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit_or_closed",
+      "access": {
+        "foot": true,
+        "bike": true,
+        "car": false
+      }
+    },
+    {
+      "name": "service_areas",
+      "description": "Highway service areas (rest stops with amenities)",
+      "required_tags": {
+        "highway": "services"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit_or_closed",
+      "access": {
+        "foot": true,
+        "bike": true,
+        "car": false
+      }
+    },
+    {
+      "name": "rest_areas",
+      "description": "Highway rest areas",
+      "required_tags": {
+        "highway": "rest_area"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit_or_closed",
+      "access": {
+        "foot": true,
+        "bike": true,
+        "car": false
+      }
+    },
+    {
+      "name": "camping",
+      "description": "Campgrounds and camp sites",
+      "required_tags": {
+        "tourism": "camp_site"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit_or_closed",
+      "access": {
+        "foot": true,
+        "bike": true,
+        "car": false
+      }
+    },
+    {
+      "name": "picnic_sites",
+      "description": "Picnic areas",
+      "required_tags": {
+        "tourism": "picnic_site"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit_or_closed",
+      "access": {
+        "foot": true,
+        "bike": true,
+        "car": false
+      }
+    },
+    {
+      "name": "platform",
+      "description": "Public transport platforms",
+      "required_tags": {
+        "public_transport": "platform"
+      },
+      "forbidden_tags": [],
+      "area_check": "explicit_or_closed",
+      "access": {
+        "foot": true,
+        "bike": false,
+        "car": false
+      }
+    }
+  ],
+  "global_forbidden_tags": [
+    {"key": "access", "value": "private"},
+    {"key": "access", "value": "no"},
+    {"key": "building", "value": "*"},
+    {"key": "natural", "value": "water"},
+    {"key": "natural", "value": "wetland"},
+    {"key": "natural", "value": "cliff"},
+    {"key": "natural", "value": "glacier"},
+    {"key": "landuse", "value": "reservoir"},
+    {"key": "landuse", "value": "industrial"},
+    {"key": "landuse", "value": "quarry"},
+    {"key": "waterway", "value": "*"},
+    {"key": "military", "value": "*"},
+    {"key": "aeroway", "value": "*"}
+  ]
+}

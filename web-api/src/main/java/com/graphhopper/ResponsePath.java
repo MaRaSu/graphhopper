@@ -42,6 +42,7 @@ public class ResponsePath {
     private String debugInfo = "";
     private InstructionList instructions;
     private PointList waypointList = PointList.EMPTY;
+    private PointList explorationWaypointList = PointList.EMPTY;
     private List<Integer> waypointIndices = new ArrayList<>();
     private PointList pointList = PointList.EMPTY;
     private int numChanges;
@@ -126,6 +127,35 @@ public class ResponsePath {
 
         this.waypointList = wpList;
         return this;
+    }
+
+    /**
+     * Returns the exploration waypoints (geometric shape vertices) for exploration mode round-trip routes.
+     * These are the waypoints used to generate the exploration route before normalization.
+     * Only populated for exploration mode round-trip routes.
+     */
+    public PointList getExplorationWaypoints() {
+        return explorationWaypointList;
+    }
+
+    /**
+     * Set the exploration waypoints (geometric shape vertices).
+     * Only used for exploration mode round-trip routes.
+     */
+    public ResponsePath setExplorationWaypoints(PointList wpList) {
+        if (explorationWaypointList != PointList.EMPTY)
+            throw new IllegalStateException("Cannot call setExplorationWaypoints twice");
+
+        this.explorationWaypointList = wpList;
+        return this;
+    }
+
+    /**
+     * Check if exploration waypoints are set.
+     */
+    public boolean hasExplorationWaypoints() {
+        return explorationWaypointList != null && explorationWaypointList != PointList.EMPTY
+            && explorationWaypointList.size() > 0;
     }
 
     public List<Integer> getWaypointIndices() {

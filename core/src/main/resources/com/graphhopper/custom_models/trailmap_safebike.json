@@ -4,7 +4,7 @@
     { "if": "true", "multiply_by": "1.0" },
     { "if": "!bike_access && (!backward_bike_access || roundabout)", "multiply_by": "0" },
     { "else_if": "!bike_access && backward_bike_access", "multiply_by": "0.2" },
-    { "if": "road_environment == FERRY", "multiply_by": "0.5" },
+    { "if": "road_environment == FERRY", "multiply_by": "0.1" },
 
     { "if": "gravel_scale == ZERO_MINUS", "multiply_by": "1.3" },
     { "if": "gravel_scale == ZERO", "multiply_by": "1.3" },

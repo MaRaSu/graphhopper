@@ -33,21 +33,30 @@ import java.util.function.Function;
 
 public class OSMParsers {
     private final List<String> ignoredHighways;
+    private final List<String> trailmapExtraWays;
     private final List<TagParser> wayTagParsers;
     private final List<RelationTagParser> relationTagParsers;
     private final List<RestrictionTagParser> restrictionTagParsers;
     private final EncodedValue.InitializerConfig relConfig = new EncodedValue.InitializerConfig();
+    private AreaWayFilter areaWayFilter = AreaWayFilter.NONE;
 
     public OSMParsers() {
-        this(new ArrayList<>(), new ArrayList<>(), new ArrayList<>(), new ArrayList<>());
+        this(new ArrayList<>(), new ArrayList<>(), new ArrayList<>(), new ArrayList<>(), new ArrayList<>());
     }
 
     public OSMParsers(List<String> ignoredHighways, List<TagParser> wayTagParsers,
                       List<RelationTagParser> relationTagParsers, List<RestrictionTagParser> restrictionTagParsers) {
+        this(ignoredHighways, wayTagParsers, relationTagParsers, restrictionTagParsers, new ArrayList<>());
+    }
+
+    public OSMParsers(List<String> ignoredHighways, List<TagParser> wayTagParsers,
+                      List<RelationTagParser> relationTagParsers, List<RestrictionTagParser> restrictionTagParsers,
+                      List<String> trailmapExtraWays) {
         this.ignoredHighways = ignoredHighways;
         this.wayTagParsers = wayTagParsers;
         this.relationTagParsers = relationTagParsers;
         this.restrictionTagParsers = restrictionTagParsers;
+        this.trailmapExtraWays = trailmapExtraWays;
     }
 
     public OSMParsers addIgnoredHighway(String highway) {
@@ -70,6 +79,20 @@ public class OSMParsers {
         return this;
     }
 
+    public OSMParsers addTrailmapExtraWay(String tagKey) {
+        trailmapExtraWays.add(tagKey);
+        return this;
+    }
+
+    public OSMParsers setAreaWayFilter(AreaWayFilter areaWayFilter) {
+        this.areaWayFilter = areaWayFilter;
+        return this;
+    }
+
+    public AreaWayFilter getAreaWayFilter() {
+        return areaWayFilter;
+    }
+
     public boolean acceptWay(ReaderWay way) {
         String highway = way.getTag("highway");
         if (highway != null)
@@ -83,8 +106,17 @@ public class OSMParsers {
             return true;
         else if ("platform".equals(way.getTag("railway")))
             return true;
-        else
-            return false;
+        // Trailmap extra ways support: accept ways with configured tags even without highway tag
+        for (String tagKey : trailmapExtraWays) {
+            if (way.getTag(tagKey) != null) {
+                return true;
+            }
+        }
+        // Area routing support: check if this is a routable area polygon
+        if (areaWayFilter.acceptAreaWay(way)) {
+            return true;
+        }
+        return false;
     }
 
     public IntsRef handleRelationTags(ReaderRelation relation, IntsRef relFlags) {
@@ -122,5 +154,9 @@ public class OSMParsers {
 
     public List<RestrictionTagParser> getRestrictionTagParsers() {
         return restrictionTagParsers;
+    }
+
+    public List<String> getTrailmapExtraWays() {
+        return trailmapExtraWays;
     }
 }
