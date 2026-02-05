@@ -199,7 +199,7 @@ graphhopper:
   graph.elevation.provider: multi3
 
   # default location for cache is /tmp/srtm
-  graph.elevation.cache_dir: /Users/suomimar/Downloads/sonny_finland
+  graph.elevation.cache_dir: /Users/suomimar/Downloads/sonny_europe/data
 
   # If you have a slow disk or plenty of RAM change the default MMAP to:
   # graph.elevation.dataaccess: RAM_STORE
@@ -298,7 +298,7 @@ graphhopper:
   graph.dataaccess.default_type: RAM_STORE
 
   # will write way names in the preferred language (language code as defined in ISO 639-1 or ISO 639-2):
-  # datareader.preferred_language: en
+  # datareader.preferred_language: fi
 
   #### Custom Areas ####
 

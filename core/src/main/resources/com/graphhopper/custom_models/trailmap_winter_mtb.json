@@ -2,8 +2,8 @@
   "distance_influence": 10,
   "priority": [
     { "if": "true", "multiply_by": "1.0" },
-    { "if": "piste_type == FATBIKE", "multiply_by": "1.5" },
-    { "if": "piste_type == HIKE", "multiply_by": "1.2" },
+    { "if": "piste_type == FATBIKE", "multiply_by": "2.5" },
+    { "if": "piste_type == HIKE", "multiply_by": "2.0" },
     {
       "if": "!bike_access && (!backward_bike_access || roundabout) && piste_type == MISSING",
       "multiply_by": "0"
@@ -16,20 +16,25 @@
 
     { "if": "piste_type == NORDIC || mtb_winter == NO", "multiply_by": "0.3" },
 
-    { "if": "mtb_scale == ZERO_MINUS", "multiply_by": "1.0" },
-    { "if": "mtb_scale == ZERO", "multiply_by": "1.0" },
-    { "if": "mtb_scale == ZERO_PLUS", "multiply_by": "1.0" },
-    { "if": "mtb_scale == ONE", "multiply_by": "1.0" },
-    { "if": "mtb_scale == TWO", "multiply_by": "1.0" },
-    { "if": "mtb_scale == THREE", "multiply_by": "0.8" },
-    { "if": "mtb_scale == FOUR", "multiply_by": "0.7" },
-    { "if": "mtb_scale == FIVE", "multiply_by": "0.6" },
-    { "if": "mtb_scale == SIX", "multiply_by": "0.5" },
-    { "if": "mtb_scale == UNKNOWN", "multiply_by": "0.7" },
+    {
+      "if": "piste_type == MISSING",
+      "do": [
+        { "if": "mtb_scale == ZERO_MINUS", "multiply_by": "1.0" },
+        { "if": "mtb_scale == ZERO", "multiply_by": "1.0" },
+        { "if": "mtb_scale == ZERO_PLUS", "multiply_by": "1.0" },
+        { "if": "mtb_scale == ONE", "multiply_by": "1.0" },
+        { "if": "mtb_scale == TWO", "multiply_by": "1.0" },
+        { "if": "mtb_scale == THREE", "multiply_by": "0.8" },
+        { "if": "mtb_scale == FOUR", "multiply_by": "0.7" },
+        { "if": "mtb_scale == FIVE", "multiply_by": "0.6" },
+        { "if": "mtb_scale == SIX", "multiply_by": "0.5" },
+        { "if": "mtb_scale == UNKNOWN", "multiply_by": "0.7" },
 
-    { "if": "mtb_winter == ONE", "multiply_by": "1.6" },
-    { "if": "mtb_winter == TWO", "multiply_by": "1.3" },
-    { "if": "mtb_winter == THREE", "multiply_by": "1.1" },
+        { "if": "mtb_winter == ONE", "multiply_by": "1.6" },
+        { "if": "mtb_winter == TWO", "multiply_by": "1.3" },
+        { "if": "mtb_winter == THREE", "multiply_by": "1.1" }
+      ]
+    },
     {
       "if": "mtb_winter == MISSING",
       "do": [
@@ -51,24 +56,34 @@
   "speed": [
     { "if": "true", "limit_to": "20" },
 
-    { "if": "mtb_winter == NO", "limit_to": "4" },
-    { "if": "mtb_winter == ONE", "limit_to": "18" },
-    { "if": "mtb_winter == TWO", "limit_to": "15" },
-    { "if": "mtb_winter == THREE", "limit_to": "12" },
+    {
+      "if": "piste_type == MISSING",
+      "do": [
+        { "if": "mtb_winter == NO", "limit_to": "4" },
+        { "if": "mtb_winter == ONE", "limit_to": "18" },
+        { "if": "mtb_winter == TWO", "limit_to": "15" },
+        { "if": "mtb_winter == THREE", "limit_to": "12" }
+      ]
+    },
 
     { "if": "piste_type == NORDIC", "limit_to": "8" },
 
-    { "if": "mtb_scale == ZERO_MINUS", "limit_to": "20" },
-    { "if": "mtb_scale == ZERO", "limit_to": "20" },
-    { "if": "mtb_scale == ZERO_PLUS", "limit_to": "18" },
-    { "if": "mtb_scale == ONE", "limit_to": "16" },
-    { "if": "mtb_scale == TWO", "limit_to": "12" },
-    { "if": "mtb_scale == THREE", "limit_to": "8" },
-    { "if": "mtb_scale == FOUR", "limit_to": "7" },
-    { "if": "mtb_scale == FIVE", "limit_to": "6" },
-    { "if": "mtb_scale == SIX", "limit_to": "5" },
-    { "if": "mtb_scale == UNKNOWN", "limit_to": "8" },
-    { "if": "mtb_scale == FERRY", "limit_to": "15" },
+    {
+      "if": "piste_type == MISSING && mtb_winter == MISSING",
+      "do": [
+        { "if": "mtb_scale == ZERO_MINUS", "limit_to": "20" },
+        { "if": "mtb_scale == ZERO", "limit_to": "20" },
+        { "if": "mtb_scale == ZERO_PLUS", "limit_to": "18" },
+        { "if": "mtb_scale == ONE", "limit_to": "16" },
+        { "if": "mtb_scale == TWO", "limit_to": "12" },
+        { "if": "mtb_scale == THREE", "limit_to": "8" },
+        { "if": "mtb_scale == FOUR", "limit_to": "7" },
+        { "if": "mtb_scale == FIVE", "limit_to": "6" },
+        { "if": "mtb_scale == SIX", "limit_to": "5" },
+        { "if": "mtb_scale == UNKNOWN", "limit_to": "8" },
+        { "if": "mtb_scale == FERRY", "limit_to": "15" }
+      ]
+    },
     { "if": "road_environment == FERRY", "limit_to": "15" },
     { "if": "predicted_highway == FOOTWAY", "limit_to": "4" },
     { "if": "!bike_access && backward_bike_access && piste_type == MISSING", "limit_to": "4" }
