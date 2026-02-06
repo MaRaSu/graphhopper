@@ -158,6 +158,21 @@ public class ResponsePath {
             && explorationWaypointList.size() > 0;
     }
 
+    private PointList altRouteViaPoints = null;
+
+    public PointList getAltRouteViaPoints() {
+        return altRouteViaPoints;
+    }
+
+    public ResponsePath setAltRouteViaPoints(PointList vp) {
+        this.altRouteViaPoints = vp;
+        return this;
+    }
+
+    public boolean hasAltRouteViaPoints() {
+        return altRouteViaPoints != null && altRouteViaPoints.size() > 0;
+    }
+
     public List<Integer> getWaypointIndices() {
         check("getWaypointIndices");
         return waypointIndices;

@@ -51,6 +51,7 @@ public class Path {
     private List<String> description;
     private boolean found;
     private String debugInfo = "";
+    private PointList altRouteViaPoints;
 
     public Path(Graph graph) {
         this.graph = graph;
@@ -176,6 +177,18 @@ public class Path {
      */
     public EdgeIteratorState getFinalEdge() {
         return graph.getEdgeIteratorState(edgeIds.get(edgeIds.size() - 1), endNode);
+    }
+
+    public PointList getAltRouteViaPoints() {
+        return altRouteViaPoints;
+    }
+
+    public void setAltRouteViaPoints(PointList viaPoints) {
+        this.altRouteViaPoints = viaPoints;
+    }
+
+    public boolean hasAltRouteViaPoints() {
+        return altRouteViaPoints != null && altRouteViaPoints.size() > 0;
     }
 
     public void setDebugInfo(String debugInfo) {

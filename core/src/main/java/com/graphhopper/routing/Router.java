@@ -492,6 +492,9 @@ public class Router {
         for (Path path : result.paths) {
             PointList waypoints = getWaypoints(snaps);
             ResponsePath responsePath = pathMerger.doWork(waypoints, Collections.singletonList(path), encodingManager, translationMap.getWithFallBack(request.getLocale()));
+            if (path.hasAltRouteViaPoints()) {
+                responsePath.setAltRouteViaPoints(path.getAltRouteViaPoints());
+            }
             ghRsp.add(responsePath);
         }
         ghRsp.getHints().putObject("visited_nodes.sum", result.visitedNodes);

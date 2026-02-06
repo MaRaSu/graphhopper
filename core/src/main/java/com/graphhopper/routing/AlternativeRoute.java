@@ -337,6 +337,14 @@ public class AlternativeRoute extends AStarBidirection implements RoutingAlgorit
                     if (sortBy < worstSortBy || alternatives.size() < maxPaths) {
                         Path path = DefaultBidirPathExtractor.extractPath(graph, weighting, fromSPTEntry, toSPTEntry, weight);
 
+                        // Record via-points for deterministic re-creation:
+                        // diverge (fromEE), meeting point (fromSPTEntry), converge (toEE)
+                        PointList viaPoints = new PointList(3, graph.getNodeAccess().is3D());
+                        viaPoints.add(graph.getNodeAccess(), fromEE.adjNode);
+                        viaPoints.add(graph.getNodeAccess(), fromSPTEntry.adjNode);
+                        viaPoints.add(graph.getNodeAccess(), toEE.adjNode);
+                        path.setAltRouteViaPoints(viaPoints);
+
                         // for now do not add alternatives to set, if we do we need to remove then on alternatives.clear too (see below)
                         // AtomicInteger tid = addToMap(traversalIDMap, path);
                         // int tid = traversalMode.createTraversalId(path.calcEdges().get(0), false);
