@@ -6,8 +6,8 @@
     { "else_if": "!bike_access && backward_bike_access", "multiply_by": "0.2" },
     { "if": "road_environment == FERRY", "multiply_by": "0.1" },
 
-    { "if": "gravel_scale == ZERO_MINUS && predicted_highway != CYCLEWAY", "multiply_by": "0.78" },
-    { "if": "gravel_scale == ZERO_MINUS && predicted_highway == CYCLEWAY", "multiply_by": "0.8" },
+    { "if": "gravel_scale == ZERO_MINUS && predicted_highway != CYCLEWAY", "multiply_by": "0.70" },
+    { "if": "gravel_scale == ZERO_MINUS && predicted_highway == CYCLEWAY", "multiply_by": "0.75" },
     { "if": "gravel_scale == ZERO", "multiply_by": "1.2" },
     { "if": "gravel_scale == ZERO_PLUS", "multiply_by": "1.2" },
     { "if": "gravel_scale == ONE", "multiply_by": "1.2" },

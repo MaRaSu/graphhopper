@@ -1,12 +1,12 @@
 {
-  "distance_influence": 10,
+  "distance_influence": 30,
   "priority": [
     { "if": "true", "multiply_by": "1.0" },
     { "if": "!bike_access && (!backward_bike_access || roundabout)", "multiply_by": "0" },
     { "else_if": "!bike_access && backward_bike_access", "multiply_by": "0.2" },
     { "if": "road_environment == FERRY", "multiply_by": "0.1" },
 
-    { "if": "mtb_scale == ZERO_MINUS", "multiply_by": "0.7" },
+    { "if": "mtb_scale == ZERO_MINUS", "multiply_by": "1.0" },
     { "if": "mtb_scale == ZERO", "multiply_by": "1.0" },
     { "if": "mtb_scale == ZERO_PLUS", "multiply_by": "1.1" },
     { "if": "mtb_scale == ONE", "multiply_by": "1.2" },
@@ -18,7 +18,7 @@
     { "if": "mtb_scale == UNKNOWN", "multiply_by": "0.5" },
 
     { "if": "predicted_highway == OUTDOOR_WAY", "multiply_by": "1.1" },
-    { "if": "predicted_highway == OUTDOOR_PATH", "multiply_by": "1.2" },
+    { "if": "predicted_highway == OUTDOOR_PATH", "multiply_by": "1.1" },
     { "if": "predicted_highway == GOOD_TRACK", "multiply_by": "1.1" },
     { "if": "predicted_highway == ROUGH_TRACK", "multiply_by": "0.9" },
     { "if": "predicted_highway == PATH", "multiply_by": "1.2" },
