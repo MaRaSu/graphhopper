@@ -175,7 +175,7 @@ graphhopper:
     bike_access, bike_average_speed, bike_priority, bike_road_access, bike_network, mtb_rating, road_environment,
     gravel_scale, gravel_scale_num, gravel_base_priority,
     mtb_scale, mtb_scale_num, mtb_base_priority,
-    predicted_surface, predicted_highway, piste_type, mtb_winter,
+    predicted_surface, predicted_highway, piste_type, mtb_winter, trail_factor,
     issue_biking_blocked, issue_foot_blocked, issue_narrow, issue_poor_visibility,
     issue_vegetation, issue_mud, issue_unknown_path, issue_unknown_track, issue_ferry
 

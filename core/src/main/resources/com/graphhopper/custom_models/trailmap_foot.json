@@ -1,7 +1,7 @@
 {
   "distance_influence": 50,
   "priority": [
-    { "if": "true", "multiply_by": "1.0" },
+    { "if": "true", "multiply_by": "(2.0 + trail_factor) * 0.3333" },
     { "if": "!foot_access", "multiply_by": "0" },
     { "if": "road_environment == FERRY", "multiply_by": "0.1" },
 

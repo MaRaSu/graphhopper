@@ -6,11 +6,21 @@
     { "else_if": "!bike_access && backward_bike_access", "multiply_by": "0.2" },
     { "if": "road_environment == FERRY", "multiply_by": "0.1" },
 
-    { "if": "gravel_scale == ZERO_MINUS && predicted_highway != CYCLEWAY", "multiply_by": "0.70" },
-    { "if": "gravel_scale == ZERO_MINUS && predicted_highway == CYCLEWAY", "multiply_by": "0.75" },
-    { "if": "gravel_scale == ZERO", "multiply_by": "1.2" },
-    { "if": "gravel_scale == ZERO_PLUS", "multiply_by": "1.2" },
-    { "if": "gravel_scale == ONE", "multiply_by": "1.2" },
+    { "if": "gravel_scale == ZERO_MINUS && predicted_highway != CYCLEWAY", "multiply_by": "0.7" },
+    { "if": "gravel_scale == ZERO_MINUS && predicted_highway == CYCLEWAY", "multiply_by": "0.8" },
+
+    {
+      "if": "gravel_scale == ZERO && predicted_surface != ASPHALT_OR_UNPAVED",
+      "multiply_by": "1.2"
+    },
+    {
+      "if": "gravel_scale == ZERO_PLUS && predicted_surface != ASPHALT_OR_UNPAVED",
+      "multiply_by": "1.2"
+    },
+    {
+      "if": "gravel_scale == ONE && predicted_surface != ASPHALT_OR_UNPAVED",
+      "multiply_by": "1.2"
+    },
     { "if": "gravel_scale == ONE && predicted_highway == GOOD_TRACK", "multiply_by": "1.1" },
     { "if": "gravel_scale == TWO", "multiply_by": "1.1" },
     { "if": "gravel_scale == TWO && mtb_scale == ONE", "multiply_by": "1.0" },
@@ -18,6 +28,7 @@
     { "if": "gravel_scale == FOUR", "multiply_by": "0.5" },
     { "if": "gravel_scale == UNKNOWN", "multiply_by": "0.5" },
 
+    { "if": "predicted_highway == OUTDOOR_WAY", "multiply_by": "1.1" },
     { "if": "predicted_highway == MAJOR_ROAD", "multiply_by": "0.5" }
   ],
   "speed": [

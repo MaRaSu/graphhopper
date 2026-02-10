@@ -17,8 +17,9 @@ import com.graphhopper.util.Helper;
  */
 public enum PredictedSurface {
     FERRY,          // Ferry routes
-    ASPHALT,        // Includes all surfaces with similar benefits than asphalt
-    COMPACTED,      // Meant for regular use, well-maintained
+    ASPHALT,            // Includes all surfaces with similar benefits than asphalt
+    ASPHALT_OR_UNPAVED, // Ambiguous: highway type equally likely paved or unpaved, no indicators
+    COMPACTED,          // Meant for regular use, well-maintained
     FINE_GRAVEL,    // Outdoor paths
     MEDIUM_GRAVEL,  // "In between", ok for non-road bikes, but slower
     ROUGH_GRAVEL,   // Really big gravel, hard to cycle on

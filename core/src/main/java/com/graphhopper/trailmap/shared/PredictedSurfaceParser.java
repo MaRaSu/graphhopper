@@ -63,6 +63,16 @@ public class PredictedSurfaceParser implements TagParser {
         }
 
         // =================================================================
+        // RULE 2b: Ambiguous highways with no surface indicators -> ASPHALT_OR_UNPAVED
+        // These highway types are roughly equally likely to be paved or unpaved.
+        // Only applies when there are NO indicators at all (surface, tracktype,
+        // smoothness, mtb:scale all absent).
+        // =================================================================
+        if (matchesAsphaltOrUnpavedRule(way)) {
+            return PredictedSurface.ASPHALT_OR_UNPAVED;
+        }
+
+        // =================================================================
         // RULE 3: Compacted surfaces -> COMPACTED
         // anyOf: [surface=compacted, LIKELY_HIGHWAY_COMPACT, LIKELY_UNPAVED_COMPACT,
         //         LIKELY_UNPAVED_COMPACT2, EXCELLENT_GOOD_SMOOTHNESS, MID_SMOOTHNESS,
@@ -162,6 +172,20 @@ public class PredictedSurfaceParser implements TagParser {
         }
 
         return false;
+    }
+
+    // --- ASPHALT_OR_UNPAVED rule ---
+    // highway in [tertiary, unclassified, residential, service, cycleway, footway]
+    // AND surface, tracktype, smoothness, mtb:scale all absent
+    private boolean matchesAsphaltOrUnpavedRule(ReaderWay way) {
+        String highway = way.getTag("highway");
+        if (highway == null || !AMBIGUOUS_SURFACE_HIGHWAYS.contains(highway)) {
+            return false;
+        }
+        return way.getTag("surface") == null
+            && way.getTag("tracktype") == null
+            && way.getTag("smoothness") == null
+            && way.getTag("mtb:scale") == null;
     }
 
     // --- COMPACTED rule ---
@@ -394,6 +418,10 @@ public class PredictedSurfaceParser implements TagParser {
 
     private static final Set<String> SECONDARY_HIGHWAYS = new HashSet<>(
         Arrays.asList("secondary", "secondary_link")
+    );
+
+    private static final Set<String> AMBIGUOUS_SURFACE_HIGHWAYS = new HashSet<>(
+        Arrays.asList("tertiary", "unclassified", "residential", "service", "cycleway", "footway")
     );
 
     private static final Set<String> LIKELY_COMPACT_HIGHWAYS = new HashSet<>(

@@ -10,6 +10,7 @@
  * - mtb_base_priority: Pre-computed priority for MTB profile
  * - predicted_surface: PredictedSurface for UI display (profile-independent)
  * - predicted_highway: PredictedHighway for UI display (profile-independent)
+ * - trail_factor: Combined trail quality penalty (width, visibility, vegetation, smoothness)
  * - issue_*: Boolean flags for route issues (returned as path details)
  *
  * To use this registry, configure GraphHopper with:
@@ -109,6 +110,15 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
                 props -> PisteType.create(),
                 (lookup, props) -> new PisteTypeParser(
                     lookup.getEnumEncodedValue(PisteType.KEY, PisteType.class))
+            );
+        }
+
+        // === Trail Factor ===
+        if (TrailFactor.KEY.equals(name)) {
+            return ImportUnit.create(name,
+                props -> TrailFactor.create(),
+                (lookup, props) -> new TrailFactorParser(
+                    lookup.getDecimalEncodedValue(TrailFactor.KEY))
             );
         }
 
