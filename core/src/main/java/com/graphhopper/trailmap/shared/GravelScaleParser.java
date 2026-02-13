@@ -70,6 +70,25 @@ public class GravelScaleParser implements TagParser {
         }
 
         // =================================================================
+        // RULE C1: smoothness=bad salvaged by strong surface/scale evidence -> ZERO_PLUS
+        // required: BAD_SMOOTHNESS
+        // anyOf: [compacted, fine_gravel, mtb:scale 0-]
+        // noneOf: [horrible smoothness, risky mtb:scale, vegetation, mud, path]
+        // =================================================================
+        if (matchesBadSmoothnessRescue(way)) {
+            return GravelScale.ZERO_PLUS;
+        }
+
+        // =================================================================
+        // RULE C2: Wide path (>2m) with compacted/fine_gravel -> ZERO_PLUS
+        // anyOf: [WIDE_PATH_GOOD_SURFACE]
+        // noneOf: [horrible smoothness, risky mtb:scale, vegetation, mud]
+        // =================================================================
+        if (matchesWidePathUpgrade(way)) {
+            return GravelScale.ZERO_PLUS;
+        }
+
+        // =================================================================
         // RULE 4: Good gravel conditions -> ZERO_PLUS
         // anyOf: [footway, fine_gravel surface, mtb:scale 0-, highway compacted,
         //         unpaved on tertiary/unclassified/residential, unpaved service,
@@ -98,6 +117,25 @@ public class GravelScaleParser implements TagParser {
         // =================================================================
         if (matchesOneRuleFinnishService(way)) {
             return GravelScale.ONE;
+        }
+
+        // =================================================================
+        // RULE C3: Narrow path (<1m) capped at TWO regardless of quality tags
+        // required: NARROW_PATH_WIDTH
+        // anyOf: [compacted/fine_gravel, good mtb:scale, good tracktype, mid smoothness]
+        // noneOf: [big risk mtb:scale, vegetation, mud]
+        // =================================================================
+        if (matchesNarrowPathFloor(way)) {
+            return GravelScale.TWO;
+        }
+
+        // =================================================================
+        // RULE C4: Path with tracktype as only quality indicator -> TWO
+        // required: path with no mtb:scale, surface, or smoothness
+        // anyOf: [grade1, grade2, grade3]
+        // =================================================================
+        if (matchesPathTracktypeOnly(way)) {
+            return GravelScale.TWO;
         }
 
         // =================================================================
@@ -154,6 +192,119 @@ public class GravelScaleParser implements TagParser {
     }
 
     // =====================================================================
+    // NEW RULE MATCHERS (C1-C4)
+    // =====================================================================
+
+    // --- C1: smoothness=bad salvaged by strong surface/scale evidence -> ZERO_PLUS ---
+    private boolean matchesBadSmoothnessRescue(ReaderWay way) {
+        // required: smoothness=bad
+        if (!hasBadSmoothness(way)) {
+            return false;
+        }
+
+        // Check exclusions
+        if (hasHorribleSmoothness(way) ||
+            hasGravelBikeRiskMtbScale(way) ||
+            hasVegetation(way) ||
+            hasMud(way) ||
+            isPath(way)) {
+            return false;
+        }
+
+        String surface = way.getTag("surface");
+        String mtbScale = way.getTag("mtb:scale");
+
+        // anyOf: compacted, fine_gravel, or mtb:scale 0-
+        if ("compacted".equals(surface)) {
+            return true;
+        }
+        if ("fine_gravel".equals(surface)) {
+            return true;
+        }
+        if ("0-".equals(mtbScale)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // --- C2: Wide path (>2m) with compacted/fine_gravel = track-like -> ZERO_PLUS ---
+    private boolean matchesWidePathUpgrade(ReaderWay way) {
+        // Check exclusions
+        if (hasHorribleSmoothness(way) ||
+            hasGravelBikeRiskMtbScale(way) ||
+            hasVegetation(way) ||
+            hasMud(way)) {
+            return false;
+        }
+
+        // anyOf: WIDE_PATH_GOOD_SURFACE
+        return isWidePathGoodSurface(way);
+    }
+
+    // --- C3: Narrow path (<1m) capped at TWO regardless of quality tags ---
+    private boolean matchesNarrowPathFloor(ReaderWay way) {
+        // required: NARROW_PATH_WIDTH (path + width < 1)
+        if (!isNarrowPathWidth(way)) {
+            return false;
+        }
+
+        // Check exclusions
+        if (hasGravelBigRiskMtbScale(way) ||
+            hasVegetation(way) ||
+            hasMud(way)) {
+            return false;
+        }
+
+        String surface = way.getTag("surface");
+        String tracktype = way.getTag("tracktype");
+        String smoothness = way.getTag("smoothness");
+        String mtbScale = way.getTag("mtb:scale");
+
+        // anyOf: compacted/fine_gravel surface
+        if ("compacted".equals(surface) || "fine_gravel".equals(surface)) {
+            return true;
+        }
+
+        // GOOD_MTB_SCALE: 0-, 0, 0+
+        if ("0-".equals(mtbScale) || "0".equals(mtbScale) || "0+".equals(mtbScale)) {
+            return true;
+        }
+
+        // GOOD_TRACKTYPE: grade1, grade2, grade3
+        if (tracktype != null && isGoodTracktype(tracktype)) {
+            return true;
+        }
+
+        // MID_SMOOTHNESS: intermediate or bad
+        if (isMidSmoothness(smoothness)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // --- C4: Path with tracktype as only quality indicator -> TWO ---
+    private boolean matchesPathTracktypeOnly(ReaderWay way) {
+        String highway = way.getTag("highway");
+
+        // required: path with no mtb:scale, surface, or smoothness
+        if (!"path".equals(highway)) {
+            return false;
+        }
+        if (way.getTag("mtb:scale") != null ||
+            way.getTag("surface") != null ||
+            way.getTag("smoothness") != null) {
+            return false;
+        }
+
+        String tracktype = way.getTag("tracktype");
+
+        // anyOf: grade1, grade2, grade3
+        return tracktype != null && isGoodTracktype(tracktype);
+    }
+
+    // =====================================================================
     // TAG PATTERN MATCHERS
     // Each method implements the matching logic for a specific pattern
     // =====================================================================
@@ -203,7 +354,13 @@ public class GravelScaleParser implements TagParser {
     }
 
     // --- ZERO rule: well-maintained unpaved cycleways ---
+    // noneOf: [GRAVEL_BIKE_RISK_MTB_SCALE, PATH]
     private boolean matchesZeroRule(ReaderWay way) {
+        // Check exclusions
+        if (hasGravelBikeRiskMtbScale(way) || isPath(way)) {
+            return false;
+        }
+
         String highway = way.getTag("highway");
         String tracktype = way.getTag("tracktype");
 
@@ -224,6 +381,7 @@ public class GravelScaleParser implements TagParser {
     private boolean matchesZeroPlusRule(ReaderWay way) {
         // First check exclusions (noneOf) EXCEPT isRiskService
         if (hasHorribleSmoothness(way) ||
+            hasBadSmoothness(way) ||
             hasGravelBikeRiskMtbScale(way) ||
             hasVegetation(way) ||
             hasMud(way) ||
@@ -283,8 +441,8 @@ public class GravelScaleParser implements TagParser {
             return true;
         }
 
-        // MID_SMOOTHNESS: intermediate or bad
-        if (isMidSmoothness(smoothness)) {
+        // INTERMEDIATE_SMOOTHNESS: intermediate only (bad now excluded above)
+        if ("intermediate".equals(smoothness)) {
             return true;
         }
 
@@ -300,6 +458,7 @@ public class GravelScaleParser implements TagParser {
     private boolean matchesOneRuleBasic(ReaderWay way) {
         // Check exclusions
         if (hasHorribleSmoothness(way) ||
+            hasGravelBikeRiskMtbScale(way) ||
             hasVegetation(way) ||
             hasMud(way) ||
             isPath(way) ||
@@ -357,7 +516,8 @@ public class GravelScaleParser implements TagParser {
             hasGravelBikeRiskMtbScale(way) ||
             hasVegetation(way) ||
             hasMud(way) ||
-            isRiskServiceGravel(way)) {
+            isRiskServiceGravel(way) ||
+            isNarrowPathWidth(way)) {
             return false;
         }
 
@@ -374,6 +534,17 @@ public class GravelScaleParser implements TagParser {
 
         // compacted surface
         if ("compacted".equals(surface)) {
+            return true;
+        }
+
+        // fine_gravel surface
+        if ("fine_gravel".equals(surface)) {
+            return true;
+        }
+
+        // path with mtb:scale=0 and good tracktype (grade1-3)
+        if ("path".equals(highway) && "0".equals(mtbScale) &&
+            tracktype != null && isGoodTracktype(tracktype)) {
             return true;
         }
 
@@ -683,5 +854,44 @@ public class GravelScaleParser implements TagParser {
         if (!"path".equals(highway) && !"track".equals(highway)) return false;
         return "intermediate".equals(visibility) || "bad".equals(visibility) ||
                "horrible".equals(visibility) || "no".equals(visibility);
+    }
+
+    private boolean hasBadSmoothness(ReaderWay way) {
+        return "bad".equals(way.getTag("smoothness"));
+    }
+
+    private boolean isGoodTracktype(String tracktype) {
+        return "grade1".equals(tracktype) || "grade2".equals(tracktype) || "grade3".equals(tracktype);
+    }
+
+    /**
+     * Parse the OSM width tag to a numeric value in meters.
+     * Handles formats like "1", "1.5", "2 m", "1.5m".
+     * Returns -1 if the tag is missing or unparseable.
+     */
+    private double parseWidth(ReaderWay way) {
+        String width = way.getTag("width");
+        if (width == null) return -1;
+        // Strip trailing "m" or " m"
+        width = width.trim().replaceAll("\\s*m$", "");
+        try {
+            return Double.parseDouble(width);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private boolean isNarrowPathWidth(ReaderWay way) {
+        if (!"path".equals(way.getTag("highway"))) return false;
+        double width = parseWidth(way);
+        return width > 0 && width < 1;
+    }
+
+    private boolean isWidePathGoodSurface(ReaderWay way) {
+        if (!"path".equals(way.getTag("highway"))) return false;
+        double width = parseWidth(way);
+        if (width <= 2) return false;
+        String surface = way.getTag("surface");
+        return "fine_gravel".equals(surface) || "compacted".equals(surface);
     }
 }
