@@ -9,8 +9,12 @@ import com.graphhopper.storage.IntsRef;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import static com.graphhopper.trailmap.shared.GravelScale.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Tests for GravelScaleParser — verifies OSM tag combinations map to correct GravelScale values.
@@ -281,6 +285,109 @@ class GravelScaleParserTest {
         // grade2 is NOT a strong tag — no rescue
         assertScale(ONE, "track + bad + grade2 (no rescue)",
                 "highway", "track", "smoothness", "bad", "tracktype", "grade2");
+    }
+
+    // =================================================================
+    // TRACK surface/tracktype combinations
+    // =================================================================
+
+    /**
+     * Helper: collect mismatches instead of failing immediately, then report all at once.
+     */
+    private void assertScaleCollect(List<String> failures, GravelScale expected, String description, String... tagPairs) {
+        ReaderWay way = new ReaderWay(1);
+        for (int i = 0; i < tagPairs.length; i += 2) {
+            way.setTag(tagPairs[i], tagPairs[i + 1]);
+        }
+        GravelScale actual = parser.computeGravelScale(way);
+        if (actual != expected) {
+            failures.add(description + " ==> expected: " + expected + " but was: " + actual);
+        }
+    }
+
+    @Test
+    void testTrackSurfaceTracktypeCombinations() {
+        List<String> failures = new ArrayList<>();
+
+        // #1: bare track → THREE
+        assertScaleCollect(failures, THREE, "#1 bare track",
+                "highway", "track");
+
+        // #2: track + dirt → THREE
+        assertScaleCollect(failures, THREE, "#2 track + dirt",
+                "highway", "track", "surface", "dirt");
+
+        // #3: track + dirt + grade5 → THREE
+        assertScaleCollect(failures, THREE, "#3 track + dirt + grade5",
+                "highway", "track", "surface", "dirt", "tracktype", "grade5");
+
+        // #4: track + grade5 (no surface) → THREE
+        assertScaleCollect(failures, THREE, "#4 track + grade5",
+                "highway", "track", "tracktype", "grade5");
+
+        // #5: track + ground → THREE
+        assertScaleCollect(failures, THREE, "#5 track + ground",
+                "highway", "track", "surface", "ground");
+
+        // #6: track + ground + grade4 → TWO
+        assertScaleCollect(failures, TWO, "#6 track + ground + grade4",
+                "highway", "track", "surface", "ground", "tracktype", "grade4");
+
+        // #7: track + ground + grade3 → ONE
+        assertScaleCollect(failures, ONE, "#7 track + ground + grade3",
+                "highway", "track", "surface", "ground", "tracktype", "grade3");
+
+        // #8: track + gravel → THREE
+        assertScaleCollect(failures, THREE, "#8 track + gravel",
+                "highway", "track", "surface", "gravel");
+
+        // #9: track + gravel + grade5 → THREE
+        assertScaleCollect(failures, THREE, "#9 track + gravel + grade5",
+                "highway", "track", "surface", "gravel", "tracktype", "grade5");
+
+        // #10: track + unpaved → ONE
+        assertScaleCollect(failures, ONE, "#10 track + unpaved",
+                "highway", "track", "surface", "unpaved");
+
+        // #11: track + unpaved + grade5 → TWO
+        assertScaleCollect(failures, TWO, "#11 track + unpaved + grade5",
+                "highway", "track", "surface", "unpaved", "tracktype", "grade5");
+
+        // #11a: track + unpaved + grade1 → ZERO (grade1 dominates)
+        assertScaleCollect(failures, ZERO, "#11a track + unpaved + grade1",
+                "highway", "track", "surface", "unpaved", "tracktype", "grade1");
+
+        // #11b: track + unpaved + grade2 → ZERO_PLUS (grade2 dominates)
+        assertScaleCollect(failures, ZERO_PLUS, "#11b track + unpaved + grade2",
+                "highway", "track", "surface", "unpaved", "tracktype", "grade2");
+
+        // #12: track + horrible smoothness → THREE
+        assertScaleCollect(failures, THREE, "#12 track + horrible",
+                "highway", "track", "smoothness", "horrible");
+
+        // #13: track + very_horrible smoothness → FOUR
+        assertScaleCollect(failures, FOUR, "#13 track + very_horrible",
+                "highway", "track", "smoothness", "very_horrible");
+
+        // #14: track + dirt + horrible smoothness → THREE
+        assertScaleCollect(failures, THREE, "#14 track + dirt + horrible",
+                "highway", "track", "surface", "dirt", "smoothness", "horrible");
+
+        // #15: track + grade5 + horrible smoothness → THREE
+        assertScaleCollect(failures, THREE, "#15 track + grade5 + horrible",
+                "highway", "track", "tracktype", "grade5", "smoothness", "horrible");
+
+        // #16: track + mud → FOUR
+        assertScaleCollect(failures, FOUR, "#16 track + mud",
+                "highway", "track", "surface", "mud");
+
+        // #17: track + mud + grade5 → FOUR
+        assertScaleCollect(failures, FOUR, "#17 track + mud + grade5",
+                "highway", "track", "surface", "mud", "tracktype", "grade5");
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
     }
 
     // =================================================================

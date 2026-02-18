@@ -573,10 +573,10 @@ public class GravelScaleParser implements TagParser {
             return true;
         }
 
-        // TRACK_UNPAVED_NO_OTHER_TAGS: track with unpaved/compacted, no smoothness or mtb:scale
+        // TRACK_UNPAVED_NO_OTHER_TAGS: track with unpaved/compacted, no other quality indicators
         if ("track".equals(highway) &&
             (surface != null && ("unpaved".equals(surface) || "compacted".equals(surface))) &&
-            smoothness == null && mtbScale == null) {
+            smoothness == null && mtbScale == null && tracktype == null) {
             return true;
         }
 
@@ -662,8 +662,8 @@ public class GravelScaleParser implements TagParser {
         String surface = way.getTag("surface");
         String smoothness = way.getTag("smoothness");
 
-        // anyOf: gravel surface, no surface, or horrible smoothness
-        if ("gravel".equals(surface)) {
+        // anyOf: gravel/dirt/ground surface, no surface, or horrible smoothness
+        if ("gravel".equals(surface) || "dirt".equals(surface) || "ground".equals(surface)) {
             return true;
         }
 
