@@ -20,6 +20,7 @@ public class RouteIssues {
 
     // Key constants for encoded values
     public static final String KEY_BIKING_BLOCKED = "issue_biking_blocked";
+    public static final String KEY_BIKING_BLOCKED_RISK = "issue_biking_blocked_risk";
     public static final String KEY_FOOT_BLOCKED = "issue_foot_blocked";
     public static final String KEY_NARROW = "issue_narrow";
     public static final String KEY_POOR_VISIBILITY = "issue_poor_visibility";
@@ -30,14 +31,22 @@ public class RouteIssues {
     public static final String KEY_FERRY = "issue_ferry";
 
     /**
-     * Biking not permitted: bicycle=no/private or access=no/private/permit without bicycle override.
+     * Biking not permitted: bicycle=no/private or access=no/private without bicycle override.
      */
     public static BooleanEncodedValue createBikingBlocked() {
         return new SimpleBooleanEncodedValue(KEY_BIKING_BLOCKED);
     }
 
     /**
-     * Walking not permitted: foot=no/private or access=no/private/permit without foot override.
+     * Biking access risk: access tags suggest possible restriction (unknown, agricultural,
+     * forestry, delivery, service, permit) but routing is still allowed.
+     */
+    public static BooleanEncodedValue createBikingBlockedRisk() {
+        return new SimpleBooleanEncodedValue(KEY_BIKING_BLOCKED_RISK);
+    }
+
+    /**
+     * Walking not permitted: foot=no/private or access=no/private without foot override.
      */
     public static BooleanEncodedValue createFootBlocked() {
         return new SimpleBooleanEncodedValue(KEY_FOOT_BLOCKED);
@@ -97,6 +106,7 @@ public class RouteIssues {
      */
     public static boolean isRouteIssueKey(String key) {
         return KEY_BIKING_BLOCKED.equals(key) ||
+               KEY_BIKING_BLOCKED_RISK.equals(key) ||
                KEY_FOOT_BLOCKED.equals(key) ||
                KEY_NARROW.equals(key) ||
                KEY_POOR_VISIBILITY.equals(key) ||

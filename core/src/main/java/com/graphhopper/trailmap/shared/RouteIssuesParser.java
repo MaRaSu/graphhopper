@@ -5,7 +5,9 @@
  * Implements typedIssueRules from route-profile-rules.ts.
  *
  * Issues detected:
- * - BIKING_BLOCKED: bicycle=no/private or access restriction without bicycle override
+ * - BIKING_BLOCKED: bicycle=no/private or access=no/private without bicycle override
+ * - BIKING_BLOCKED_RISK: access tags suggest possible restriction (unknown, agricultural,
+ *   forestry, delivery, service, permit) but routing is still allowed
  * - FOOT_BLOCKED: foot=no/private or access restriction without foot override
  * - NARROW: highway=path with width < 0.5m
  * - POOR_VISIBILITY: highway=path with trail_visibility=bad/horrible/no
@@ -34,6 +36,7 @@ import java.util.Set;
 public class RouteIssuesParser implements TagParser {
 
     private final BooleanEncodedValue bikingBlockedEnc;
+    private final BooleanEncodedValue bikingBlockedRiskEnc;
     private final BooleanEncodedValue footBlockedEnc;
     private final BooleanEncodedValue narrowEnc;
     private final BooleanEncodedValue poorVisibilityEnc;
@@ -58,8 +61,19 @@ public class RouteIssuesParser implements TagParser {
         Arrays.asList("bad", "horrible", "no")
     );
 
+    // Access values that suggest possible restriction but don't fully block biking
+    private static final Set<String> RISK_ACCESS_VALUES = new HashSet<>(
+        Arrays.asList("unknown", "agricultural", "forestry", "delivery", "service", "permit")
+    );
+
+    // Allowed bicycle values that override access risk
+    private static final Set<String> BICYCLE_OVERRIDES = new HashSet<>(
+        Arrays.asList("yes", "designated", "official", "permissive", "destination")
+    );
+
     public RouteIssuesParser(
             BooleanEncodedValue bikingBlockedEnc,
+            BooleanEncodedValue bikingBlockedRiskEnc,
             BooleanEncodedValue footBlockedEnc,
             BooleanEncodedValue narrowEnc,
             BooleanEncodedValue poorVisibilityEnc,
@@ -69,6 +83,7 @@ public class RouteIssuesParser implements TagParser {
             BooleanEncodedValue unknownTrackEnc,
             BooleanEncodedValue ferryEnc) {
         this.bikingBlockedEnc = bikingBlockedEnc;
+        this.bikingBlockedRiskEnc = bikingBlockedRiskEnc;
         this.footBlockedEnc = footBlockedEnc;
         this.narrowEnc = narrowEnc;
         this.poorVisibilityEnc = poorVisibilityEnc;
@@ -84,6 +99,7 @@ public class RouteIssuesParser implements TagParser {
                               ReaderWay way, IntsRef relationFlags) {
         // Set all issue flags in one pass
         bikingBlockedEnc.setBool(false, edgeId, edgeIntAccess, checkBikingBlocked(way));
+        bikingBlockedRiskEnc.setBool(false, edgeId, edgeIntAccess, checkBikingBlockedRisk(way));
         footBlockedEnc.setBool(false, edgeId, edgeIntAccess, checkFootBlocked(way));
         narrowEnc.setBool(false, edgeId, edgeIntAccess, checkNarrow(way));
         poorVisibilityEnc.setBool(false, edgeId, edgeIntAccess, checkPoorVisibility(way));
@@ -108,9 +124,31 @@ public class RouteIssuesParser implements TagParser {
 
         // Case 2: General access restriction without bicycle override
         String access = way.getTag("access");
-        if ("no".equals(access) || "private".equals(access) || "permit".equals(access)) {
+        if ("no".equals(access) || "private".equals(access)) {
             // Check if bicycle explicitly allowed
             return !"yes".equals(bicycle) && !"permissive".equals(bicycle);
+        }
+
+        return false;
+    }
+
+    // =========================================================================
+    // BIKING_BLOCKED_RISK
+    // Access tags suggest possible restriction but routing is still allowed.
+    // Triggers for: unknown, agricultural, forestry, delivery, service, permit
+    // =========================================================================
+    private boolean checkBikingBlockedRisk(ReaderWay way) {
+        String bicycle = way.getTag("bicycle");
+
+        // Direct bicycle risk tag
+        if (bicycle != null && RISK_ACCESS_VALUES.contains(bicycle)) {
+            return true;
+        }
+
+        // General access risk without bicycle override
+        String access = way.getTag("access");
+        if (access != null && RISK_ACCESS_VALUES.contains(access)) {
+            return !BICYCLE_OVERRIDES.contains(bicycle);
         }
 
         return false;

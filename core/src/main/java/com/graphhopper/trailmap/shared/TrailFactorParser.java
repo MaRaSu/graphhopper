@@ -59,7 +59,7 @@ public class TrailFactorParser implements TagParser {
         }
 
         double width = parseWidth(widthStr);
-        if (Double.isNaN(width)) {
+        if (Double.isNaN(width) || width <= 0) {
             return 1.0;
         }
 

@@ -142,6 +142,7 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
                 props -> RouteIssues.createBikingBlocked(),
                 (lookup, props) -> new RouteIssuesParser(
                     lookup.getBooleanEncodedValue(RouteIssues.KEY_BIKING_BLOCKED),
+                    lookup.getBooleanEncodedValue(RouteIssues.KEY_BIKING_BLOCKED_RISK),
                     lookup.getBooleanEncodedValue(RouteIssues.KEY_FOOT_BLOCKED),
                     lookup.getBooleanEncodedValue(RouteIssues.KEY_NARROW),
                     lookup.getBooleanEncodedValue(RouteIssues.KEY_POOR_VISIBILITY),
@@ -151,6 +152,7 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
                     lookup.getBooleanEncodedValue(RouteIssues.KEY_UNKNOWN_TRACK),
                     lookup.getBooleanEncodedValue(RouteIssues.KEY_FERRY)),
                 // Declare dependencies so ImportUnitSorter processes these first
+                RouteIssues.KEY_BIKING_BLOCKED_RISK,
                 RouteIssues.KEY_FOOT_BLOCKED,
                 RouteIssues.KEY_NARROW,
                 RouteIssues.KEY_POOR_VISIBILITY,
@@ -159,6 +161,13 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
                 RouteIssues.KEY_UNKNOWN_PATH,
                 RouteIssues.KEY_UNKNOWN_TRACK,
                 RouteIssues.KEY_FERRY
+            );
+        }
+
+        if (RouteIssues.KEY_BIKING_BLOCKED_RISK.equals(name)) {
+            return ImportUnit.create(name,
+                props -> RouteIssues.createBikingBlockedRisk(),
+                null  // No parser - handled by RouteIssuesParser via KEY_BIKING_BLOCKED
             );
         }
 

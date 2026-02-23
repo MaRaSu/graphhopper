@@ -40,6 +40,11 @@ public class FootAccessParser extends AbstractAccessParser implements TagParser 
         this(lookup.getBooleanEncodedValue(VehicleAccess.key("foot")));
         blockPrivate(properties.getBool("block_private", true));
         blockFords(properties.getBool("block_fords", false));
+
+        // Trailmap: pedestrians can pass through these access types
+        restrictedValues.remove("unknown");
+        restrictedValues.remove("service");
+        restrictedValues.remove("permit");
     }
 
     protected FootAccessParser(BooleanEncodedValue accessEnc) {

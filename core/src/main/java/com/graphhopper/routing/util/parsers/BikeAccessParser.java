@@ -13,6 +13,14 @@ public class BikeAccessParser extends BikeCommonAccessParser {
                 lookup.getBooleanEncodedValue(Roundabout.KEY));
         blockPrivate(properties.getBool("block_private", true));
         blockFords(properties.getBool("block_fords", false));
+
+        // Trailmap: bikes can pass through these access types
+        restrictedValues.remove("unknown");
+        restrictedValues.remove("agricultural");
+        restrictedValues.remove("forestry");
+        restrictedValues.remove("delivery");
+        restrictedValues.remove("service");
+        restrictedValues.remove("permit");
     }
 
     public BikeAccessParser(BooleanEncodedValue accessEnc, BooleanEncodedValue roundaboutEnc) {
