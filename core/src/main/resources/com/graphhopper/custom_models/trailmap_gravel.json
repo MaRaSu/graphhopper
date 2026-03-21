@@ -7,7 +7,7 @@
     { "if": "road_environment == FERRY", "multiply_by": "0.1" },
 
     { "if": "gravel_scale == ZERO_MINUS && predicted_highway != CYCLEWAY", "multiply_by": "0.7" },
-    { "if": "gravel_scale == ZERO_MINUS && predicted_highway == CYCLEWAY", "multiply_by": "0.8" },
+    { "if": "gravel_scale == ZERO_MINUS && predicted_highway == CYCLEWAY", "multiply_by": "0.85" },
     {
       "if": "gravel_scale == ZERO && predicted_surface != ASPHALT_OR_UNPAVED",
       "multiply_by": "1.25"

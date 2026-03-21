@@ -2,7 +2,7 @@
  * Trailmap - TrailFactorParser
  *
  * Computes trail_factor from OSM tags: width, trail_visibility, obstacle, smoothness.
- * The factor is a product of four sub-factors, each defaulting to 1.0 when the
+ * The factor is the minimum of four sub-factors, each defaulting to 1.0 when the
  * relevant tag is absent.
  *
  * Width and visibility apply only to paths/tracks. Smoothness applies to all ways.
@@ -40,11 +40,12 @@ public class TrailFactorParser implements TagParser {
         double vegetationFactor = isPathOrTrack ? computeVegetationFactor(way) : 1.0;
         double smoothnessFactor = computeSmoothnessFactor(way);
 
-        double combined = widthFactor * visibilityFactor * vegetationFactor * smoothnessFactor;
+        double combined = Math.min(Math.min(widthFactor, visibilityFactor),
+                Math.min(vegetationFactor, smoothnessFactor));
 
         // Clamp to [0, 1] and round to 0.05 steps
-        combined = Math.max(0.0, Math.min(1.0, combined));
-        return Math.round(combined * 20.0) / 20.0;
+        combined = Math.max(0.05, Math.round(combined * 20.0) / 20.0);
+        return Math.min(1.0, combined);
     }
 
     /**
@@ -66,13 +67,13 @@ public class TrailFactorParser implements TagParser {
         if (width >= 0.6) {
             return 1.0;
         } else if (width >= 0.5) {
-            return 0.70;
+            return 0.80;
         } else if (width >= 0.4) {
-            return 0.50;
+            return 0.60;
         } else if (width >= 0.3) {
-            return 0.35;
+            return 0.40;
         } else {
-            return 0.15;
+            return 0.20;
         }
     }
 
@@ -84,7 +85,8 @@ public class TrailFactorParser implements TagParser {
         try {
             // Strip common suffixes
             String cleaned = widthStr.replaceAll("[^0-9.]", "");
-            if (cleaned.isEmpty()) return Double.NaN;
+            if (cleaned.isEmpty())
+                return Double.NaN;
             return Double.parseDouble(cleaned);
         } catch (NumberFormatException e) {
             return Double.NaN;
@@ -108,10 +110,10 @@ public class TrailFactorParser implements TagParser {
             case "intermediate":
                 return 0.80;
             case "bad":
-                return 0.40;
+                return 0.60;
             default:
                 // horrible, no, or any other value
-                return 0.15;
+                return 0.35;
         }
     }
 
@@ -121,7 +123,7 @@ public class TrailFactorParser implements TagParser {
     private double computeVegetationFactor(ReaderWay way) {
         String obstacle = way.getTag("obstacle");
         if ("vegetation".equals(obstacle)) {
-            return 0.50;
+            return 0.40;
         }
         return 1.0;
     }
@@ -142,19 +144,28 @@ public class TrailFactorParser implements TagParser {
         if (hasMtbScale) {
             // Moderated: mtb:scale carries the primary difficulty signal
             switch (smoothness) {
-                case "horrible":      return 0.95;
-                case "very_horrible": return 0.85;
-                case "impassable":    return 0.10;
-                default:              return 1.0;
+                case "horrible":
+                    return 0.95;
+                case "very_horrible":
+                    return 0.85;
+                case "impassable":
+                    return 0.10;
+                default:
+                    return 1.0;
             }
         } else {
             // Full: smoothness is the primary difficulty signal
             switch (smoothness) {
-                case "very_bad":      return 0.90;
-                case "horrible":      return 0.85;
-                case "very_horrible": return 0.60;
-                case "impassable":    return 0.10;
-                default:              return 1.0;
+                case "very_bad":
+                    return 0.90;
+                case "horrible":
+                    return 0.85;
+                case "very_horrible":
+                    return 0.60;
+                case "impassable":
+                    return 0.10;
+                default:
+                    return 1.0;
             }
         }
     }
