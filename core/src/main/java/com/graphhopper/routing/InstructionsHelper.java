@@ -25,15 +25,15 @@ import com.graphhopper.util.shapes.GHPoint;
 /**
  * Simple helper class used during the instruction generation
  */
-class InstructionsHelper {
+public class InstructionsHelper {
 
-    static double calculateOrientationDelta(double prevLatitude, double prevLongitude, double latitude, double longitude, double prevOrientation) {
+    public static double calculateOrientationDelta(double prevLatitude, double prevLongitude, double latitude, double longitude, double prevOrientation) {
         double orientation = AngleCalc.ANGLE_CALC.calcOrientation(prevLatitude, prevLongitude, latitude, longitude, false);
         orientation = AngleCalc.ANGLE_CALC.alignOrientation(prevOrientation, orientation);
         return orientation - prevOrientation;
     }
 
-    static int calculateSign(double prevLatitude, double prevLongitude, double latitude, double longitude, double prevOrientation) {
+    public static int calculateSign(double prevLatitude, double prevLongitude, double latitude, double longitude, double prevOrientation) {
         double delta = calculateOrientationDelta(prevLatitude, prevLongitude, latitude, longitude, prevOrientation);
         double absDelta = Math.abs(delta);
 
@@ -61,14 +61,14 @@ class InstructionsHelper {
             return Instruction.TURN_SHARP_RIGHT;
     }
 
-    static boolean isSameName(String name1, String name2) {
+    public static boolean isSameName(String name1, String name2) {
         // We don't want two empty names to be similar (they usually don't have names if they are random tracks)
         if (name1 == null || name2 == null || name1.isEmpty() || name2.isEmpty())
             return false;
         return name1.equals(name2);
     }
 
-    static GHPoint getPointForOrientationCalculation(EdgeIteratorState edgeIteratorState, NodeAccess nodeAccess) {
+    public static GHPoint getPointForOrientationCalculation(EdgeIteratorState edgeIteratorState, NodeAccess nodeAccess) {
         double tmpLat;
         double tmpLon;
         PointList tmpWayGeo = edgeIteratorState.fetchWayGeometry(FetchMode.ALL);
@@ -82,15 +82,15 @@ class InstructionsHelper {
         return new GHPoint(tmpLat, tmpLon);
     }
 
-    static boolean isToFerry(RoadEnvironment re, RoadEnvironment prev) {
+    public static boolean isToFerry(RoadEnvironment re, RoadEnvironment prev) {
         return (re == RoadEnvironment.FERRY) && re != prev;
     }
 
-    static boolean isFromFerry(RoadEnvironment re, RoadEnvironment prev) {
+    public static boolean isFromFerry(RoadEnvironment re, RoadEnvironment prev) {
         return (prev == RoadEnvironment.FERRY) && re != prev;
     }
 
-    static String createFerryInfo(RoadEnvironment re, RoadEnvironment prev) {
+    public static String createFerryInfo(RoadEnvironment re, RoadEnvironment prev) {
         if (re == prev) return null;
         if (re == RoadEnvironment.FERRY) return "board_ferry";
         if (prev == RoadEnvironment.FERRY) return "leave_ferry";

@@ -1,0 +1,913 @@
+package com.graphhopper.trailmap.tbt;
+
+import com.graphhopper.GHRequest;
+import com.graphhopper.GHResponse;
+import com.graphhopper.GraphHopper;
+import com.graphhopper.ResponsePath;
+import com.graphhopper.config.Profile;
+import com.graphhopper.routing.Path;
+import com.graphhopper.routing.ev.EncodedValueLookup;
+import com.graphhopper.routing.weighting.Weighting;
+import com.graphhopper.storage.BaseGraph;
+import com.graphhopper.storage.NodeAccess;
+import com.graphhopper.util.*;
+import com.graphhopper.util.details.PathDetail;
+import com.graphhopper.util.shapes.GHPoint;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Core logic for Trailmap TbT instruction generation.
+ * <p>
+ * Handles three segment types:
+ * <ul>
+ *   <li>{@code followRoads} — routed via GH, produces edge sequences and instructions</li>
+ *   <li>{@code direct} — straight line, no instructions, geometry included in polyline</li>
+ *   <li>{@code coordinates} — imported track, no instructions, geometry included in polyline</li>
+ * </ul>
+ * Non-routable segments (direct/coordinates) produce a synthetic CONTINUE_ON_STREET
+ * instruction with {@code tbt_available: false} so the client can alert the user.
+ * The preceding instruction also carries {@code next_segment_type}, and the first
+ * instruction after the gap carries {@code tbt_resumed: true}.
+ * <p>
+ * Each routable segment is routed individually (no merging of same-profile segments).
+ * Edge chains are stitched at segment boundaries with deduplication and micro-routing
+ * to bridge any gaps between disconnected edges.
+ */
+public class RouteInstructionGenerator {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(RouteInstructionGenerator.class);
+
+    private final GraphHopper graphHopper;
+    private final BaseGraph baseGraph;
+    private final EncodedValueLookup encodedValueLookup;
+    private final TranslationMap translationMap;
+
+    public RouteInstructionGenerator(GraphHopper graphHopper, BaseGraph baseGraph,
+                                     EncodedValueLookup encodedValueLookup,
+                                     TranslationMap translationMap) {
+        this.graphHopper = graphHopper;
+        this.baseGraph = baseGraph;
+        this.encodedValueLookup = encodedValueLookup;
+        this.translationMap = translationMap;
+    }
+
+    /**
+     * Result of instruction generation: instructions + full route polyline.
+     */
+    public static class Result {
+        public final InstructionList instructions;
+        public final PointList polyline;
+
+        public Result(InstructionList instructions, PointList polyline) {
+            this.instructions = instructions;
+            this.polyline = polyline;
+        }
+    }
+
+    /**
+     * Generate a continuous instruction list and polyline for the entire route.
+     */
+    public Result generate(TrailmapInstructionRequest request) {
+        Map<String, TrailmapInstructionRequest.Coordinates> waypointMap = new HashMap<>();
+        for (TrailmapInstructionRequest.Waypoint wp : request.getWaypoints()) {
+            waypointMap.put(wp.getId(), wp.getCoordinates());
+        }
+
+        // Each routable segment becomes its own chunk (no merging).
+        List<Chunk> chunks = buildChunks(request.getSegments(), waypointMap);
+        LOGGER.info("Route has {} segments split into {} chunks", request.getSegments().size(), chunks.size());
+
+        // Resolve instruction profile
+        Profile instrProfile = graphHopper.getProfile(request.getInstructionProfile());
+        if (instrProfile == null) {
+            throw new IllegalArgumentException("Unknown instruction profile: " + request.getInstructionProfile());
+        }
+        Weighting weighting = graphHopper.createWeighting(instrProfile, new PMap());
+        Translation tr = translationMap.getWithFallBack(Locale.forLanguageTag(request.getLocale()));
+
+        // Snap preventions from the top-level request
+        List<String> snapPreventions = request.getSnapPreventions();
+
+        // Process each chunk: route sections produce instructions; non-routable chunks
+        // produce geometry only. The full polyline is built by concatenation.
+        InstructionList allInstructions = new InstructionList(tr);
+        PointList fullPolyline = new PointList(128, true);
+
+        Double nextHeading = null;
+        TrailmapInstructionRequest.Coordinates nextStartOverride = null;
+        // Track the last routable chunk's edge chain for stitching
+        List<Integer> prevEdgeIds = null;
+        PointList prevRoutePolyline = null;
+        String prevProfile = null;
+        // Track non-routable gap so the next routed section's first instruction gets tbt_resumed
+        String pendingResumeType = null;
+
+        for (int ci = 0; ci < chunks.size(); ci++) {
+            Chunk chunk = chunks.get(ci);
+
+            if (chunk.routableSection != null) {
+                // --- Routable chunk: route, extract edges, generate instructions ---
+                Section section = chunk.routableSection;
+
+                Double heading = nextHeading != null ? nextHeading : section.initialHeading;
+                if (nextStartOverride != null) {
+                    section.points.set(0, nextStartOverride);
+                }
+
+                GHResponse response = routeSection(section, heading, snapPreventions);
+                if (response.hasErrors()) {
+                    throw new IllegalStateException("Routing failed for chunk " + ci + ": " +
+                            response.getErrors().stream().map(Throwable::getMessage).collect(Collectors.joining(", ")));
+                }
+
+                ResponsePath responsePath = response.getBest();
+                List<Integer> edgeIds = extractEdgeIds(responsePath);
+                PointList routePolyline = responsePath.getPoints();
+
+                // Stitch edge chains at boundary between consecutive routable chunks
+                boolean uturnAtBoundary = false;
+                if (prevEdgeIds != null && !prevEdgeIds.isEmpty() && !edgeIds.isEmpty()) {
+                    uturnAtBoundary = stitchEdgeChains(prevEdgeIds, edgeIds, prevRoutePolyline, routePolyline,
+                            fullPolyline, section.profile, snapPreventions);
+                }
+
+                if (!edgeIds.isEmpty()) {
+                    // Build synthetic path and generate instructions
+                    TrailmapInstructionRequest.Coordinates startCoord = section.points.get(0);
+                    Path syntheticPath = buildSyntheticPath(edgeIds, startCoord);
+                    InstructionList sectionInstructions = TrailmapInstructionsFromEdges.calcInstructions(
+                            syntheticPath, baseGraph, weighting, encodedValueLookup, tr);
+
+                    // InstructionsFromEdges cannot generate a U-turn as the first instruction
+                    // of a standalone synthetic path (no previous edge to compute angle against).
+                    // If stitchEdgeChains detected a U-turn at the boundary, patch the first
+                    // CONTINUE_ON_STREET to U_TURN_UNKNOWN so appendInstructions() won't strip it.
+                    if (uturnAtBoundary && !sectionInstructions.isEmpty()
+                            && sectionInstructions.get(0).getSign() == Instruction.CONTINUE_ON_STREET) {
+                        sectionInstructions.get(0).setSign(Instruction.U_TURN_UNKNOWN);
+                    }
+
+                    boolean isLastRoutableChunk = isLastRoutableChunk(chunks, ci);
+                    int instrCountBefore = allInstructions.size();
+                    appendInstructions(allInstructions, sectionInstructions, fullPolyline.size(),
+                            isLastRoutableChunk, pendingResumeType != null);
+
+                    // Mark the first new instruction as resuming TbT after a direct/coordinates gap.
+                    // Store the current polyline size as a hint for remapInstructionGeometry():
+                    // the synthetic path's first graph node may not be in the route response
+                    // polyline (it's before the snapped start), so coordinate matching would fail.
+                    if (pendingResumeType != null && allInstructions.size() > instrCountBefore) {
+                        Instruction firstNew = allInstructions.get(instrCountBefore);
+                        firstNew.setExtraInfo("tbt_resumed", true);
+                        firstNew.setExtraInfo("prev_segment_type", pendingResumeType);
+                        firstNew.setExtraInfo("_polyline_start_hint", fullPolyline.size());
+                        pendingResumeType = null;
+                    }
+
+                    // Append the route response polyline
+                    appendRoutePolyline(fullPolyline, routePolyline);
+                }
+
+                // Track for next stitching
+                prevEdgeIds = edgeIds;
+                prevRoutePolyline = routePolyline;
+                prevProfile = section.profile;
+
+                // Chain heading and snapped coordinate for next chunk
+                PointList pts = routePolyline;
+                if (pts.size() >= 2) {
+                    nextHeading = AngleCalc.ANGLE_CALC.calcAzimuth(
+                            pts.getLat(pts.size() - 2), pts.getLon(pts.size() - 2),
+                            pts.getLat(pts.size() - 1), pts.getLon(pts.size() - 1));
+                    nextStartOverride = coordOf(pts.getLat(pts.size() - 1), pts.getLon(pts.size() - 1));
+                } else {
+                    nextHeading = null;
+                    nextStartOverride = null;
+                }
+
+            } else {
+                // --- Non-routable chunk (direct or coordinates) ---
+                // Flag the preceding instruction so client knows TbT is about to end
+                if (!allInstructions.isEmpty()) {
+                    Instruction lastInstr = allInstructions.get(allInstructions.size() - 1);
+                    lastInstr.setExtraInfo("next_segment_type", chunk.segmentType);
+                }
+
+                // Build gap geometry and create synthetic "entering direct" instruction
+                PointList gapGeometry = buildGapGeometry(chunk, waypointMap);
+                Instruction directInstr = new Instruction(Instruction.CONTINUE_ON_STREET, "", gapGeometry);
+                directInstr.setDistance(calcGapDistance(gapGeometry));
+                directInstr.setExtraInfo("segment_type", chunk.segmentType);
+                directInstr.setExtraInfo("tbt_available", false);
+                directInstr.setExtraInfo("confirm_reason", "entering_direct_segment");
+                allInstructions.add(directInstr);
+
+                // Append geometry to polyline
+                appendGapPolyline(fullPolyline, gapGeometry);
+
+                // Track that the next routable chunk should be marked as resuming TbT
+                pendingResumeType = chunk.segmentType;
+
+                // Reset edge tracking across non-routable gaps
+                prevEdgeIds = null;
+                prevRoutePolyline = null;
+                prevProfile = null;
+
+                // Do NOT chain heading from non-routable segments — the straight-line
+                // direction of a direct/coordinates gap is meaningless for road snapping
+                // and would force the next routed segment to start in the wrong direction.
+                nextHeading = null;
+                nextStartOverride = null;
+            }
+        }
+
+        // Ensure the instruction list ends with FINISH. When the route ends with a
+        // non-routable segment, no routable chunk produces a FINISH instruction.
+        if (!allInstructions.isEmpty()
+                && allInstructions.get(allInstructions.size() - 1).getSign() != Instruction.FINISH) {
+            PointList finishPt = new PointList(1, true);
+            if (fullPolyline.size() > 0) {
+                int last = fullPolyline.size() - 1;
+                finishPt.add(fullPolyline.getLat(last), fullPolyline.getLon(last),
+                        fullPolyline.is3D() ? fullPolyline.getEle(last) : Double.NaN);
+            }
+            allInstructions.add(new Instruction(Instruction.FINISH, "", finishPt));
+        }
+
+        // Remap instruction geometry to use the full route polyline instead of the
+        // synthetic path geometry. The synthetic path uses full graph edges (node-to-node),
+        // so its geometry extends beyond the actual snapped route endpoints.
+        remapInstructionGeometry(allInstructions, fullPolyline);
+
+        LOGGER.info("Generated {} instructions, polyline has {} points", allInstructions.size(), fullPolyline.size());
+        return new Result(allInstructions, fullPolyline);
+    }
+
+    // ---- Chunk building ----
+
+    /**
+     * A chunk is either a single routable segment (one FollowRoads segment)
+     * or a single non-routable segment (Direct / Coordinates).
+     * No merging of same-profile segments — each routable segment is its own chunk.
+     */
+    static class Chunk {
+        Section routableSection;    // non-null for routable chunks
+        String segmentType;         // "direct" or "coordinates" for non-routable chunks
+        TrailmapInstructionRequest.Segment nonRoutableSegment; // the original segment for non-routable
+    }
+
+    List<Chunk> buildChunks(List<TrailmapInstructionRequest.Segment> segments,
+                            Map<String, TrailmapInstructionRequest.Coordinates> waypointMap) {
+        List<Chunk> chunks = new ArrayList<>();
+
+        for (TrailmapInstructionRequest.Segment seg : segments) {
+            if (!seg.isRoutable()) {
+                // Add non-routable chunk
+                Chunk c = new Chunk();
+                c.segmentType = seg.getType();
+                c.nonRoutableSegment = seg;
+                chunks.add(c);
+            } else {
+                // Each routable segment becomes its own section — no merging
+                Section section = new Section();
+                section.profile = seg.getProfile();
+                section.customModel = seg.getCustomModel();
+                section.initialHeading = seg.getInitialHeading();
+                section.headingPenalty = seg.getHeadingPenalty();
+                section.points = new ArrayList<>();
+                section.points.add(waypointMap.get(seg.getStart()));
+                if (seg.getViaPoints() != null) {
+                    section.points.addAll(seg.getViaPoints());
+                }
+                section.points.add(waypointMap.get(seg.getEnd()));
+
+                Chunk c = new Chunk();
+                c.routableSection = section;
+                chunks.add(c);
+            }
+        }
+        return chunks;
+    }
+
+    // ---- Routing ----
+
+    private GHResponse routeSection(Section section, Double heading, List<String> snapPreventions) {
+        GHRequest request = new GHRequest();
+        for (TrailmapInstructionRequest.Coordinates coord : section.points) {
+            request.addPoint(new GHPoint(coord.getLat(), coord.getLng()));
+        }
+        request.setProfile(section.profile);
+        request.setPathDetails(List.of("edge_id"));
+        request.putHint("instructions", false);
+        request.putHint("calc_points", true);
+
+        if (section.customModel != null) {
+            request.setCustomModel(section.customModel);
+        }
+
+        if (snapPreventions != null && !snapPreventions.isEmpty()) {
+            request.setSnapPreventions(snapPreventions);
+        }
+
+        if (section.headingPenalty != null) {
+            request.putHint("heading_penalty", section.headingPenalty);
+        }
+
+        if (heading != null && !heading.isNaN()) {
+            List<Double> headings = new ArrayList<>();
+            headings.add(heading);
+            for (int i = 1; i < section.points.size(); i++) {
+                headings.add(Double.NaN);
+            }
+            request.setHeadings(headings);
+        }
+
+        return graphHopper.route(request);
+    }
+
+    private static final double VIA_POINT_UTURN_MAX_EDGE_DISTANCE = 40.0; // meters
+
+    private List<Integer> extractEdgeIds(ResponsePath path) {
+        List<PathDetail> edgeDetails = path.getPathDetails().get("edge_id");
+        if (edgeDetails == null || edgeDetails.isEmpty()) {
+            return new ArrayList<>();
+        }
+        // First pass: collect raw edge IDs (no dedup yet)
+        List<Integer> rawEdgeIds = new ArrayList<>(edgeDetails.size());
+        for (PathDetail detail : edgeDetails) {
+            rawEdgeIds.add((Integer) detail.getValue());
+        }
+
+        // Second pass: resolve consecutive duplicates.
+        // Multi-waypoint GH routes can produce the same edge ID twice at leg
+        // boundaries. There are two distinct cases:
+        //
+        // 1. Same-direction snap: via-point snaps to the middle of an edge.
+        //    The edge appears as the last edge of leg N and the first edge of
+        //    leg N+1, both traversed in the same direction. Remove one copy.
+        //
+        // 2. U-turn at via-point: the route reaches the via-point at one end
+        //    of an edge and comes back. The edge is traversed in opposite
+        //    directions. Detected by checking whether the edges before and
+        //    after the duplicate connect to the SAME node of the duplicate
+        //    (both enter/exit from the same side → U-turn).
+        //    - Short edge (≤ threshold): snap artifact, remove both copies.
+        //    - Long edge: intentional out-and-back, keep both copies so
+        //      buildSyntheticPath walks the U-turn and InstructionsFromEdges
+        //      generates a U-turn instruction.
+        List<Integer> edgeIds = new ArrayList<>(rawEdgeIds.size());
+        for (int i = 0; i < rawEdgeIds.size(); i++) {
+            int edgeId = rawEdgeIds.get(i);
+            if (i + 1 < rawEdgeIds.size() && rawEdgeIds.get(i + 1) == edgeId) {
+                // Consecutive duplicate found — classify it
+                boolean isUturn = false;
+                if (i > 0 && i + 2 < rawEdgeIds.size()) {
+                    isUturn = isViaPointUturn(rawEdgeIds.get(i - 1), edgeId, rawEdgeIds.get(i + 2));
+                }
+
+                if (isUturn) {
+                    double edgeDist = baseGraph.getEdgeIteratorState(edgeId, Integer.MIN_VALUE).getDistance();
+                    if (edgeDist <= VIA_POINT_UTURN_MAX_EDGE_DISTANCE) {
+                        // Short U-turn: snap artifact, remove both copies
+                        LOGGER.debug("Removing short U-turn duplicate edge {} ({}m) at via-point boundary",
+                                edgeId, String.format("%.1f", edgeDist));
+                        i++; // skip the second copy too
+                    } else {
+                        // Long U-turn: intentional, keep both copies
+                        LOGGER.debug("Keeping U-turn duplicate edge {} ({}m) at via-point boundary",
+                                edgeId, String.format("%.1f", edgeDist));
+                        edgeIds.add(edgeId);
+                        edgeIds.add(edgeId);
+                        i++; // skip the second copy (already added)
+                    }
+                } else {
+                    // Same-direction snap: remove one copy
+                    LOGGER.debug("Removing same-direction duplicate edge {} at via-point boundary", edgeId);
+                    i++; // skip the second copy
+                    edgeIds.add(edgeId);
+                }
+            } else {
+                edgeIds.add(edgeId);
+            }
+        }
+        return edgeIds;
+    }
+
+    /**
+     * Determine whether a consecutive duplicate edge at a via-point boundary is a U-turn.
+     * Checks if the edges before and after the duplicate connect to the SAME node of the
+     * duplicate edge (both enter/exit from the same side).
+     */
+    private boolean isViaPointUturn(int prevEdgeId, int dupEdgeId, int nextEdgeId) {
+        EdgeIteratorState dupEdge = baseGraph.getEdgeIteratorState(dupEdgeId, Integer.MIN_VALUE);
+        int nodeA = dupEdge.getBaseNode();
+        int nodeB = dupEdge.getAdjNode();
+
+        EdgeIteratorState prevEdge = baseGraph.getEdgeIteratorState(prevEdgeId, Integer.MIN_VALUE);
+        Set<Integer> prevNodes = Set.of(prevEdge.getBaseNode(), prevEdge.getAdjNode());
+        int entryNode = -1;
+        if (prevNodes.contains(nodeA)) entryNode = nodeA;
+        else if (prevNodes.contains(nodeB)) entryNode = nodeB;
+
+        EdgeIteratorState nextEdge = baseGraph.getEdgeIteratorState(nextEdgeId, Integer.MIN_VALUE);
+        Set<Integer> nextNodes = Set.of(nextEdge.getBaseNode(), nextEdge.getAdjNode());
+        int exitNode = -1;
+        if (nextNodes.contains(nodeA)) exitNode = nodeA;
+        else if (nextNodes.contains(nodeB)) exitNode = nodeB;
+
+        // U-turn: both prev and next connect to the same node of the duplicate edge
+        return entryNode != -1 && entryNode == exitNode;
+    }
+
+    // ---- Edge chain stitching ----
+
+    /**
+     * Stitch edge chains at segment boundaries between two consecutive routable chunks.
+     * Three cases:
+     * 1. Same edge at boundary → deduplicate (remove last edge of prev or first of current)
+     * 2. Edges share a node → direct concatenation (works naturally)
+     * 3. Edges don't connect → micro-route between the snapped end of segment N and
+     *    snapped start of segment N+1 to bridge the gap.
+     */
+    private boolean stitchEdgeChains(List<Integer> prevEdgeIds, List<Integer> currentEdgeIds,
+                                   PointList prevPolyline, PointList currentPolyline,
+                                   PointList fullPolyline, String profile,
+                                   List<String> snapPreventions) {
+        if (prevEdgeIds.isEmpty() || currentEdgeIds.isEmpty()) return false;
+
+        int lastPrevEdge = prevEdgeIds.get(prevEdgeIds.size() - 1);
+        int firstCurrentEdge = currentEdgeIds.get(0);
+
+        if (lastPrevEdge == firstCurrentEdge) {
+            // Same edge at boundary — could be a true duplicate (same direction, snap mid-edge)
+            // or a U-turn (opposite direction). Distinguish by checking where the second edge
+            // of the current segment connects vs. the second-to-last edge of the previous segment.
+            boolean isUturn = false;
+            if (currentEdgeIds.size() >= 2 && prevEdgeIds.size() >= 2) {
+                int secondToLastPrev = prevEdgeIds.get(prevEdgeIds.size() - 2);
+                int secondCurrent = currentEdgeIds.get(1);
+                EdgeIteratorState sharedEdge = baseGraph.getEdgeIteratorState(lastPrevEdge, Integer.MIN_VALUE);
+                Set<Integer> sharedNodes = Set.of(sharedEdge.getBaseNode(), sharedEdge.getAdjNode());
+
+                // Find which node of the shared edge connects to the previous segment's second-to-last edge
+                EdgeIteratorState prevPenult = baseGraph.getEdgeIteratorState(secondToLastPrev, Integer.MIN_VALUE);
+                Set<Integer> prevPenultNodes = Set.of(prevPenult.getBaseNode(), prevPenult.getAdjNode());
+                int prevEntryNode = -1;
+                for (int n : sharedNodes) {
+                    if (prevPenultNodes.contains(n)) { prevEntryNode = n; break; }
+                }
+
+                // Find which node of the shared edge connects to the current segment's second edge
+                EdgeIteratorState currSecond = baseGraph.getEdgeIteratorState(secondCurrent, Integer.MIN_VALUE);
+                Set<Integer> currSecondNodes = Set.of(currSecond.getBaseNode(), currSecond.getAdjNode());
+                int currExitNode = -1;
+                for (int n : sharedNodes) {
+                    if (currSecondNodes.contains(n)) { currExitNode = n; break; }
+                }
+
+                // If both segments connect to the SAME node of the shared edge, it's a U-turn:
+                // prev enters from node X, current exits toward node X (going back the way it came)
+                isUturn = prevEntryNode != -1 && prevEntryNode == currExitNode;
+            }
+
+            if (isUturn) {
+                // U-turn: keep the shared edge in both segments (traversed in opposite directions)
+                LOGGER.debug("U-turn detected on boundary edge {} between segments — keeping both", lastPrevEdge);
+                return true;
+            } else {
+                // Same direction: keep the shared edge in seg2's edge list so that
+                // InstructionsFromEdges has the context to generate a turn instruction
+                // at the transition from the shared edge to seg2's next edge.
+                // The resulting first CONTINUE_ON_STREET is stripped by appendInstructions(),
+                // and remapInstructionGeometry() corrects any distance overlap.
+                LOGGER.debug("Shared boundary edge {} between segments — keeping for instruction context", lastPrevEdge);
+            }
+            return false;
+        }
+
+        // Check if edges share a node (case 2)
+        EdgeIteratorState prevEdge = baseGraph.getEdgeIteratorState(lastPrevEdge, Integer.MIN_VALUE);
+        EdgeIteratorState currEdge = baseGraph.getEdgeIteratorState(firstCurrentEdge, Integer.MIN_VALUE);
+        Set<Integer> prevNodes = Set.of(prevEdge.getBaseNode(), prevEdge.getAdjNode());
+        boolean connected = prevNodes.contains(currEdge.getBaseNode()) || prevNodes.contains(currEdge.getAdjNode());
+
+        if (connected) {
+            // Case 2: Edges share a node — natural concatenation, nothing to do
+            LOGGER.debug("Boundary edges {} and {} share a node, no bridging needed", lastPrevEdge, firstCurrentEdge);
+            return false;
+        }
+
+        // Case 3: Edges don't connect — micro-route to bridge the gap
+        LOGGER.info("Boundary edges {} and {} are disconnected, micro-routing to bridge", lastPrevEdge, firstCurrentEdge);
+
+        double fromLat = prevPolyline.getLat(prevPolyline.size() - 1);
+        double fromLon = prevPolyline.getLon(prevPolyline.size() - 1);
+        double toLat = currentPolyline.getLat(0);
+        double toLon = currentPolyline.getLon(0);
+
+        GHRequest bridgeReq = new GHRequest(fromLat, fromLon, toLat, toLon);
+        bridgeReq.setProfile(profile);
+        bridgeReq.setPathDetails(List.of("edge_id"));
+        bridgeReq.putHint("instructions", false);
+        bridgeReq.putHint("calc_points", true);
+        if (snapPreventions != null && !snapPreventions.isEmpty()) {
+            bridgeReq.setSnapPreventions(snapPreventions);
+        }
+
+        GHResponse bridgeRsp = graphHopper.route(bridgeReq);
+        if (bridgeRsp.hasErrors()) {
+            LOGGER.warn("Micro-route bridging failed: {}", bridgeRsp.getErrors());
+            return false;
+        }
+
+        ResponsePath bridgePath = bridgeRsp.getBest();
+        List<Integer> bridgeEdgeIds = extractEdgeIds(bridgePath);
+        PointList bridgePolyline = bridgePath.getPoints();
+
+        if (!bridgeEdgeIds.isEmpty()) {
+            // Deduplicate at the prev/bridge boundary
+            if (bridgeEdgeIds.get(0) == lastPrevEdge) {
+                bridgeEdgeIds.remove(0);
+            }
+            // Deduplicate at the bridge/current boundary
+            if (!bridgeEdgeIds.isEmpty() && bridgeEdgeIds.get(bridgeEdgeIds.size() - 1) == firstCurrentEdge) {
+                bridgeEdgeIds.remove(bridgeEdgeIds.size() - 1);
+            }
+
+            // Insert bridging edges before the current edges
+            // (We modify currentEdgeIds in place — caller's list)
+            currentEdgeIds.addAll(0, bridgeEdgeIds);
+
+            // Insert bridging polyline into the full polyline
+            appendRoutePolyline(fullPolyline, bridgePolyline);
+
+            LOGGER.debug("Inserted {} bridging edges between segments", bridgeEdgeIds.size());
+        }
+        return false;
+    }
+
+    // ---- Synthetic path ----
+
+    private Path buildSyntheticPath(List<Integer> edgeIds, TrailmapInstructionRequest.Coordinates startCoord) {
+        int fromNode = resolveFromNode(edgeIds, startCoord);
+
+        Path path = new Path(baseGraph);
+        for (int edgeId : edgeIds) {
+            path.addEdge(edgeId);
+        }
+        path.setFromNode(fromNode);
+        path.setFound(true);
+
+        int currentNode = fromNode;
+        for (int edgeId : edgeIds) {
+            currentNode = walkEdge(edgeId, currentNode);
+        }
+        path.setEndNode(currentNode);
+
+        return path;
+    }
+
+    /**
+     * Determine the starting node of the edge chain.
+     * <p>
+     * When there are 2+ edges, we use edge connectivity: the shared node between
+     * the first and second edge is the exit node, so fromNode is the OTHER end
+     * of the first edge. This is deterministic and doesn't depend on coordinate
+     * proximity (which fails when the snapped point is closer to the wrong endpoint).
+     * <p>
+     * For a single edge, we fall back to proximity to the start coordinate.
+     */
+    private int resolveFromNode(List<Integer> edgeIds, TrailmapInstructionRequest.Coordinates startCoord) {
+        EdgeIteratorState firstEdge = baseGraph.getEdgeIteratorState(edgeIds.get(0), Integer.MIN_VALUE);
+        int nodeA = firstEdge.getBaseNode();
+        int nodeB = firstEdge.getAdjNode();
+
+        if (edgeIds.size() >= 2) {
+            EdgeIteratorState secondEdge = baseGraph.getEdgeIteratorState(edgeIds.get(1), Integer.MIN_VALUE);
+            boolean aConnects = secondEdge.getBaseNode() == nodeA || secondEdge.getAdjNode() == nodeA;
+            boolean bConnects = secondEdge.getBaseNode() == nodeB || secondEdge.getAdjNode() == nodeB;
+
+            if (aConnects && !bConnects) {
+                // nodeA is the shared/exit node → fromNode is nodeB
+                return nodeB;
+            } else if (bConnects && !aConnects) {
+                // nodeB is the shared/exit node → fromNode is nodeA
+                return nodeA;
+            }
+            // Both connect (parallel edges) or neither — fall through to proximity
+            LOGGER.warn("Ambiguous edge connectivity for edges {} and {}, falling back to proximity",
+                    edgeIds.get(0), edgeIds.get(1));
+        }
+
+        // Single edge or ambiguous: use proximity to start coordinate
+        NodeAccess nodeAccess = baseGraph.getNodeAccess();
+        DistanceCalcEarth distCalc = DistanceCalcEarth.DIST_EARTH;
+        double distA = distCalc.calcDist(startCoord.getLat(), startCoord.getLng(),
+                nodeAccess.getLat(nodeA), nodeAccess.getLon(nodeA));
+        double distB = distCalc.calcDist(startCoord.getLat(), startCoord.getLng(),
+                nodeAccess.getLat(nodeB), nodeAccess.getLon(nodeB));
+        return distA <= distB ? nodeA : nodeB;
+    }
+
+    /**
+     * Walk one edge in the chain: given the current node, return the other endpoint.
+     */
+    private int walkEdge(int edgeId, int currentNode) {
+        EdgeIteratorState edge = baseGraph.getEdgeIteratorState(edgeId, Integer.MIN_VALUE);
+        if (edge.getBaseNode() == currentNode) {
+            return edge.getAdjNode();
+        } else if (edge.getAdjNode() == currentNode) {
+            return edge.getBaseNode();
+        }
+        throw new IllegalStateException("Edge " + edgeId + " is not connected to node " + currentNode +
+                " (endpoints: " + edge.getBaseNode() + ", " + edge.getAdjNode() + ")");
+    }
+
+    // ---- Instruction stitching ----
+
+    /**
+     * Append section instructions to the accumulated list.
+     * Strips FINISH from non-final routable chunks and adjusts interval offsets.
+     * For non-first sections, strips the initial CONTINUE_ON_STREET — unless resuming
+     * after a direct/coordinates gap, where that CONTINUE is the "TbT resumes" marker.
+     * <p>
+     * Note: instruction PointLists still contain synthetic path geometry at this point.
+     * They will be remapped to the full route polyline later by remapInstructionGeometry().
+     */
+    private void appendInstructions(InstructionList target, InstructionList sectionInstructions,
+                                    int polylineOffset, boolean isLastRoutableChunk,
+                                    boolean resumingAfterGap) {
+        boolean isFirstSection = target.isEmpty();
+
+        for (int i = 0; i < sectionInstructions.size(); i++) {
+            Instruction instr = sectionInstructions.get(i);
+
+            // Strip FINISH from non-final routable chunks; only the last routable chunk
+            // should contribute a FINISH instruction.
+            if (instr.getSign() == Instruction.FINISH && !isLastRoutableChunk) {
+                continue;
+            }
+
+            // Strip initial CONTINUE from non-first sections to avoid duplicate at junction.
+            // But keep it when resuming after a direct/coordinates gap — it marks where TbT resumes.
+            if (!isFirstSection && !resumingAfterGap
+                    && i == 0 && instr.getSign() == Instruction.CONTINUE_ON_STREET) {
+                // Merge this instruction's distance/time into the previous instruction
+                if (!target.isEmpty()) {
+                    Instruction prev = target.get(target.size() - 1);
+                    prev.setDistance(prev.getDistance() + instr.getDistance());
+                    prev.setTime(prev.getTime() + instr.getTime());
+                }
+                continue;
+            }
+
+            target.add(instr);
+        }
+    }
+
+    /**
+     * Check if the chunk at index ci is the last chunk in the list.
+     * FINISH is only preserved for the truly final chunk — not just the last routable
+     * chunk, since non-routable chunks after it will produce their own instructions.
+     */
+    private static boolean isLastRoutableChunk(List<Chunk> chunks, int ci) {
+        return ci == chunks.size() - 1;
+    }
+
+    // ---- Geometry remapping ----
+
+    /**
+     * Remap instruction geometry from the synthetic path (node-to-node edges) to the
+     * actual full route polyline (snapped start/end points, concatenated across sections).
+     * <p>
+     * The synthetic path uses full graph edges, so its geometry extends beyond the actual
+     * route endpoints. This method replaces each instruction's PointList with the
+     * corresponding slice of the full route polyline.
+     * <p>
+     * Approach: each instruction boundary in the synthetic path occurs at a graph node.
+     * We find that node's location in the full polyline by coordinate matching,
+     * then slice the polyline at those boundaries.
+     */
+    private void remapInstructionGeometry(InstructionList instructions, PointList fullPolyline) {
+        if (instructions.isEmpty() || fullPolyline.isEmpty()) return;
+
+        // For each instruction, determine its start index in the full polyline.
+        // The first instruction starts at index 0, FINISH starts at the last point.
+        // Other instructions start at graph nodes, which we find by matching coordinates.
+        List<Integer> instrPolyStarts = new ArrayList<>();
+        for (int i = 0; i < instructions.size(); i++) {
+            Instruction instr = instructions.get(i);
+
+            if (instr.getSign() == Instruction.FINISH) {
+                instrPolyStarts.add(fullPolyline.size() - 1);
+                continue;
+            }
+
+            if (i == 0) {
+                instrPolyStarts.add(0);
+                continue;
+            }
+
+            // Instructions resuming after a direct/coordinates gap carry a polyline start
+            // hint because the synthetic path's first graph node may not be in the route
+            // response polyline (it precedes the snapped start point on the first edge).
+            Object hintObj = instr.getExtraInfoJSON().get("_polyline_start_hint");
+            if (hintObj instanceof Number) {
+                int hint = ((Number) hintObj).intValue();
+                hint = Math.max(hint, instrPolyStarts.get(instrPolyStarts.size() - 1));
+                hint = Math.min(hint, fullPolyline.size() - 1);
+                instrPolyStarts.add(hint);
+                continue;
+            }
+
+            PointList instrPts = instr.getPoints();
+            if (instrPts.size() == 0) {
+                instrPolyStarts.add(instrPolyStarts.get(instrPolyStarts.size() - 1));
+                continue;
+            }
+
+            // The instruction's first point is at a graph node. Find it in the full polyline.
+            double targetLat = instrPts.getLat(0);
+            double targetLon = instrPts.getLon(0);
+
+            // Search forward from the previous instruction's matched index.
+            // Monotonicity is guaranteed: searchFrom >= all previous matches,
+            // so outbound occurrences of repeated nodes are naturally skipped.
+            int searchFrom = instrPolyStarts.get(instrPolyStarts.size() - 1);
+            int bestIdx = searchFrom;
+            double bestDist = Double.MAX_VALUE;
+            for (int pi = searchFrom; pi < fullPolyline.size(); pi++) {
+                double dist = Math.abs(fullPolyline.getLat(pi) - targetLat)
+                        + Math.abs(fullPolyline.getLon(pi) - targetLon);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestIdx = pi;
+                }
+                // Accept the first exact match (< ~0.11m). On out-and-back routes,
+                // the same node coordinate appears multiple times in the polyline;
+                // since searchFrom is past earlier occurrences, the first exact match
+                // after searchFrom is the correct one. Continuing to scan could pick
+                // up a false near-match on a parallel trail segment further along.
+                if (bestDist < 1e-6) {
+                    break;
+                }
+            }
+            instrPolyStarts.add(bestIdx);
+        }
+
+        // Now assign polyline slices to each instruction
+        boolean is3D = fullPolyline.is3D();
+        for (int i = 0; i < instructions.size(); i++) {
+            Instruction instr = instructions.get(i);
+
+            if (instr.getSign() == Instruction.FINISH) {
+                PointList finishPts = new PointList(1, is3D);
+                int lastIdx = fullPolyline.size() - 1;
+                finishPts.add(fullPolyline.getLat(lastIdx), fullPolyline.getLon(lastIdx),
+                        is3D ? fullPolyline.getEle(lastIdx) : Double.NaN);
+                instr.setPoints(finishPts);
+                continue;
+            }
+
+            int polyStart = instrPolyStarts.get(i);
+            int polyEnd = (i + 1 < instrPolyStarts.size()) ? instrPolyStarts.get(i + 1) : fullPolyline.size() - 1;
+
+            PointList newPts = new PointList(Math.max(1, polyEnd - polyStart), is3D);
+            for (int pi = polyStart; pi < polyEnd; pi++) {
+                newPts.add(fullPolyline.getLat(pi), fullPolyline.getLon(pi),
+                        is3D ? fullPolyline.getEle(pi) : Double.NaN);
+            }
+            // Ensure at least 1 point per non-FINISH instruction
+            if (newPts.size() == 0 && polyStart < fullPolyline.size()) {
+                newPts.add(fullPolyline.getLat(polyStart), fullPolyline.getLon(polyStart),
+                        is3D ? fullPolyline.getEle(polyStart) : Double.NaN);
+            }
+            instr.setPoints(newPts);
+
+            // Recalculate distance from the full polyline slice [polyStart, polyEnd] inclusive.
+            // The instruction's distance covers the route from its start point to the next
+            // instruction's start point, which includes the segment from polyEnd-1 to polyEnd
+            // that is not part of this instruction's PointList (which is [polyStart, polyEnd)).
+            double oldDist = instr.getDistance();
+            if (oldDist > 0 && polyEnd > polyStart) {
+                double newDist = 0;
+                for (int pi = polyStart; pi < polyEnd; pi++) {
+                    newDist += DistanceCalcEarth.DIST_EARTH.calcDist(
+                            fullPolyline.getLat(pi), fullPolyline.getLon(pi),
+                            fullPolyline.getLat(pi + 1), fullPolyline.getLon(pi + 1));
+                }
+                long oldTime = instr.getTime();
+                instr.setDistance(newDist);
+                instr.setTime(Math.round(newDist / oldDist * oldTime));
+            }
+        }
+
+        // Strip internal polyline hints — not for the client
+        for (Instruction instr : instructions) {
+            instr.getExtraInfoJSON().remove("_polyline_start_hint");
+        }
+    }
+
+    // ---- Polyline building ----
+
+    /**
+     * Append route response polyline to the full polyline, skipping the first point
+     * if it duplicates the last point of the existing polyline (at segment boundaries).
+     */
+    private void appendRoutePolyline(PointList fullPolyline, PointList routePolyline) {
+        int startIdx = 0;
+        if (fullPolyline.size() > 0 && routePolyline.size() > 0) {
+            double lastLat = fullPolyline.getLat(fullPolyline.size() - 1);
+            double lastLon = fullPolyline.getLon(fullPolyline.size() - 1);
+            double firstLat = routePolyline.getLat(0);
+            double firstLon = routePolyline.getLon(0);
+            // Use a small tolerance for floating point comparison
+            if (DistanceCalcEarth.DIST_EARTH.calcDist(lastLat, lastLon, firstLat, firstLon) < 1.0) {
+                startIdx = 1; // skip duplicate point at segment boundary
+            }
+        }
+        for (int i = startIdx; i < routePolyline.size(); i++) {
+            fullPolyline.add(routePolyline.getLat(i), routePolyline.getLon(i),
+                    routePolyline.is3D() ? routePolyline.getEle(i) : Double.NaN);
+        }
+    }
+
+    /**
+     * Build geometry for a non-routable gap segment.
+     */
+    private PointList buildGapGeometry(Chunk chunk, Map<String, TrailmapInstructionRequest.Coordinates> waypointMap) {
+        TrailmapInstructionRequest.Segment seg = chunk.nonRoutableSegment;
+
+        if (TrailmapInstructionRequest.TYPE_COORDINATES.equals(chunk.segmentType)
+                && seg.getTrackCoordinates() != null && !seg.getTrackCoordinates().isEmpty()) {
+            // Use the track coordinates
+            PointList points = new PointList(seg.getTrackCoordinates().size(), true);
+            for (TrailmapInstructionRequest.Coordinates c : seg.getTrackCoordinates()) {
+                points.add(c.getLat(), c.getLng(), Double.NaN);
+            }
+            return points;
+        } else {
+            // Direct segment: straight line from start to end
+            PointList points = new PointList(2, true);
+            TrailmapInstructionRequest.Coordinates start = waypointMap.get(seg.getStart());
+            TrailmapInstructionRequest.Coordinates end = waypointMap.get(seg.getEnd());
+            if (start != null) points.add(start.getLat(), start.getLng(), Double.NaN);
+            if (end != null) points.add(end.getLat(), end.getLng(), Double.NaN);
+            return points;
+        }
+    }
+
+    /**
+     * Append gap geometry to the full polyline, skipping the first point
+     * if it duplicates the polyline's last point.
+     */
+    private void appendGapPolyline(PointList fullPolyline, PointList gapPoints) {
+        for (int i = 0; i < gapPoints.size(); i++) {
+            // Skip first point if it matches last point of polyline (avoid duplicate at junction)
+            if (i == 0 && fullPolyline.size() > 0) {
+                double lastLat = fullPolyline.getLat(fullPolyline.size() - 1);
+                double lastLon = fullPolyline.getLon(fullPolyline.size() - 1);
+                if (Math.abs(lastLat - gapPoints.getLat(i)) < 1e-7
+                        && Math.abs(lastLon - gapPoints.getLon(i)) < 1e-7) {
+                    continue;
+                }
+            }
+            fullPolyline.add(gapPoints.getLat(i), gapPoints.getLon(i),
+                    gapPoints.is3D() ? gapPoints.getEle(i) : Double.NaN);
+        }
+    }
+
+    // ---- Helpers ----
+
+    /**
+     * Compute straight-line distance of a gap geometry PointList.
+     */
+    private static double calcGapDistance(PointList points) {
+        double dist = 0;
+        for (int i = 0; i < points.size() - 1; i++) {
+            dist += DistanceCalcEarth.DIST_EARTH.calcDist(
+                    points.getLat(i), points.getLon(i),
+                    points.getLat(i + 1), points.getLon(i + 1));
+        }
+        return dist;
+    }
+
+    private static TrailmapInstructionRequest.Coordinates coordOf(double lat, double lng) {
+        TrailmapInstructionRequest.Coordinates c = new TrailmapInstructionRequest.Coordinates();
+        c.setLat(lat);
+        c.setLng(lng);
+        return c;
+    }
+
+    static class Section {
+        String profile;
+        com.graphhopper.util.CustomModel customModel;
+        Double initialHeading;
+        Double headingPenalty;
+        List<TrailmapInstructionRequest.Coordinates> points;
+    }
+}

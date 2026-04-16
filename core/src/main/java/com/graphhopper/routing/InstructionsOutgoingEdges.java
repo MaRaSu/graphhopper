@@ -51,7 +51,7 @@ import java.util.List;
  *
  * @author Robin Boldt
  */
-class InstructionsOutgoingEdges {
+public class InstructionsOutgoingEdges {
 
     private final EdgeIteratorState prevEdge;
     private final EdgeIteratorState currentEdge;
@@ -105,6 +105,14 @@ class InstructionsOutgoingEdges {
                 }
             }
         }
+    }
+
+    /**
+     * Returns the list of alternative edges that the current vehicle is allowed to turn onto,
+     * excluding the previous edge and the current edge.
+     */
+    public List<EdgeIteratorState> getAllowedAlternativeTurns() {
+        return allowedAlternativeTurns;
     }
 
     /**

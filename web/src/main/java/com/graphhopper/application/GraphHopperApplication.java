@@ -23,6 +23,7 @@ import com.graphhopper.application.resources.RootResource;
 import com.graphhopper.http.CORSFilter;
 import com.graphhopper.http.GraphHopperBundle;
 import com.graphhopper.navigation.NavigateResource;
+import com.graphhopper.resources.TrailmapInstructionResource;
 import io.dropwizard.assets.AssetsBundle;
 import io.dropwizard.core.Application;
 import io.dropwizard.core.setup.Bootstrap;
@@ -51,6 +52,7 @@ public final class GraphHopperApplication extends Application<GraphHopperServerC
     public void run(GraphHopperServerConfiguration configuration, Environment environment) {
         environment.jersey().register(new RootResource());
         environment.jersey().register(NavigateResource.class);
+        environment.jersey().register(TrailmapInstructionResource.class);
         environment.servlets().addFilter("cors", CORSFilter.class).addMappingForUrlPatterns(EnumSet.allOf(DispatcherType.class), false, "*");
     }
 }
