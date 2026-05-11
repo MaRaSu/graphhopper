@@ -36,6 +36,8 @@ public class TrailmapInstructionResource {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(TrailmapInstructionResource.class);
     private static final double POLYLINE_PRECISION = 1e6;
+    private static final Set<String> RESERVED_INSTRUCTION_KEYS = Set.of(
+            "text", "street_name", "time", "distance", "sign", "interval");
 
     private final RouteInstructionGenerator generator;
     private final InstructionPostProcessor postProcessor;
@@ -58,7 +60,7 @@ public class TrailmapInstructionResource {
             validateRequest(request);
 
             RouteInstructionGenerator.Result result = generator.generate(request);
-            postProcessor.process(result.instructions);
+            postProcessor.process(result.instructions, request.getInstructionProfile());
 
             TrailmapInstructionResponse response = new TrailmapInstructionResponse();
             response.setInstructions(serializeInstructions(result.instructions));
@@ -79,7 +81,7 @@ public class TrailmapInstructionResource {
                     .entity(Map.of("error", e.getMessage()))
                     .build();
         } catch (IllegalStateException e) {
-            LOGGER.error("Instruction generation failed: {}", e.getMessage());
+            LOGGER.error("Instruction generation failed", e);
             return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
                     .entity(Map.of("error", e.getMessage()))
                     .build();
@@ -153,10 +155,15 @@ public class TrailmapInstructionResource {
             instrJson.put("time", instruction.getTime());
             instrJson.put("distance", Helper.round(instruction.getDistance(), 3));
             instrJson.put("sign", instruction.getSign());
-            // CAUTION: extraInfo keys must not collide with the core fields above (text,
-            // street_name, time, distance, sign) or with "interval" below — putAll would
-            // silently overwrite them. All current Trailmap extraInfo keys are distinct.
-            instrJson.putAll(instruction.getExtraInfoJSON());
+            Map<String, Object> extraInfo = instruction.getExtraInfoJSON();
+            for (String key : extraInfo.keySet()) {
+                if (RESERVED_INSTRUCTION_KEYS.contains(key)) {
+                    throw new IllegalStateException("extraInfo key '" + key
+                            + "' collides with reserved instruction field (sign=" + instruction.getSign()
+                            + ", text=" + instruction.getTurnDescription(instructions.getTr()) + ")");
+                }
+            }
+            instrJson.putAll(extraInfo);
 
             int tmpIndex = pointsIndex + instruction.getLength();
             instrJson.put("interval", Arrays.asList(pointsIndex, tmpIndex));

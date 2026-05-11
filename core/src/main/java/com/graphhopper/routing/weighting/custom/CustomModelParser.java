@@ -277,9 +277,7 @@ public class CustomModelParser {
         for (Statement s : customModel.getTurnPenalty()) {
             if (s.operation() == Statement.Op.ADD && s.value().trim().startsWith("-"))
                 throw new IllegalArgumentException("The value for the 'add' operation must be positive, but was: " + s.value());
-            if (s.isBlock())
-                throw new IllegalArgumentException("'turn_penalty' statement cannot be a block (not yet implemented)");
-            if (s.operation() != Statement.Op.ADD)
+            if (!s.isBlock() && s.operation() != Statement.Op.ADD)
                 throw new IllegalArgumentException("'turn_penalty' statement must have the operation 'add' but was: " + s.operation() + " (not yet implemented)");
         }
 
@@ -356,26 +354,31 @@ public class CustomModelParser {
             return "double change_angle = CustomWeightingHelper.calcChangeAngle(edgeIntAccess, this.orientation_enc, inEdge, inEdgeReverse, outEdge, outEdgeReverse);\n";
         } else if (lookup.hasEncodedValue(arg)) {
             EncodedValue enc = lookup.getEncodedValue(arg, EncodedValue.class);
-            if (!(enc instanceof EnumEncodedValue<?>))
-                throw new IllegalArgumentException("Currently only EnumEncodedValues are supported: " + arg);
-
+            String reverseExpr = needTwoDirections ? "outEdgeReverse" : "false";
             return getReturnType(enc) + " " + arg + " = (" + getReturnType(enc) + ") " +
-                    "this." + arg + "_enc.getEnum(" + (needTwoDirections ? "outEdgeReverse" : "false") + ", outEdge, edgeIntAccess);\n";
+                    "this." + arg + "_enc" + getTurnPenaltyAccessor(enc, reverseExpr, "outEdge") + ";\n";
         } else if (arg.startsWith(PREV_PREFIX)) {
             final String argSubstr = arg.substring(PREV_PREFIX.length());
             if (lookup.hasEncodedValue(argSubstr)) {
                 EncodedValue enc = lookup.getEncodedValue(argSubstr, EncodedValue.class);
-                if (!(enc instanceof EnumEncodedValue<?>))
-                    throw new IllegalArgumentException("Currently only EnumEncodedValues are supported: " + arg);
-
+                String reverseExpr = needTwoDirections ? "inEdgeReverse" : "false";
                 return getReturnType(enc) + " " + arg + " = (" + getReturnType(enc) + ") " +
-                        "this." + argSubstr + "_enc.getEnum(" + (needTwoDirections ? "inEdgeReverse" : "false") + ", inEdge, edgeIntAccess);\n";
+                        "this." + argSubstr + "_enc" + getTurnPenaltyAccessor(enc, reverseExpr, "inEdge") + ";\n";
             } else {
                 throw new IllegalArgumentException("Not supported for prev: " + argSubstr);
             }
         } else {
             throw new IllegalArgumentException("Not supported for turn_penalty: " + arg);
         }
+    }
+
+    private static String getTurnPenaltyAccessor(EncodedValue enc, String reverseExpr, String edgeIdExpr) {
+        String args = "(" + reverseExpr + ", " + edgeIdExpr + ", edgeIntAccess)";
+        if (enc instanceof EnumEncodedValue<?>) return ".getEnum" + args;
+        if (enc instanceof IntEncodedValue) return ".getInt" + args;
+        if (enc instanceof DecimalEncodedValue) return ".getDecimal" + args;
+        if (enc instanceof BooleanEncodedValue) return ".getBool" + args;
+        throw new IllegalArgumentException("Unsupported EncodedValue type for turn_penalty: " + enc.getClass().getSimpleName());
     }
 
     /**

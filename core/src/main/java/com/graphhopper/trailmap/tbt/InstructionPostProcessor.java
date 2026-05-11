@@ -33,7 +33,15 @@ public class InstructionPostProcessor {
     private static final double SNAP_STUB_MAX_ROUND_TRIP = 40.0;  // meters (covers up to ~20m snap offset)
     private static final double JOIN_SIDE_PATH_MAX_DISTANCE = 15.0;  // meters
     private static final double QUICK_SEQUENCE_MAX_DISTANCE = 50.0;  // meters
-    private static final double MTB_CONSECUTIVE_FORK_MAX_DISTANCE = 200.0;  // meters
+    // M3 (consecutive same-direction KEEP forks on trails) — profile-aware merge horizon.
+    // Foot routes have lower fork density and slower travel speed, so the rider's ability
+    // to remember a "stay-left N times" prompt is shorter than for vehicle profiles.
+    private static final double M3_FORK_MAX_DISTANCE_FOOT    = 60.0;   // meters
+    private static final double M3_FORK_MAX_DISTANCE_NONFOOT = 100.0;  // meters
+    // M4 (short-zigzag collapse) — operates on M2-merged instructions whose two turns are
+    // opposite-direction, very close together, and net to near-straight on a non-road continuation.
+    private static final double M4_ZIGZAG_MAX_CONNECTOR_M   = 5.0;   // connector edge length
+    private static final double M4_ZIGZAG_MAX_NET_ANGLE_DEG = 15.0;  // |a1 + a2| net direction change
 
     // Suppression thresholds
     private static final double MICRO_ARTIFACT_MAX_DISTANCE = 5.0;  // meters
@@ -43,19 +51,31 @@ public class InstructionPostProcessor {
 
     /**
      * Apply all post-processing passes to the instruction list.
-     * Modifies the list in-place.
+     * Profile-agnostic — uses non-foot defaults for profile-sensitive thresholds.
+     * Prefer {@link #process(InstructionList, String)} so M3 thresholds are sized
+     * correctly for foot routes.
      */
     public void process(InstructionList instructions) {
+        process(instructions, null);
+    }
+
+    /**
+     * Apply all post-processing passes. The {@code instructionProfile} string influences
+     * profile-sensitive thresholds (currently only M3 — consecutive-fork merging horizon).
+     * May be {@code null}, in which case non-foot defaults are used.
+     */
+    public void process(InstructionList instructions, String instructionProfile) {
         if (instructions.size() < 2) return;
 
         int originalSize = instructions.size();
 
-        pass1_patternMerging(instructions);
+        pass1_patternMerging(instructions, instructionProfile);
         pass2_continuitySuppression(instructions);
         pass3_confirmationInsertion(instructions);
         pass4_annotation(instructions);
 
-        LOGGER.debug("Post-processing complete: {} instructions (was {})", instructions.size(), originalSize);
+        LOGGER.debug("Post-processing complete: {} instructions (was {}, profile={})",
+                instructions.size(), originalSize, instructionProfile);
     }
 
     // ========================================================================
@@ -66,9 +86,13 @@ public class InstructionPostProcessor {
      * Detect and merge multi-instruction patterns:
      * M1: Join side path — TURN_X → short segment → TURN_Y (opposite) with PH change
      * M2: Quick sequence — two turns within 50m (not M1) → link with then_turn
-     * M3: MTB consecutive forks — 2+ same-direction KEEP within 200m
+     * M3: Consecutive forks — 2+ same-direction KEEP within profile-aware horizon
+     *     (60m foot, 100m non-foot)
+     * M4: Short-zigzag collapse — M2-merged opposite-direction turns with very short
+     *     connector and near-zero net angle on non-road PH → CONTINUE_ON_STREET +
+     *     trail_fork (rider experiences a near-straight cycleway, not two real turns)
      */
-    private void pass1_patternMerging(InstructionList instructions) {
+    private void pass1_patternMerging(InstructionList instructions, String instructionProfile) {
         // M0: Waypoint snap stub suppression — must run before M1/M2/M3
         suppressSnapStubs(instructions);
 
@@ -89,8 +113,8 @@ public class InstructionPostProcessor {
                 mergeJoinSidePath(instructions, i, first, second);
                 // Re-check: the merged instruction may form an M2 quick-sequence with its
                 // new neighbor (e.g., "join cycleway on left, then right 30m").
-                // M1→M1 is prevented by isJoinSidePathPattern rejecting already-merged
-                // instructions (join_direction check).
+                // M1→M1 cascade is prevented by isJoinSidePathPattern rejecting
+                // join_direction on either side (first or second).
                 i--;
                 continue;
             }
@@ -109,6 +133,16 @@ public class InstructionPostProcessor {
                         // Skip M2 — let the loop advance so M1 fires on [second]+[third]
                         continue;
                     }
+                    // Closer-pair preference: when (second, third) also qualifies for M2 and
+                    // its connector is strictly shorter than (first, second)'s, skip the
+                    // (first, second) merge so M2 fires on (second, third) at the next
+                    // iteration. The closer pair matches the rider's "back-to-back" intuition.
+                    if (!isTerminal(third)
+                            && isTurnInstruction(third)
+                            && second.getDistance() <= QUICK_SEQUENCE_MAX_DISTANCE
+                            && second.getDistance() < first.getDistance()) {
+                        continue;
+                    }
                 }
                 mergeQuickSequence(instructions, i, first, second);
                 // No re-check (no i--): the then_turn data model is a single object, not a
@@ -119,8 +153,11 @@ public class InstructionPostProcessor {
             }
         }
 
-        // M3: MTB consecutive forks
-        mergeConsecutiveForks(instructions);
+        // M3: Consecutive forks (profile-aware horizon)
+        mergeConsecutiveForks(instructions, instructionProfile);
+
+        // M4: Short-zigzag collapse on M2-merged instructions
+        collapseShortZigzag(instructions);
     }
 
     /**
@@ -209,9 +246,24 @@ public class InstructionPostProcessor {
      * not a "join via side path" pattern. The connector type is irrelevant.
      */
     private boolean isJoinSidePathPattern(Instruction first, Instruction second) {
-        // Never merge onto an instruction that is already an M1 result — cascading
-        // M1 merges collapse genuine multi-turn sequences into a single instruction.
+        // Never cascade onto or off an existing M1 result. Cascading M1 merges
+        // collapse genuine multi-turn sequences into a single instruction. The
+        // re-check after a successful M1 merge (`i--` in pass 1) brings the merged
+        // instruction back as `first` for the next iteration; without the symmetric
+        // first-check, the geometry gate evaluates against the merged instruction's
+        // stale `turn_angle_deg` (the original first turn's angle, not the M1's
+        // effective ~0° net) and erroneously absorbs the next real navigation turn.
+        if (first.getExtraInfoJSON().containsKey("join_direction")) return false;
         if (second.getExtraInfoJSON().containsKey("join_direction")) return false;
+
+        // Continuation guard: M1's "join via sidepath" semantics require the source
+        // way to physically continue past the first turn. At a real T-end (source
+        // way ends at a different way, no alt within ±30° of straight) the rider is
+        // at a forced navigation decision, not a brief sidepath detour, so M1 must
+        // not fire. Fail-open: if the field is absent (e.g., older instruction
+        // streams predating the Stage 1 enrichExtraInfo addition), don't reject.
+        Object straightAlt = first.getExtraInfoJSON().get("junction_has_straight_alt");
+        if (Boolean.FALSE.equals(straightAlt)) return false;
 
         int s1 = first.getSign();
         int s2 = second.getSign();
@@ -317,6 +369,9 @@ public class InstructionPostProcessor {
         thenTurn.put("road_class", extraStr(second, "road_class"));
         thenTurn.put("predicted_highway", extraStr(second, "predicted_highway"));
         thenTurn.put("name", second.getName());
+        // Carry the second turn's angle so M4 can evaluate net-angle on the merged instruction.
+        Object secondAngle = second.getExtraInfoJSON().get("turn_angle_deg");
+        if (secondAngle != null) thenTurn.put("turn_angle_deg", secondAngle);
         first.setExtraInfo("then_turn", thenTurn);
 
         // Absorb second instruction's distance, time, and geometry
@@ -338,8 +393,13 @@ public class InstructionPostProcessor {
 
     /**
      * M3: Merge consecutive same-direction KEEP_LEFT/KEEP_RIGHT forks on trails.
+     * The horizon is profile-aware: 60m for foot, 100m otherwise.
      */
-    private void mergeConsecutiveForks(InstructionList instructions) {
+    private void mergeConsecutiveForks(InstructionList instructions, String instructionProfile) {
+        final double maxDistance = isFootProfile(instructionProfile)
+                ? M3_FORK_MAX_DISTANCE_FOOT
+                : M3_FORK_MAX_DISTANCE_NONFOOT;
+
         for (int i = 0; i < instructions.size() - 1; i++) {
             Instruction first = instructions.get(i);
             if (first.getSign() != Instruction.KEEP_LEFT && first.getSign() != Instruction.KEEP_RIGHT) continue;
@@ -354,7 +414,7 @@ public class InstructionPostProcessor {
             for (int j = i + 1; j < instructions.size(); j++) {
                 Instruction next = instructions.get(j);
                 if (next.getSign() != targetSign) break;
-                if (totalDist > MTB_CONSECUTIVE_FORK_MAX_DISTANCE) break;
+                if (totalDist > maxDistance) break;
                 if (!isTrailPH(extraStr(next, "predicted_highway"))) break;
 
                 count++;
@@ -383,6 +443,82 @@ public class InstructionPostProcessor {
 
                 LOGGER.debug("M3: Merged {} consecutive {} forks at index {}", count, direction, i);
             }
+        }
+    }
+
+    /**
+     * M4: Collapse a short opposite-direction zigzag on a non-road continuation
+     * into a single CONTINUE_ON_STREET instruction.
+     * <p>
+     * Operates on M2 output: an instruction with {@code then_turn} set has already
+     * absorbed the second turn's distance and geometry. M4 inspects whether the
+     * pair represents a real navigation event (keep as-is) or a micro S-bend the
+     * rider experiences as essentially straight (collapse).
+     * <p>
+     * Detection — all must be true:
+     * <ol>
+     *   <li>Instruction has a {@code then_turn} compound (M2 fired)</li>
+     *   <li>Both predicted highways are non-road ({@code CYCLEWAY}, {@code FOOTWAY},
+     *       {@code PATH}) — road infrastructure isn't covered because lane-shift
+     *       zigzags on roads are real navigation events</li>
+     *   <li>The two turn signs point in opposite directions
+     *       ({@code (a.sign > 0) != (b.sign > 0)})</li>
+     *   <li>Connector edge length ≤ {@link #M4_ZIGZAG_MAX_CONNECTOR_M} —
+     *       carried in {@code then_turn.distance_m}</li>
+     *   <li>{@code |a.turn_angle_deg + b.turn_angle_deg| ≤
+     *       M4_ZIGZAG_MAX_NET_ANGLE_DEG} — net direction change near zero</li>
+     * </ol>
+     * Action: change sign to {@code CONTINUE_ON_STREET}, set
+     * {@code trail_fork: true} so the client passes the instruction through
+     * (existing pass-through marker — no client change needed), and remove
+     * {@code then_turn}. Distance and geometry are kept as M2 produced them.
+     */
+    private void collapseShortZigzag(InstructionList instructions) {
+        for (int i = 0; i < instructions.size(); i++) {
+            Instruction instr = instructions.get(i);
+            Map<String, Object> extra = instr.getExtraInfoJSON();
+
+            Object thenTurnObj = extra.get("then_turn");
+            if (!(thenTurnObj instanceof Map)) continue;
+            @SuppressWarnings("unchecked")
+            Map<String, Object> thenTurn = (Map<String, Object>) thenTurnObj;
+
+            // Both PH must be non-road (cycleway/footway/path)
+            String firstPH = extraStr(instr, "predicted_highway");
+            Object secondPHObj = thenTurn.get("predicted_highway");
+            String secondPH = secondPHObj != null ? secondPHObj.toString() : null;
+            if (!isNonRoadPH(firstPH) || !isNonRoadPH(secondPH)) continue;
+
+            // Signs must oppose
+            int firstSign = instr.getSign();
+            Object secondSignObj = thenTurn.get("sign");
+            if (!(secondSignObj instanceof Number)) continue;
+            int secondSign = ((Number) secondSignObj).intValue();
+            if ((firstSign > 0) == (secondSign > 0)) continue;
+
+            // Connector ≤ threshold
+            Object connectorObj = thenTurn.get("distance_m");
+            if (!(connectorObj instanceof Number)) continue;
+            double connectorM = ((Number) connectorObj).doubleValue();
+            if (connectorM > M4_ZIGZAG_MAX_CONNECTOR_M) continue;
+
+            // Net angle ≈ 0
+            Object firstAngleObj = extra.get("turn_angle_deg");
+            Object secondAngleObj = thenTurn.get("turn_angle_deg");
+            if (!(firstAngleObj instanceof Number) || !(secondAngleObj instanceof Number)) continue;
+            double netAngle = ((Number) firstAngleObj).doubleValue()
+                    + ((Number) secondAngleObj).doubleValue();
+            if (Math.abs(netAngle) > M4_ZIGZAG_MAX_NET_ANGLE_DEG) continue;
+
+            // Collapse: reclassify as CONTINUE_ON_STREET with trail_fork=true.
+            // M2 already produced the spanning distance/geometry; we just change
+            // the sign and drop then_turn.
+            instr.setSign(Instruction.CONTINUE_ON_STREET);
+            instr.setExtraInfo("trail_fork", true);
+            instr.getExtraInfoJSON().remove("then_turn");
+
+            LOGGER.debug("M4: Collapsed zigzag at index {}: connector={}m netAngle={}°",
+                    i, connectorM, netAngle);
         }
     }
 
@@ -597,6 +733,16 @@ public class InstructionPostProcessor {
         return false;
     }
 
+    /**
+     * Returns true iff the instruction profile is a foot profile. Matches the canonical
+     * {@code trailmap_foot} and any future variants like {@code trailmap_foot_explore}.
+     * A {@code null} profile is treated as non-foot — callers like the no-arg
+     * {@link #process(InstructionList)} wrapper want vehicle defaults.
+     */
+    private static boolean isFootProfile(String instructionProfile) {
+        return instructionProfile != null && instructionProfile.startsWith("trailmap_foot");
+    }
+
     private static boolean isTrailPH(String ph) {
         if (ph == null) return false;
         switch (ph) {
@@ -610,6 +756,15 @@ public class InstructionPostProcessor {
             default:
                 return false;
         }
+    }
+
+    /**
+     * Non-road continuations matching Stage 1's E6 allowlist. Used by M4 to scope
+     * the zigzag collapse — road infrastructure isn't covered because lane-shift
+     * zigzags on roads (e.g., crossing a divided highway) are real navigation events.
+     */
+    private static boolean isNonRoadPH(String ph) {
+        return "CYCLEWAY".equals(ph) || "FOOTWAY".equals(ph) || "PATH".equals(ph);
     }
 
     private static boolean isProminentPH(String ph) {

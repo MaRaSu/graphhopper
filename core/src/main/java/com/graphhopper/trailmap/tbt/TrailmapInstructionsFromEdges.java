@@ -12,6 +12,7 @@ import com.graphhopper.trailmap.shared.PredictedSurface;
 import com.graphhopper.util.*;
 import com.graphhopper.util.shapes.GHPoint;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import static com.graphhopper.util.Parameters.Details.*;
@@ -71,13 +72,17 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
 
     // --- Junction context from last getTurn() call, consumed by enrichExtraInfo ---
     private InstructionsOutgoingEdges lastOutgoingEdges;
-    private boolean lastTrailFork;
 
     // --- Visual guidance side-channel ---
     // Set by suppression rules in getTurn() when a junction is visual-worthy but not
     // instruction-worthy. Read by next() after getTurn() returns IGNORE.
     // Carries the angle-based sign the instruction would have if it were a real turn.
     private int visualCandidateSign = Instruction.IGNORE;
+
+    // --- Sign reframer state ---
+    // Holds the shape label of the last reframer firing (e.g. "shape_4_sandwich").
+    // Reset at the start of each reframeSign() call. Read by next() to tag extraInfo.
+    private String lastReframerShape = null;
 
     private static final int MAX_U_TURN_DISTANCE = 35;
 
@@ -236,6 +241,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                     prevRoadEnv = roadEnv;
                     prevDestinationAndRef = destination + destinationRef;
                     prevPredictedHighway = currentPH;
+                    prevPredictedSurface = currentPS;
                     prevBikeNetwork = currentBN;
                 }
                 prevInstruction = roundaboutInstruction;
@@ -284,6 +290,19 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
 
         } else {
             int sign = getTurn(edge, baseNode, prevNode, adjNode, name, destination + destinationRef);
+
+            // Sign reframer (Stage 1 junction-relative reframing layer).
+            // Adjusts the rule-chain sign against the visible-alt distribution at the
+            // junction. Acts only on signs in the slight zone (CONTINUE/SLIGHT/KEEP);
+            // real turns and IGNORE pass through. May demote slight→CONTINUE or
+            // upgrade CONTINUE→KEEP depending on junction shape.
+            int originalSign = sign;
+            if (isReframerCandidate(sign)) {
+                int reframed = reframeSign(sign, edge, baseNode);
+                if (reframed != sign) {
+                    sign = reframed;
+                }
+            }
 
             // Visual side-channel: if getTurn() returned IGNORE but a rule flagged this
             // junction as visual-worthy, upgrade to a visual instruction.
@@ -335,6 +354,20 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
 
                 if (isVisual) {
                     prevInstruction.setExtraInfo("visual_guidance", true);
+                }
+                if (sign != originalSign && lastReframerShape != null) {
+                    prevInstruction.setExtraInfo("reframed_from", originalSign);
+                    prevInstruction.setExtraInfo("reframer_shape", lastReframerShape);
+                    // When the reframer demoted to CONTINUE because the rider sees a real
+                    // junction (side-turn off the route, or a sandwich of alts), stamp
+                    // trail_fork so the client fires its "continue" cue. The existing
+                    // hasConfusableAlternative criteria are tighter than the reframer's
+                    // visual-alt set, so the tag would otherwise be missing.
+                    if (sign == Instruction.CONTINUE_ON_STREET
+                            && ("shape_1_side_turn".equals(lastReframerShape)
+                                || "shape_4_sandwich".equals(lastReframerShape))) {
+                        prevInstruction.setExtraInfo("trail_fork", true);
+                    }
                 }
             }
             prevName = name;
@@ -433,6 +466,31 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                     || InstructionsHelper.isFromFerry(roadEnv, prevRoadEnv)) {
                 return sign;
             }
+            // E5: Bike on CYCLEWAY makes a real turn while a visually-similar FOOTWAY runs
+            // (near-)straight ahead. The footway is access-blocked under the bike weighting
+            // and so absent from getAllowedTurns()/getVisibleTurns(); on the ground the
+            // rider still sees it as an identical-looking path. Emit the angle-based sign.
+            // Visual similarity is checked against BOTH the prev edge surface and the route's
+            // next edge surface — the rider sees both at the junction, so an alt matching
+            // either is a real go-straight trap.
+            if (Math.abs(sign) > 1
+                    && currentPH == PredictedHighway.CYCLEWAY
+                    && !outgoingEdges.mergedOrSplitWay()
+                    && hasConfusableFootwayAlternative(edge, baseNode, prevSurface, currentSurface,
+                            prevLat, prevLon, lat, lon, prevOrientation)) {
+                return sign;
+            }
+            // E6: Road → non-road transition at a forced-path junction. The road ends
+            // and a cycleway/footway/path picks up with no alternatives. The graph says
+            // "no choice", but on the ground the rider faces a road end (vehicle turnaround
+            // visual cue) and needs to know the cycleway/path ahead is the continuation.
+            // Emit the angle-based sign so the rider gets a normal "continue" / turn
+            // instruction at the transition. One-directional only — the reverse
+            // (non-road → road) is intentionally not covered, since emerging onto a road
+            // typically has clear visual cues.
+            if (isRoadInfrastructure(prevPH) && isNonRoadTarget(currentPH)) {
+                return sign;
+            }
             return Instruction.IGNORE;
         }
 
@@ -474,17 +532,33 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         // Clear turn: |sign| > 1 (actual angle change)
         // =================================================================
         if (Math.abs(sign) > 1) {
-            // S1: Same PH + same name + all alternatives are different PH → road bending
-            if (InstructionsHelper.isSameName(name, prevName)
+            // S1/S2 same-name suppression precondition: at least one side of the junction
+            // must be road infrastructure (motorway/major/minor/service road). Same-name
+            // suppression relies on names being physically sign-posted so the rider can see
+            // they're still on the same way. That holds on roads but not on cycleways /
+            // footways / paths / tracks (informal route names that aren't observable on the
+            // ground). Pure non-road junctions are handled by other rules (S3 prominence,
+            // S5/S6 trail logic, E2 fork). Transitions in/out of road keep S1/S2 active.
+            boolean s1s2ScopeOk = isRoadInfrastructure(currentPH) || isRoadInfrastructure(prevPH);
+
+            // S1: Same PH + same name + all alternatives visually distinct → road bending.
+            // "Visually distinct" requires BOTH a different PH bucket (per isConfusableFrom)
+            // AND a clearly different surface (asphalt vs known non-asphalt; ASPHALT_OR_UNPAVED
+            // is ambiguous and never counts as distinguishing).
+            if (s1s2ScopeOk
+                    && InstructionsHelper.isSameName(name, prevName)
                     && currentPH != null && currentPH == prevPH
-                    && allAlternativesDifferentPH(outgoingEdges, currentPH)) {
+                    && allAlternativesVisuallyDistinct(outgoingEdges, edge, currentPH)) {
                 return Instruction.IGNORE;
             }
 
-            // S2: Same name + same RoadClass + no alternative of same RC → road curves
-            if (InstructionsHelper.isSameName(name, prevName)
+            // S2: Same name + same RoadClass + all alternatives visually distinct → road curves.
+            // Uses the same visual-distinctness helper as S1 — strict RC equality of alts is
+            // not enough (cycleway/service_road are visually similar when both unpaved).
+            if (s1s2ScopeOk
+                    && InstructionsHelper.isSameName(name, prevName)
                     && currentRC == prevRC
-                    && noAlternativeOfSameRC(outgoingEdges, currentRC)) {
+                    && allAlternativesVisuallyDistinct(outgoingEdges, edge, currentPH)) {
                 return Instruction.IGNORE;
             }
 
@@ -509,10 +583,13 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         double delta = InstructionsHelper.calculateOrientationDelta(prevLat, prevLon, lat, lon, prevOrientation);
 
         // S4: Name changes but same PH + near zero angle + no fork → municipal boundary
+        // The "no fork" guard is otherContinue==null (no near-straight alt) AND no E2-confusable
+        // alt at wider angle — getOtherContinue alone misses same-PH/same-surface forks at e.g. +50°.
         if (!InstructionsHelper.isSameName(name, prevName)
                 && currentPH != null && currentPH == prevPH
                 && Math.abs(delta) < 0.15
-                && otherContinue == null) {
+                && otherContinue == null
+                && !hasConfusableAlternative(outgoingEdges, edge, currentPH)) {
             return Instruction.IGNORE;
         }
 
@@ -535,8 +612,44 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             }
         }
 
-        // S3: All alternatives are lower prominence → obviously staying on main way
-        if (currentPH != null && allAlternativesLowerProminence(outgoingEdges, currentPH)) {
+        // S3: All alternatives are lower prominence → obviously staying on main way.
+        // Guard 1: rider must be staying on (or descending from) something at least as prominent
+        // as the route ahead. When prevPH < currentPH the rider is *joining* a more prominent
+        // way — that transition is itself the navigation event and needs an instruction.
+        // Guard 2 (non-road only): when the rider is on non-road infrastructure (trails,
+        // cycleways, paths) prominence alone is not a reliable visual cue — an unpaved
+        // cycleway and a same-surface footway can be visually identical despite different
+        // PH. On non-road, S3 escapes (emits the angle-based sign) only when at least one
+        // alt is *both* forward-pointing (within ±90° of incoming) and visually confusable
+        // with the route (same PH bucket per isConfusableFrom OR same major surface). A
+        // back-leg / U-turn-shaped alt is not a real navigation choice and shouldn't trigger
+        // an instruction even if its surface matches. On road infrastructure
+        // (motorway/major/minor/service) the road environment carries its own visual cues
+        // (signs, kerbs, markings) and prominence remains a fine proxy — S3 keeps its
+        // original behaviour there.
+        if (currentPH != null && prevPH != null
+                && phProminence(prevPH) >= phProminence(currentPH)
+                && allAlternativesLowerProminence(outgoingEdges, currentPH)) {
+            boolean bothNonRoad = !isRoadInfrastructure(currentPH) && !isRoadInfrastructure(prevPH);
+            if (bothNonRoad
+                    && hasForwardConfusableAlt(outgoingEdges, edge, currentPH, delta,
+                            prevLat, prevLon, prevOrientation)) {
+                return sign;
+            }
+            return Instruction.IGNORE;
+        }
+
+        // S6: Forced trail bend — both prev and current are non-road-infrastructure AND
+        // no alternative is a viable forward continuation (no alt within ±90° of incoming).
+        // On trails/cycleways large geometric angles are often just path curvature, and
+        // back-leg / U-turn-shaped alts are not real navigation choices. This suppresses
+        // the leaving-current-street fallback's |Δ|>0.6 and name-based triggers (the
+        // latter being unreliable on non-road-infra where names are informal route
+        // designations not visible on the ground).
+        if (currentPH != null && prevPH != null
+                && !isRoadInfrastructure(currentPH)
+                && !isRoadInfrastructure(prevPH)
+                && !hasViableForwardAlternative(outgoingEdges, prevLat, prevLon, prevOrientation)) {
             return Instruction.IGNORE;
         }
 
@@ -647,7 +760,9 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         if (currentPH != null && !isRoadInfrastructure(currentPH)
                 && (name == null || name.isEmpty() || currentPH == PredictedHighway.CYCLEWAY)
                 && hasConfusableAlternative(outgoingEdges, edge, currentPH)) {
-            lastTrailFork = true;
+            // trail_fork tagging happens in enrichExtraInfo from junction state,
+            // not from a getTurn-side flag — so any rule that emits at this kind
+            // of junction picks up the tag.
             return Instruction.CONTINUE_ON_STREET;
         }
 
@@ -682,25 +797,41 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     }
 
     /**
-     * Check if all accessible alternative edges have a different PredictedHighway than current.
-     * Returns false if PH data is unavailable.
+     * Check if all accessible alternative edges are visually distinct from the route edge.
+     * <p>
+     * An alternative is visually distinct only when BOTH:
+     * <ul>
+     *   <li>its PredictedHighway is in a different visual bucket (per {@link #isConfusableFrom}), AND</li>
+     *   <li>its surface clearly differs from the route's (per {@link #surfacesClearlyDiffer} —
+     *       ASPHALT_OR_UNPAVED is ambiguous and never counts as distinguishing).</li>
+     * </ul>
+     * If either signal is ambiguous the alt is treated as potentially confusing and the
+     * helper returns false. Returns false also if PH data is unavailable.
      */
-    private boolean allAlternativesDifferentPH(InstructionsOutgoingEdges outgoing, PredictedHighway currentPH) {
+    private boolean allAlternativesVisuallyDistinct(InstructionsOutgoingEdges outgoing,
+                                                     EdgeIteratorState routeEdge,
+                                                     PredictedHighway currentPH) {
         if (predictedHighwayEnc == null || currentPH == null) return false;
+        PredictedSurface currentSurface = predictedSurfaceEnc != null ? routeEdge.get(predictedSurfaceEnc) : null;
         for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
-            if (alt.get(predictedHighwayEnc) == currentPH) return false;
+            PredictedHighway altPH = alt.get(predictedHighwayEnc);
+            if (isConfusableFrom(currentPH, altPH)) return false;
+            if (predictedSurfaceEnc != null) {
+                PredictedSurface altSurface = alt.get(predictedSurfaceEnc);
+                if (!surfacesClearlyDiffer(currentSurface, altSurface)) return false;
+            }
         }
         return true;
     }
 
     /**
-     * Check if no accessible alternative edge has the same RoadClass as current.
+     * Whether two predicted surfaces clearly differ on the asphalt/non-asphalt visual axis.
+     * ASPHALT_OR_UNPAVED is treated as ambiguous: it could be either, so it never counts
+     * as distinguishing.
      */
-    private boolean noAlternativeOfSameRC(InstructionsOutgoingEdges outgoing, RoadClass currentRC) {
-        for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
-            if (alt.get(roadClassEnc) == currentRC) return false;
-        }
-        return true;
+    private static boolean surfacesClearlyDiffer(PredictedSurface a, PredictedSurface b) {
+        if (a == PredictedSurface.ASPHALT_OR_UNPAVED || b == PredictedSurface.ASPHALT_OR_UNPAVED) return false;
+        return isAsphalt(a) != isAsphalt(b);
     }
 
     /**
@@ -746,6 +877,72 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
 
             // Route must deviate at least 0.35 rad (~20°) more than the alternative
             if (angularGap > 0.35) return true;
+        }
+        return false;
+    }
+
+    /**
+     * E5 helper. Inside the forced-path block ({@code nrOfPossibleTurns <= 1}) the
+     * weighting-based alternative counts hide a footway that is bike-blocked but
+     * visually indistinguishable from the cycleway the bike is on. Walk
+     * {@link #allExplorer} (unfiltered) to find such an alternative regardless of
+     * access tags.
+     * <p>
+     * Returns true iff at least one graph-incident edge at {@code baseNode} (other
+     * than the route edge and the previous edge) satisfies:
+     * <ol>
+     *   <li>{@code predicted_highway == FOOTWAY},</li>
+     *   <li>same major surface as <em>either</em> the rider's prev edge or the route's
+     *       next edge ({@code isAsphalt(alt)} matches {@code isAsphalt(prev)} OR
+     *       {@code isAsphalt(current)}). The rider sees both surfaces at the junction,
+     *       so an alt visually matching either is a real confusable.</li>
+     *   <li>{@code |altDelta| ≤ |routeDelta| + π/6} — the alt is no more than ~30°
+     *       further off the rider's forward line than the route.</li>
+     * </ol>
+     * <p>
+     * Condition 3 captures both confusion patterns:
+     * <ul>
+     *   <li>alt much straighter than route (rider's go-straight inertia trap), and</li>
+     *   <li>alt and route at similar-magnitude turns (symmetric T-junction with no
+     *       obvious "default" choice).</li>
+     * </ul>
+     * It rejects alts that are clearly further off-line than the route — the rider
+     * can distinguish those by eye.
+     */
+    private boolean hasConfusableFootwayAlternative(EdgeIteratorState routeEdge,
+                                                     int baseNode,
+                                                     PredictedSurface prevSurface,
+                                                     PredictedSurface currentSurface,
+                                                     double prevLat, double prevLon,
+                                                     double routeLat, double routeLon,
+                                                     double prevOrientation) {
+        if (predictedHighwayEnc == null) return false;
+
+        double routeDelta = InstructionsHelper.calculateOrientationDelta(
+                prevLat, prevLon, routeLat, routeLon, prevOrientation);
+        final double CONFUSABILITY_TOLERANCE = Math.PI / 6; // ~30°
+
+        EdgeIterator iter = allExplorer.setBaseNode(baseNode);
+        while (iter.next()) {
+            if (iter.getEdge() == routeEdge.getEdge()) continue;
+            if (prevEdge != null && iter.getEdge() == prevEdge.getEdge()) continue;
+
+            if (iter.get(predictedHighwayEnc) != PredictedHighway.FOOTWAY) continue;
+
+            if (predictedSurfaceEnc != null) {
+                PredictedSurface altSurface = iter.get(predictedSurfaceEnc);
+                boolean altAsphalt = isAsphalt(altSurface);
+                boolean matchesPrev = altAsphalt == isAsphalt(prevSurface);
+                boolean matchesCurrent = altAsphalt == isAsphalt(currentSurface);
+                if (!matchesPrev && !matchesCurrent) continue;
+            }
+
+            GHPoint altPt = InstructionsHelper.getPointForOrientationCalculation(iter, nodeAccess);
+            double altDelta = InstructionsHelper.calculateOrientationDelta(
+                    prevLat, prevLon, altPt.getLat(), altPt.getLon(), prevOrientation);
+
+            if (Math.abs(altDelta) > Math.abs(routeDelta) + CONFUSABILITY_TOLERANCE) continue;
+            return true;
         }
         return false;
     }
@@ -805,6 +1002,75 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         return false;
     }
 
+    /**
+     * S3 escape gate: returns true iff at least one alt is a real "go-straight inertia
+     * trap" relative to the route. Three AND-mandatory gates per alt:
+     * <ol>
+     *   <li><b>PH bucket</b> — {@code isConfusableFrom(currentPH, altPH)} must be true.
+     *       This is the layer-2 visual-bucket signal: the alt must be the kind of way the
+     *       rider could plausibly mistake for their continuation.</li>
+     *   <li><b>Surface</b> — same major surface (asphalt vs non-asphalt) per
+     *       {@link #surfacesClearlyDiffer}. ASPHALT_OR_UNPAVED is ambiguous and counts as
+     *       a match either way.</li>
+     *   <li><b>Angle</b> — alt is meaningfully straighter than the route:
+     *       {@code |routeDelta| - |altDelta| > ~0.35 rad (≈20°)}. This is the rider's
+     *       inertia trap pattern: going straight would land on the alt while the route
+     *       bends off. A side branch — alt at 50–90° off forward while route is gentle —
+     *       fails this gate and is not a real trap.</li>
+     * </ol>
+     * Same shape as {@link #hasConfusableAlternative} (used by S4/E2/F1) for the PH and
+     * surface gates, and same straighter-than-route gate as
+     * {@link #hasVisualCandidateAlternative} (S5's visual side-channel).
+     */
+    private boolean hasForwardConfusableAlt(InstructionsOutgoingEdges outgoing,
+                                             EdgeIteratorState routeEdge,
+                                             PredictedHighway currentPH,
+                                             double routeDelta,
+                                             double prevLat, double prevLon,
+                                             double prevOrientation) {
+        if (predictedHighwayEnc == null || currentPH == null) return false;
+        PredictedSurface routeSurface = predictedSurfaceEnc != null
+                ? routeEdge.get(predictedSurfaceEnc) : null;
+        double routeDeviation = Math.abs(routeDelta);
+        final double STRAIGHTER_THRESHOLD = 0.35; // ~20°
+        for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
+            // (a) PH bucket — alt must be confusable per layer-2 table
+            PredictedHighway altPH = alt.get(predictedHighwayEnc);
+            if (!isConfusableFrom(currentPH, altPH)) continue;
+
+            // (b) surface — must not clearly differ
+            if (predictedSurfaceEnc != null) {
+                PredictedSurface altSurface = alt.get(predictedSurfaceEnc);
+                if (surfacesClearlyDiffer(routeSurface, altSurface)) continue;
+            }
+
+            // (c) angle — alt is meaningfully straighter than the route
+            GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(alt, nodeAccess);
+            double altDelta = InstructionsHelper.calculateOrientationDelta(
+                    prevLat, prevLon, altPoint.getLat(), altPoint.getLon(), prevOrientation);
+            if (routeDeviation - Math.abs(altDelta) > STRAIGHTER_THRESHOLD) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Whether any non-route alternative at the junction is a "viable forward continuation"
+     * — its outgoing direction is within ±90° of the incoming direction. Back-legs and
+     * U-turn-shaped alts (>90° divergence) are not viable forward and don't constitute a
+     * real navigation choice for the rider. Used by S6 (forced trail bend).
+     */
+    private boolean hasViableForwardAlternative(InstructionsOutgoingEdges outgoing,
+                                                double prevLat, double prevLon,
+                                                double prevOrientation) {
+        for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
+            GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(alt, nodeAccess);
+            double altDelta = InstructionsHelper.calculateOrientationDelta(
+                    prevLat, prevLon, altPoint.getLat(), altPoint.getLon(), prevOrientation);
+            if (Math.abs(altDelta) < Math.PI / 2) return true;
+        }
+        return false;
+    }
+
     private static boolean isAsphalt(PredictedSurface surface) {
         return surface == PredictedSurface.ASPHALT;
     }
@@ -842,6 +1108,14 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                         || alt == PredictedHighway.CYCLEWAY || alt == PredictedHighway.OUTDOOR_WAY
                         || alt == PredictedHighway.SERVICE_ROAD;
             case CYCLEWAY:
+                // Wide maintained ways: confusable with each other and tracks. Also FOOTWAY:
+                // an unpaved Finnish cycleway is often a 1 m gravel strip visually identical
+                // to a same-surface footway running alongside or branching off. The layer-3
+                // surface gate disambiguates the paved-cycleway case where width and
+                // maintenance markings make the distinction visible.
+                return alt == PredictedHighway.ROUGH_TRACK || alt == PredictedHighway.GOOD_TRACK
+                        || alt == PredictedHighway.CYCLEWAY || alt == PredictedHighway.OUTDOOR_WAY
+                        || alt == PredictedHighway.FOOTWAY;
             case OUTDOOR_WAY:
                 // Wide maintained ways: confusable with each other and tracks, NOT paths
                 return alt == PredictedHighway.ROUGH_TRACK || alt == PredictedHighway.GOOD_TRACK
@@ -869,6 +1143,17 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     }
 
     /**
+     * Non-road continuations that the E6 forced-path anti-suppression pairs with the
+     * road-side {@link #isRoadInfrastructure} types. Tight allowlist; extend by enum
+     * addition if real-world data shows other non-road types need the same hint.
+     */
+    private static boolean isNonRoadTarget(PredictedHighway ph) {
+        return ph == PredictedHighway.CYCLEWAY
+                || ph == PredictedHighway.FOOTWAY
+                || ph == PredictedHighway.PATH;
+    }
+
+    /**
      * Prominence ordering for PredictedHighway — higher value = more prominent way.
      * Used by S3 to suppress instructions when alternatives are visibly less important.
      */
@@ -891,6 +1176,295 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             case UNKNOWN:      return 1;
             default:           return 0;
         }
+    }
+
+    // ========================================================================
+    // Sign reframer (Stage 1 junction-relative reframing layer)
+    // ========================================================================
+    //
+    // After getTurn() decides a sign, the reframer compares the route's angle
+    // against the junction's visible-alt distribution and may adjust the sign
+    // to better match rider perception. Five "shapes" of junction are
+    // recognised; three of them rewrite the sign (Shape 1 = no competition,
+    // Shape 3 = Y-fork with route on outside, Shape 4 = sandwich) and two pass
+    // through (Shape 2 = anchored straight reference, Shape 5 = real turn).
+    //
+    // Visual-alt collection walks the unfiltered explorer to catch
+    // access-blocked-but-visible alts (e.g. footways with bike=no when riding
+    // on a cycleway), mirroring the pattern used by hasConfusableFootwayAlternative.
+
+    // Reframer thresholds (radians where noted). Picked conservatively; the
+    // first-cut intent is "don't bite when the answer is uncertain."
+    private static final double REFRAMER_FORWARD_CONE = Math.toRadians(75);
+    private static final double REFRAMER_REAL_TURN_CUTOFF = Math.toRadians(40);
+    private static final double REFRAMER_ANCHORED_THRESHOLD = Math.toRadians(10);
+    private static final double REFRAMER_ROUTE_NOISE_MARGIN = Math.toRadians(8);
+    private static final double REFRAMER_SHAPE4_ROUTE_CLAMP = Math.toRadians(12);
+    private static final double REFRAMER_SHAPE3A_ROUTE_CLAMP = Math.toRadians(30);
+    private static final double REFRAMER_SHAPE3A_ALT_MAX_ABS = Math.toRadians(45);
+    private static final double REFRAMER_SHAPE3B_ROUTE_CLAMP = Math.toRadians(25);
+    private static final double REFRAMER_SAMESIDE_SPREAD = Math.toRadians(33);
+    // Shape 1 side-turn demote — hard thresholds. Both must hold to demote a slight/keep
+    // sign to CONTINUE. The route must be genuinely near-straight in absolute terms, AND
+    // every visible alt must be clearly past the slight bucket (no plausible fork branch).
+    // Avoids relying on fine angular differences that OSM data can't reliably support.
+    private static final double REFRAMER_SHAPE1_ROUTE_NEAR_STRAIGHT = Math.toRadians(20);
+    private static final double REFRAMER_SHAPE1_ALT_CLEARLY_OFF = Math.toRadians(60);
+
+    /**
+     * Whether the reframer should act on this sign. Acts on CONTINUE_ON_STREET,
+     * TURN_SLIGHT_LEFT/RIGHT, KEEP_LEFT/RIGHT. Passes through all other signs
+     * (real turns, sharp turns, ferries, u-turns, IGNORE, etc.).
+     */
+    private static boolean isReframerCandidate(int sign) {
+        return sign == Instruction.CONTINUE_ON_STREET
+                || sign == Instruction.TURN_SLIGHT_LEFT
+                || sign == Instruction.TURN_SLIGHT_RIGHT
+                || sign == Instruction.KEEP_LEFT
+                || sign == Instruction.KEEP_RIGHT;
+    }
+
+    /**
+     * Reframe a rule-chain sign against the junction's visible-alt distribution.
+     * Returns the new sign (possibly unchanged). Side-effect: sets
+     * {@link #lastReframerShape} to a debug label when a shape rewrites the sign.
+     */
+    private int reframeSign(int decidedSign, EdgeIteratorState routeEdge, int baseNode) {
+        lastReframerShape = null;
+
+        // Route's signed delta from incoming direction.
+        GHPoint routePoint = InstructionsHelper.getPointForOrientationCalculation(routeEdge, nodeAccess);
+        double routeDelta = InstructionsHelper.calculateOrientationDelta(
+                prevLat, prevLon, routePoint.getLat(), routePoint.getLon(), prevOrientation);
+
+        // Shape 5 — route is past the slight bucket. The angular event is real;
+        // never reframe.
+        if (Math.abs(routeDelta) > REFRAMER_REAL_TURN_CUTOFF) {
+            return decidedSign;
+        }
+
+        // Type-change detection. F1 emits angular signs intentionally when the route
+        // crosses a PredictedHighway or major-surface (asphalt/non-asphalt) boundary;
+        // those intentional cues should not be upgraded to KEEP by Shape 3.
+        boolean typeChange = isTypeChangeAtJunction(routeEdge);
+
+        // Collect visible alts at the junction (unfiltered explorer + visibility filters).
+        PredictedSurface routeSurface = predictedSurfaceEnc != null
+                ? routeEdge.get(predictedSurfaceEnc) : null;
+        List<Double> altDeltas = collectVisualAltDeltas(baseNode, routeEdge, routeSurface);
+
+        // Shape 2 — a clear straight reference exists; the rule chain's sign is right.
+        for (double altDelta : altDeltas) {
+            if (Math.abs(altDelta) <= REFRAMER_ANCHORED_THRESHOLD) {
+                return decidedSign;
+            }
+        }
+
+        // Shape 1 — no forward competitor visible. Demote slight to CONTINUE.
+        if (altDeltas.isEmpty()) {
+            if (decidedSign == Instruction.TURN_SLIGHT_LEFT
+                    || decidedSign == Instruction.TURN_SLIGHT_RIGHT
+                    || decidedSign == Instruction.KEEP_LEFT
+                    || decidedSign == Instruction.KEEP_RIGHT) {
+                lastReframerShape = "shape_1_no_competition";
+                return Instruction.CONTINUE_ON_STREET;
+            }
+            return decidedSign;
+        }
+
+        // Classify alts relative to the route's angular position.
+        boolean leftOfRoute = false;
+        boolean rightOfRoute = false;
+        for (double altDelta : altDeltas) {
+            if (altDelta > routeDelta + REFRAMER_ROUTE_NOISE_MARGIN) leftOfRoute = true;
+            else if (altDelta < routeDelta - REFRAMER_ROUTE_NOISE_MARGIN) rightOfRoute = true;
+        }
+
+        // Shape 4 — sandwich: alts on both sides of route. No KEEP direction works.
+        // Demote near-straight routes to CONTINUE; pass through if route is off-axis enough
+        // that the rider physically feels the bend (route clamp guards against false demotion).
+        // Limited to non-road junctions (see bothNonRoadAtJunction).
+        if (leftOfRoute && rightOfRoute) {
+            if (Math.abs(routeDelta) <= REFRAMER_SHAPE4_ROUTE_CLAMP
+                    && bothNonRoadAtJunction(routeEdge)
+                    && (decidedSign == Instruction.TURN_SLIGHT_LEFT
+                        || decidedSign == Instruction.TURN_SLIGHT_RIGHT
+                        || decidedSign == Instruction.KEEP_LEFT
+                        || decidedSign == Instruction.KEEP_RIGHT)) {
+                lastReframerShape = "shape_4_sandwich";
+                return Instruction.CONTINUE_ON_STREET;
+            }
+            return decidedSign;
+        }
+
+        // Detect a "straddling fork branch" — an alt on the opposite side of incoming
+        // from the route that the rider would perceive as a Y-fork partner.
+        // Single gate: alt must be in the forward fan (|alt| ≤ 45°). Past that the alt
+        // is clearly a turn, not a forward branch.
+        // Route at 0° is treated as straddling against any non-zero alt.
+        // (No magnitude-gap check — that would be a fine-grained angular comparison
+        // that OSM data isn't reliable enough to support. Junction-shape signals only.)
+        boolean hasStraddlingForkBranch = false;
+        for (double altDelta : altDeltas) {
+            boolean isStraddling = (routeDelta == 0.0) || (altDelta * routeDelta < 0);
+            if (isStraddling && Math.abs(altDelta) <= REFRAMER_SHAPE3A_ALT_MAX_ABS) {
+                hasStraddlingForkBranch = true;
+                break;
+            }
+        }
+
+        // Shape 3a — Y-fork, straddle of incoming with a real fork-branch alt.
+        // KEEP toward the route's side (the empty side, away from where the alts are).
+        //
+        // Upgrades CONTINUE_ON_STREET to KEEP unconditionally. For TURN_SLIGHT_X,
+        // upgrades only when there is no PH/surface change at this junction —
+        // at type transitions, F1's angular cue conveys "you're changing road
+        // type" and must not be replaced by a fork-relative KEEP that drops that
+        // signal. KEEP inputs pass through (rule chain's KEEP direction is trusted).
+        if (hasStraddlingForkBranch) {
+            if (Math.abs(routeDelta) <= REFRAMER_SHAPE3A_ROUTE_CLAMP
+                    && shape3InputCanUpgrade(decidedSign, typeChange)) {
+                lastReframerShape = "shape_3a_straddle";
+                return leftOfRoute ? Instruction.KEEP_RIGHT : Instruction.KEEP_LEFT;
+            }
+            return decidedSign;
+        }
+
+        // Same-side as incoming (or opposite-side alts that failed the fork-branch
+        // bound — in either case we use spread from route as the fork-vs-side-turn metric).
+        double maxSpread = 0;
+        for (double altDelta : altDeltas) {
+            maxSpread = Math.max(maxSpread, Math.abs(altDelta - routeDelta));
+        }
+
+        // Shape 3b — same-side Y-fork (small spread, route in slight zone).
+        // Same upgrade restriction as Shape 3a.
+        if (maxSpread <= REFRAMER_SAMESIDE_SPREAD
+                && Math.abs(routeDelta) <= REFRAMER_SHAPE3B_ROUTE_CLAMP
+                && shape3InputCanUpgrade(decidedSign, typeChange)) {
+            lastReframerShape = "shape_3b_sameside_fork";
+            return leftOfRoute ? Instruction.KEEP_RIGHT : Instruction.KEEP_LEFT;
+        }
+
+        // Shape 1 (side-turn variant) — demote slight/keep to CONTINUE only when the
+        // junction shape unambiguously says "route is the straight one, alts are turns."
+        // Two hard conditions:
+        //   (a) Route is genuinely near-straight in absolute terms (|route| ≤ 20°).
+        //   (b) ALL visible alts are clearly past the slight bucket (|alt| ≥ 60° each).
+        // Both must hold. This avoids relying on fine angular differences that OSM
+        // data can't support — only fires when the asymmetry is overwhelming (Case A:
+        // route -18°, alt -66°). Anything less clear preserves the rule chain's sign.
+        // Limited to non-road junctions: at road junctions the rule chain's angular
+        // signs are intentional (F1 type-transition cues, leaving-current-street at
+        // RC changes) and must not be demoted.
+        boolean routeIsNearStraight = Math.abs(routeDelta) <= REFRAMER_SHAPE1_ROUTE_NEAR_STRAIGHT;
+        boolean allAltsClearlyOff = true;
+        for (double altDelta : altDeltas) {
+            if (Math.abs(altDelta) < REFRAMER_SHAPE1_ALT_CLEARLY_OFF) {
+                allAltsClearlyOff = false;
+                break;
+            }
+        }
+        if (routeIsNearStraight && allAltsClearlyOff
+                && bothNonRoadAtJunction(routeEdge)
+                && (decidedSign == Instruction.TURN_SLIGHT_LEFT
+                    || decidedSign == Instruction.TURN_SLIGHT_RIGHT
+                    || decidedSign == Instruction.KEEP_LEFT
+                    || decidedSign == Instruction.KEEP_RIGHT)) {
+            lastReframerShape = "shape_1_side_turn";
+            return Instruction.CONTINUE_ON_STREET;
+        }
+        return decidedSign;
+    }
+
+    /**
+     * Whether a Shape-3 upgrade (→ KEEP) is allowed for this input sign.
+     * CONTINUE upgrades unconditionally. TURN_SLIGHT_X upgrades only when there
+     * is no type change at the junction (otherwise we preserve F1's angular cue).
+     * KEEP inputs never upgrade (rule chain's KEEP direction is trusted).
+     */
+    private static boolean shape3InputCanUpgrade(int sign, boolean typeChange) {
+        if (sign == Instruction.CONTINUE_ON_STREET) return true;
+        if (sign == Instruction.TURN_SLIGHT_LEFT || sign == Instruction.TURN_SLIGHT_RIGHT) {
+            return !typeChange;
+        }
+        return false;
+    }
+
+    /**
+     * Whether neither side of the junction is road infrastructure (motorway / major
+     * road / minor road / service road). Used to gate Shape 1 side-turn and Shape 4
+     * sandwich demotions — the reframer's demote-to-CONTINUE logic targets trail-
+     * network junctions where geometric ambiguity is the dominant signal. At any
+     * junction involving a road, the rule chain's angular signs are intentional
+     * (F1 type-transition cues, leaving-current-street at road-class changes) and
+     * should be preserved.
+     */
+    private boolean bothNonRoadAtJunction(EdgeIteratorState routeEdge) {
+        if (predictedHighwayEnc == null || prevEdge == null) return true;
+        PredictedHighway prevPH = prevEdge.get(predictedHighwayEnc);
+        PredictedHighway currentPH = routeEdge.get(predictedHighwayEnc);
+        if (prevPH == null || currentPH == null) return true;
+        return !isRoadInfrastructure(prevPH) && !isRoadInfrastructure(currentPH);
+    }
+
+    /**
+     * Whether this junction crosses a PredictedHighway or major-surface
+     * (asphalt vs non-asphalt) boundary between {@code prevEdge} and {@code routeEdge}.
+     * Used by Shape 3 to preserve F1's intentional angular cue at type transitions.
+     */
+    private boolean isTypeChangeAtJunction(EdgeIteratorState routeEdge) {
+        if (prevEdge == null) return false;
+        if (predictedHighwayEnc != null) {
+            PredictedHighway prevPH = prevEdge.get(predictedHighwayEnc);
+            PredictedHighway currentPH = routeEdge.get(predictedHighwayEnc);
+            if (prevPH != null && currentPH != null && prevPH != currentPH) return true;
+        }
+        if (predictedSurfaceEnc != null) {
+            PredictedSurface prevS = prevEdge.get(predictedSurfaceEnc);
+            PredictedSurface currentS = routeEdge.get(predictedSurfaceEnc);
+            if (prevS != null && currentS != null
+                    && prevS != PredictedSurface.ASPHALT_OR_UNPAVED
+                    && currentS != PredictedSurface.ASPHALT_OR_UNPAVED
+                    && isAsphalt(prevS) != isAsphalt(currentS)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Collect visible alts at {@code baseNode} (the junction node). Walks the
+     * unfiltered explorer to catch access-blocked-but-visible alts, then applies
+     * forward-cone and surface visibility gates.
+     */
+    private List<Double> collectVisualAltDeltas(int baseNode, EdgeIteratorState routeEdge,
+                                                 PredictedSurface routeSurface) {
+        List<Double> deltas = new ArrayList<>();
+        EdgeIterator iter = allExplorer.setBaseNode(baseNode);
+        while (iter.next()) {
+            if (iter.getEdge() == routeEdge.getEdge()) continue;
+            if (prevEdge != null && iter.getEdge() == prevEdge.getEdge()) continue;
+
+            // Surface visibility: drop alts whose major surface clearly differs.
+            // Treat ASPHALT_OR_UNPAVED (unknown) as ambiguous — always keep.
+            if (predictedSurfaceEnc != null && routeSurface != null
+                    && routeSurface != PredictedSurface.ASPHALT_OR_UNPAVED) {
+                PredictedSurface altSurface = iter.get(predictedSurfaceEnc);
+                if (altSurface != PredictedSurface.ASPHALT_OR_UNPAVED
+                        && isAsphalt(altSurface) != isAsphalt(routeSurface)) {
+                    continue;
+                }
+            }
+
+            GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(iter, nodeAccess);
+            double altDelta = InstructionsHelper.calculateOrientationDelta(
+                    prevLat, prevLon, altPoint.getLat(), altPoint.getLon(), prevOrientation);
+
+            // Forward cone: drop back-legs and clearly-sharp side-turns.
+            if (Math.abs(altDelta) > REFRAMER_FORWARD_CONE) continue;
+
+            deltas.add(altDelta);
+        }
+        return deltas;
     }
 
     // ========================================================================
@@ -976,10 +1550,20 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                 instruction.setExtraInfo("junction_has_higher_road", hasHigherRoad);
             }
 
-            // E2 trail fork flag — tells post-processing C1 to preserve this instruction
-            if (lastTrailFork) {
-                instruction.setExtraInfo("trail_fork", true);
-                lastTrailFork = false;
+            // trail_fork: junction-level marker for a confusable trail/cycleway fork.
+            // Stamped on any emitted instruction whose junction matches the criteria,
+            // independent of which rule in getTurn() returned the sign. Used by Stage 2
+            // Pass 2 C1 (preserve from continuity suppression) and the client app
+            // (treat as meaningful fork, not a generic CONTINUE that may be suppressed).
+            if (predictedHighwayEnc != null) {
+                PredictedHighway phForFork = edge.get(predictedHighwayEnc);
+                String nameForFork = instruction.getName();
+                if (phForFork != null
+                        && !isRoadInfrastructure(phForFork)
+                        && (nameForFork == null || nameForFork.isEmpty() || phForFork == PredictedHighway.CYCLEWAY)
+                        && hasConfusableAlternative(lastOutgoingEdges, edge, phForFork)) {
+                    instruction.setExtraInfo("trail_fork", true);
+                }
             }
 
             // T-junction detection: does the source road continue through this junction?
@@ -1000,6 +1584,26 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                     }
                 }
                 instruction.setExtraInfo("source_road_continues", sourceRoadContinues);
+            }
+
+            // junction_has_straight_alt: does any alternative continue roughly straight?
+            // Pure geometric check, independent of PH/RC. Used by Stage 2 M1 as a
+            // continuation guard — when the source way ends at a real T-junction
+            // (no alt within ±30° of straight), the rider is at a forced navigation
+            // turn rather than a brief sidepath detour, so M1's "join via sidepath"
+            // semantics don't apply.
+            if (prevEdge != null) {
+                boolean hasStraightAlt = false;
+                for (EdgeIteratorState alt : alts) {
+                    GHPoint altPt = InstructionsHelper.getPointForOrientationCalculation(alt, nodeAccess);
+                    double altDelta = InstructionsHelper.calculateOrientationDelta(
+                            prevLat, prevLon, altPt.getLat(), altPt.getLon(), prevOrientation);
+                    if (Math.abs(altDelta) <= Math.PI / 6) {  // ~30°
+                        hasStraightAlt = true;
+                        break;
+                    }
+                }
+                instruction.setExtraInfo("junction_has_straight_alt", hasStraightAlt);
             }
         }
     }

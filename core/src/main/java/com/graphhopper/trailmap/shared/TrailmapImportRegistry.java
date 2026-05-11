@@ -104,6 +104,15 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
             );
         }
 
+        // === Road Name Hash ===
+        if (RoadNameHash.KEY.equals(name)) {
+            return ImportUnit.create(name,
+                props -> RoadNameHash.create(),
+                (lookup, props) -> new RoadNameHashParser(
+                    lookup.getIntEncodedValue(RoadNameHash.KEY))
+            );
+        }
+
         // === Piste Type ===
         if (PisteType.KEY.equals(name)) {
             return ImportUnit.create(name,

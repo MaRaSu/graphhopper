@@ -349,7 +349,7 @@ public class InstructionValidationTest {
         assertEquals(polylineDist, totalInstrDist, 2.0, "Distance should match polyline within 2m");
 
         // Direct survives post-processing with voice priority
-        new InstructionPostProcessor().process(result.instructions);
+        new InstructionPostProcessor().process(result.instructions, request.getInstructionProfile());
         boolean foundDirect = false;
         for (Instruction instr : result.instructions) {
             if (Boolean.FALSE.equals(instr.getExtraInfoJSON().get("tbt_available"))) {
@@ -523,7 +523,7 @@ public class InstructionValidationTest {
 
         // Apply post-processing
         InstructionPostProcessor postProcessor = new InstructionPostProcessor();
-        postProcessor.process(result.instructions);
+        postProcessor.process(result.instructions, request.getInstructionProfile());
 
         // --- After post-processing: structural ---
         assertValidInstructionList(result);
@@ -691,7 +691,7 @@ public class InstructionValidationTest {
         assertValidInstructionList(result);
 
         InstructionPostProcessor postProcessor = new InstructionPostProcessor();
-        postProcessor.process(result.instructions);
+        postProcessor.process(result.instructions, request.getInstructionProfile());
 
         int turnCount = 0;
         for (Instruction instr : result.instructions) {
@@ -747,7 +747,7 @@ public class InstructionValidationTest {
         assertValidInstructionList(result);
 
         InstructionPostProcessor postProcessor = new InstructionPostProcessor();
-        postProcessor.process(result.instructions);
+        postProcessor.process(result.instructions, request.getInstructionProfile());
 
         // All join instructions must have complete metadata
         for (int i = 0; i < result.instructions.size(); i++) {
@@ -822,7 +822,7 @@ public class InstructionValidationTest {
         assertValidInstructionList(result);
 
         InstructionPostProcessor postProcessor = new InstructionPostProcessor();
-        postProcessor.process(result.instructions);
+        postProcessor.process(result.instructions, request.getInstructionProfile());
 
         // After M0 suppression: no U-turn should remain
         for (int i = 0; i < result.instructions.size(); i++) {
@@ -840,6 +840,112 @@ public class InstructionValidationTest {
         assertTrue(result.instructions.size() <= 4,
                 "After snap stub suppression, expected at most 4 instructions, got "
                 + result.instructions.size() + ". Instructions: " + summarizeInstructions(result));
+    }
+
+    // ========== Test 6b: Cross-segment U-turn — anchored at boundary, not stacked ==========
+
+    /**
+     * Production bug (2026-05-10): on a 30 km route, a single waypoint creating a
+     * U-turn at a segment boundary caused instructions for the entire middle of the
+     * route to be misplaced. The U-turn instruction landed ~500 m off its real
+     * location, and five subsequent instructions stacked on top of it because they
+     * searched forward from the wrong anchor.
+     *
+     * Root cause: the synthetic-path fromNode for the new segment is the FAR endpoint
+     * of the shared edge (opposite the snap point) and is not on the route polyline.
+     * remapInstructionGeometry's coordinate-match fell back to "global-closest forward
+     * point," which landed at an arbitrary index hundreds of meters away.
+     *
+     * Fix: stamp _polyline_start_hint on the patched U_TURN_UNKNOWN at the U-turn
+     * boundary, anchoring it at the snap point.
+     *
+     * Origin: diagUturnWaypointBreaksRemap in RouteInstructionGeneratorTest.
+     */
+    @Test
+    void crossSegmentUturn_anchoredAtBoundaryNotStacked() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("w1", 61.505403, 23.679752),
+                makeWaypoint("w2", 61.505903, 23.666556),
+                makeWaypoint("w3", 61.520546, 23.640742),
+                makeWaypoint("w4", 61.531336, 23.636473)));
+
+        TrailmapInstructionRequest.Segment s1 = new TrailmapInstructionRequest.Segment();
+        s1.setStart("w1"); s1.setEnd("w2");
+        s1.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        s1.setProfile("gravel");
+        s1.setInitialHeading(282.83505622838345);
+        s1.setHeadingPenalty(60.0);
+
+        TrailmapInstructionRequest.Segment s2 = new TrailmapInstructionRequest.Segment();
+        s2.setStart("w2"); s2.setEnd("w3");
+        s2.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        s2.setProfile("gravel");
+        s2.setInitialHeading(263.8884413748203);
+        s2.setHeadingPenalty(60.0);
+
+        TrailmapInstructionRequest.Segment s3 = new TrailmapInstructionRequest.Segment();
+        s3.setStart("w3"); s3.setEnd("w4");
+        s3.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        s3.setProfile("gravel");
+        s3.setInitialHeading(315.47069676557135);
+        s3.setHeadingPenalty(60.0);
+
+        request.setSegments(List.of(s1, s2, s3));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        // --- A U-turn instruction must be present (the boundary is a true U-turn) ---
+        int uturnIdx = -1;
+        for (int i = 0; i < result.instructions.size(); i++) {
+            int sign = result.instructions.get(i).getSign();
+            if (sign == Instruction.U_TURN_UNKNOWN
+                    || sign == Instruction.U_TURN_LEFT
+                    || sign == Instruction.U_TURN_RIGHT) {
+                uturnIdx = i;
+                break;
+            }
+        }
+        assertTrue(uturnIdx >= 0,
+                "Expected a U-turn instruction at the seg1/seg2 boundary. Instructions: "
+                + summarizeInstructions(result));
+
+        // --- No two non-FINISH instructions may share the same polyline interval start ---
+        // This is the symptom of the bug: pre-fix, six instructions stacked at the same
+        // polyline index. Post-fix, every instruction has a distinct, monotonically
+        // increasing interval start.
+        int polyIdx = 0;
+        int prevPolyIdx = -1;
+        for (int i = 0; i < result.instructions.size(); i++) {
+            Instruction instr = result.instructions.get(i);
+            if (instr.getSign() != Instruction.FINISH) {
+                assertTrue(polyIdx > prevPolyIdx,
+                        "Instruction [" + i + "] sign=" + signName(instr.getSign())
+                        + " shares polyline interval start " + polyIdx
+                        + " with the previous instruction. U-turn anchor regression? "
+                        + "Instructions: " + summarizeInstructions(result));
+                prevPolyIdx = polyIdx;
+            }
+            polyIdx += instr.getLength();
+        }
+
+        // --- The U-turn instruction must anchor at the seg1/seg2 boundary ---
+        // Seg1 is the first 10 edges of the route; its polyline ends at the snap point
+        // that is the U-turn location. Pre-fix the U-turn landed at polyline index ~65
+        // (deep into seg2); post-fix it sits at the boundary (~index 35).
+        int uturnPolyStart = 0;
+        for (int i = 0; i < uturnIdx; i++) {
+            uturnPolyStart += result.instructions.get(i).getLength();
+        }
+        assertTrue(uturnPolyStart <= 50,
+                "U-turn instruction polyStart=" + uturnPolyStart
+                + " is too far down the polyline; expected to anchor near the seg1/seg2 "
+                + "boundary (~35). Pre-fix would have given ~65. Instructions: "
+                + summarizeInstructions(result));
     }
 
     // ========== Test 7: Fork near end — track vs path ==========
@@ -872,7 +978,7 @@ public class InstructionValidationTest {
         assertValidInstructionList(result);
 
         InstructionPostProcessor postProcessor = new InstructionPostProcessor();
-        postProcessor.process(result.instructions);
+        postProcessor.process(result.instructions, request.getInstructionProfile());
 
         assertValidInstructionList(result);
 
@@ -1098,7 +1204,7 @@ public class InstructionValidationTest {
         assertValidInstructionList(result);
 
         InstructionPostProcessor postProcessor = new InstructionPostProcessor();
-        postProcessor.process(result.instructions);
+        postProcessor.process(result.instructions, request.getInstructionProfile());
 
         // Must have at least 2 turn instructions (the 3 turns may merge to 2 via then_turn,
         // but must NOT collapse to a single false join)
@@ -1168,7 +1274,7 @@ public class InstructionValidationTest {
         assertValidInstructionList(result);
 
         InstructionPostProcessor postProcessor = new InstructionPostProcessor();
-        postProcessor.process(result.instructions);
+        postProcessor.process(result.instructions, request.getInstructionProfile());
 
         // Should have a join instruction targeting MINOR_ROAD (the Mattilankatu join)
         boolean hasJoin = false;
@@ -1361,7 +1467,7 @@ public class InstructionValidationTest {
         assertValidInstructionList(result);
 
         InstructionPostProcessor postProcessor = new InstructionPostProcessor();
-        postProcessor.process(result.instructions);
+        postProcessor.process(result.instructions, request.getInstructionProfile());
 
         // After post-processing, there must be at least 2 real turn instructions.
         // The bug would collapse all 3 turns into 1 false join.
@@ -1493,7 +1599,7 @@ public class InstructionValidationTest {
 
         // Apply post-processing (trail_fork survives C1 suppression)
         InstructionPostProcessor postProcessor = new InstructionPostProcessor();
-        postProcessor.process(result.instructions);
+        postProcessor.process(result.instructions, request.getInstructionProfile());
 
         // Count trail_fork instructions
         int trailForkCount = 0;
@@ -1507,13 +1613,15 @@ public class InstructionValidationTest {
                 "Named cycleway route with Y-junctions must have at least 3 trail_fork instructions, "
                 + "got " + trailForkCount + ". Instructions: " + summarizeInstructions(result));
 
-        // All trail_fork instructions should be CONTINUE_ON_STREET (not turns)
+        // trail_fork is a junction-level marker — it can attach to any emitted instruction
+        // at a confusable trail/cycleway fork (CONTINUE, KEEP_*, TURN_*, etc.). The only
+        // hard invariant is that FINISH never carries it.
         for (Instruction instr : result.instructions) {
             Map<String, Object> extra = instr.getExtraInfoJSON();
-            if (Boolean.TRUE.equals(extra.get("trail_fork"))) {
-                assertEquals(Instruction.CONTINUE_ON_STREET, instr.getSign(),
-                        "trail_fork instruction should be CONTINUE_ON_STREET, got "
-                        + signName(instr.getSign()) + ". Instructions: " + summarizeInstructions(result));
+            if (instr.getSign() == Instruction.FINISH) {
+                assertNotEquals(Boolean.TRUE, extra.get("trail_fork"),
+                        "FINISH must never carry trail_fork. Instructions: "
+                        + summarizeInstructions(result));
             }
         }
 
@@ -1525,6 +1633,1188 @@ public class InstructionValidationTest {
                         + "Instructions: " + summarizeInstructions(result));
             }
         }
+    }
+
+    // ========== Test 18: E5 — cycleway right turn with footway running straight ==========
+
+    /**
+     * Bike on a CYCLEWAY makes a real right turn at a junction whose only graph
+     * alternative is an asphalt FOOTWAY going straight ahead. Both options look
+     * identical on the ground — only OSM tagging distinguishes them. Pre-fix the
+     * forced-path block returned IGNORE because the footway was access-blocked
+     * under the gravel weighting and therefore invisible to getAllowedTurns() /
+     * getVisibleTurns(). E5 detects the same-major-surface FOOTWAY alternative
+     * via the unfiltered allExplorer and emits the angle-based turn.
+     *
+     * Origin: testCyclewayRightTurnFootwayStraight_suppressedTurn in
+     * RouteInstructionGeneratorTest.
+     */
+    @Test
+    void cyclewayWithFootwayStraight_emitsAngleBasedRightTurn() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("aZ7vebZ1VLcMBvaH-b9As", 61.50377, 23.658394),
+                makeWaypoint("vDy0QlvS1zJk4NjrE43zu", 61.504136, 23.657891)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("aZ7vebZ1VLcMBvaH-b9As");
+        seg.setEnd("vDy0QlvS1zJk4NjrE43zu");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        // Locate the cycleway-with-footway-straight junction: a sharp right turn
+        // (turn_angle_deg <= -60) where both incoming and outgoing edges are CYCLEWAY.
+        Instruction e5Instr = null;
+        for (Instruction instr : result.instructions) {
+            Map<String, Object> extra = instr.getExtraInfoJSON();
+            Object angleObj = extra.get("turn_angle_deg");
+            if (!(angleObj instanceof Number)) continue;
+            double angle = ((Number) angleObj).doubleValue();
+            if (angle > -60.0) continue; // not sharp enough or wrong direction
+            if (!"CYCLEWAY".equals(extra.get("predicted_highway"))) continue;
+            if (!"CYCLEWAY".equals(extra.get("prev_predicted_highway"))) continue;
+            e5Instr = instr;
+            break;
+        }
+
+        assertNotNull(e5Instr,
+                "E5 should produce a sharp right turn (turn_angle_deg <= -60°) on "
+                + "CYCLEWAY at the cycleway/footway junction. "
+                + "Instructions: " + summarizeInstructions(result));
+
+        // Sign must be a real right turn — angle-based (TURN_RIGHT or TURN_SHARP_RIGHT),
+        // not KEEP_RIGHT (which would be wrong for a forced-path junction with only one
+        // bike-accessible alternative) and not CONTINUE_ON_STREET / IGNORE.
+        int sign = e5Instr.getSign();
+        assertTrue(sign == Instruction.TURN_RIGHT || sign == Instruction.TURN_SHARP_RIGHT,
+                "E5 instruction sign must be TURN_RIGHT or TURN_SHARP_RIGHT, got "
+                + signName(sign) + ". Instructions: " + summarizeInstructions(result));
+
+        // Apply post-processing: A3 (sharp turn) should assign tbt_priority=voice.
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+
+        // Re-locate after post-processing (object identity preserved by in-place ops).
+        Map<String, Object> extra = e5Instr.getExtraInfoJSON();
+        assertEquals("voice", extra.get("tbt_priority"),
+                "E5 sharp turn must be voice-tier after Pass 4 (A3 sharp turn rule). "
+                + "Instructions: " + summarizeInstructions(result));
+    }
+
+    // ========== Test 18b: E5 — cycleway T-junction with footway departing left ==========
+
+    /**
+     * Variant of Test 18 covering the relaxed E5 gate. Bike on a CYCLEWAY reaches a
+     * T-junction where the route turns right onto another CYCLEWAY (~73°) and a FOOTWAY
+     * departs left (~90°). Both edges are asphalt and unnamed; the only distinguishing
+     * feature on the ground is a regulatory sign 20m out. The footway here is OSM-tagged
+     * `bicycle=no` (vs. the visually-identical first T in this route which has no bike
+     * tag and thus IS bike-routable), so the forced-path branch fires for this junction.
+     *
+     * E5's original gates (`|altDelta| < π/4` AND `|altDelta| < |routeDelta|`) missed
+     * this case — the footway alt is past π/4 and is sharper than the route. The
+     * relaxed gate `|altDelta| ≤ |routeDelta| + π/6` catches it: 89.6° ≤ 73° + 30° = 103°.
+     *
+     * Origin: testCyclewayTJunctionFootwayLeft_suppressedTurn in
+     * RouteInstructionGeneratorTest.
+     */
+    @Test
+    void cyclewayTJunctionFootwayLeft_emitsAngleBasedRightTurn() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("rQb5GcsGGrvcNj4hhU9RP", 61.508318, 23.687523),
+                makeWaypoint("qvCCj4IkrwQxEp0dPr0os", 61.508691, 23.687772)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("rQb5GcsGGrvcNj4hhU9RP");
+        seg.setEnd("qvCCj4IkrwQxEp0dPr0os");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        // Pre-postprocess: assert the new TURN_RIGHT exists at the second T (Node 2002495)
+        // before M2 quick-sequence merging absorbs it. turn_angle_deg ≤ -60 (sharp right),
+        // CYCLEWAY → CYCLEWAY transition.
+        Instruction tjInstr = null;
+        for (Instruction instr : result.instructions) {
+            if (instr.getSign() != Instruction.TURN_RIGHT
+                    && instr.getSign() != Instruction.TURN_SHARP_RIGHT) continue;
+            Map<String, Object> extra = instr.getExtraInfoJSON();
+            Object angleObj = extra.get("turn_angle_deg");
+            if (!(angleObj instanceof Number)) continue;
+            if (((Number) angleObj).doubleValue() > -60.0) continue;
+            if (!"CYCLEWAY".equals(extra.get("predicted_highway"))) continue;
+            if (!"CYCLEWAY".equals(extra.get("prev_predicted_highway"))) continue;
+            tjInstr = instr;
+            break;
+        }
+        assertNotNull(tjInstr,
+                "Relaxed E5 must produce a sharp right TURN_RIGHT (turn_angle_deg ≤ -60°) "
+                + "on CYCLEWAY → CYCLEWAY at the second T-junction (Node 2002495). "
+                + "Instructions: " + summarizeInstructions(result));
+
+        // Post-processing: M2 quick-sequence collapses the LEFT (Node 2002496) and RIGHT
+        // (Node 2002495) — they're ~10m apart — into a single voice-tier TURN_LEFT with
+        // a then_turn pointing to the merged TURN_RIGHT. Both turns must be communicated
+        // to the rider via the compound instruction.
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+
+        Instruction compound = null;
+        for (Instruction instr : result.instructions) {
+            if (instr.getSign() != Instruction.TURN_LEFT
+                    && instr.getSign() != Instruction.TURN_SHARP_LEFT) continue;
+            if (!instr.getExtraInfoJSON().containsKey("then_turn")) continue;
+            compound = instr;
+            break;
+        }
+        assertNotNull(compound,
+                "After post-processing the LEFT+RIGHT close-pair must collapse to a "
+                + "TURN_LEFT carrying a then_turn pointing to the right turn. "
+                + "Instructions: " + summarizeInstructions(result));
+
+        Map<String, Object> compoundExtra = compound.getExtraInfoJSON();
+        assertEquals("voice", compoundExtra.get("tbt_priority"),
+                "Compound LEFT+then-RIGHT must be voice-tier. "
+                + "Instructions: " + summarizeInstructions(result));
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> thenTurn = (Map<String, Object>) compoundExtra.get("then_turn");
+        assertNotNull(thenTurn, "then_turn must be a populated object");
+        assertEquals(Instruction.TURN_RIGHT, ((Number) thenTurn.get("sign")).intValue(),
+                "then_turn.sign must be TURN_RIGHT (the second T's right turn). "
+                + "then_turn=" + thenTurn);
+        assertEquals("CYCLEWAY", thenTurn.get("road_class"),
+                "then_turn.road_class must be CYCLEWAY. then_turn=" + thenTurn);
+    }
+
+    // ========== Test 19: Cycleway/service-road indistinguishable + service→residential transition ==========
+
+    /**
+     * Single route exercising two suppression bugs that were fixed together:
+     *
+     * 1) **S1/S2 (visual-distinctness)**: at a same-named SERVICE_ROAD turn (−47.7°) where the
+     *    only alternative is a CYCLEWAY whose surface is ASPHALT_OR_UNPAVED (ambiguous, in
+     *    reality unpaved), S1/S2 used to suppress the turn because they treated the alt as
+     *    "visually distinct" (different PH/RC, surface differs on isAsphalt). Both now use
+     *    `allAlternativesVisuallyDistinct` which requires a different PH bucket (per
+     *    isConfusableFrom) AND a clearly different surface (ASPHALT_OR_UNPAVED is ambiguous).
+     *
+     * 2) **S3 (prevPH-aware)**: at a SERVICE_ROAD → MINOR_ROAD transition (+15.8°), S3 used
+     *    to suppress because all alts are lower prominence than current MINOR_ROAD. Fixed
+     *    to require `prevPH ≥ currentPH` so the rider joining a more prominent way still
+     *    gets a turn.
+     *
+     * Origin: testCyclewayServiceRoadIndistinguishable_61_530_23_702 in RouteInstructionGeneratorTest
+     */
+    @Test
+    void cyclewayServiceRoadIndistinguishable_emitsTurnsAtBothJunctions() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("wp1", 61.530601, 23.702663),
+                makeWaypoint("wp2", 61.528947, 23.697955)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("wp1");
+        seg.setEnd("wp2");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        // Assertion 1: S1/S2 fix — same-PH SERVICE_ROAD turn (~−47°) must be emitted when
+        // the only alt is a CYCLEWAY with ASPHALT_OR_UNPAVED (ambiguous) surface.
+        boolean hasServiceRoadTurn = hasInstructionWithProperties(result,
+                sign -> Math.abs(sign) == Instruction.TURN_RIGHT || Math.abs(sign) == Instruction.TURN_LEFT,
+                extra -> "SERVICE_ROAD".equals(extra.get("predicted_highway"))
+                        && "SERVICE_ROAD".equals(extra.get("prev_predicted_highway"))
+                        && extra.containsKey("turn_angle_deg")
+                        && Math.abs(((Number) extra.get("turn_angle_deg")).doubleValue()) > 30.0);
+        assertTrue(hasServiceRoadTurn,
+                "S1/S2 fix: expected a TURN_LEFT/TURN_RIGHT on a same-PH SERVICE_ROAD continuation "
+                + "(cycleway alt with ASPHALT_OR_UNPAVED surface must be treated as visually "
+                + "ambiguous, preventing suppression). Instructions: " + summarizeInstructions(result));
+
+        // Assertion 2: S3 fix — slight turn at SERVICE_ROAD → MINOR_ROAD transition must be emitted.
+        // prevPH=SERVICE_ROAD < currentPH=MINOR_ROAD → S3 must NOT suppress.
+        boolean hasJoinResidentialTurn = hasInstructionWithProperties(result,
+                sign -> Math.abs(sign) == Instruction.TURN_SLIGHT_LEFT
+                        || Math.abs(sign) == Instruction.TURN_SLIGHT_RIGHT
+                        || Math.abs(sign) == Instruction.TURN_LEFT
+                        || Math.abs(sign) == Instruction.TURN_RIGHT,
+                extra -> "MINOR_ROAD".equals(extra.get("predicted_highway"))
+                        && "SERVICE_ROAD".equals(extra.get("prev_predicted_highway")));
+        assertTrue(hasJoinResidentialTurn,
+                "S3 fix: expected a turn instruction at SERVICE_ROAD→MINOR_ROAD transition "
+                + "(rider joining a more prominent way; prevPH=6 < currentPH=8 must prevent S3 "
+                + "from suppressing). Instructions: " + summarizeInstructions(result));
+    }
+
+    /**
+     * Validates the E6 forced-path anti-suppression rule for road → non-road transitions.
+     *
+     * Junction node 1997741 (61.500301, 23.655447) is a 2-degree graph node where
+     * Raholankatu (MINOR_ROAD/asphalt) terminates and an unnamed CYCLEWAY/fine_gravel
+     * picks up. With no graph alternatives the legacy forced-path branch returned IGNORE,
+     * but the rider faces a road end (vehicle turnaround visual cue) and needs to know
+     * the cycleway ahead is the continuation. E6 emits the angle-based sign
+     * (CONTINUE_ON_STREET here, since Δ ≈ +0.8°) when prevPH is road infrastructure and
+     * currentPH is in {CYCLEWAY, FOOTWAY, PATH}.
+     *
+     * E6 is one-directional. The reverse (CYCLEWAY → MINOR_ROAD) is intentionally not
+     * covered: emerging onto a road typically has clear visual cues, so the original
+     * forced-path suppression remains correct in that direction.
+     *
+     * Origin: testRoadEndCyclewayTransition_61_500_23_655 in RouteInstructionGeneratorTest
+     */
+    @Test
+    void roadEndCyclewayTransition_e6EmitsForwardOnly() {
+        // ---- FORWARD: MINOR_ROAD → CYCLEWAY (E6 must fire) ----
+        TrailmapInstructionRequest fwdReq = new TrailmapInstructionRequest();
+        fwdReq.setWaypoints(List.of(
+                makeWaypoint("hvH1f2dBl3s_0xB2EHrXx", 61.500518, 23.655585),
+                makeWaypoint("l-hO7UTD9iVIbMFSbNObO", 61.500109, 23.655586)));
+
+        TrailmapInstructionRequest.Segment fwdSeg = new TrailmapInstructionRequest.Segment();
+        fwdSeg.setStart("hvH1f2dBl3s_0xB2EHrXx");
+        fwdSeg.setEnd("l-hO7UTD9iVIbMFSbNObO");
+        fwdSeg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        fwdSeg.setProfile("gravel");
+
+        fwdReq.setSegments(List.of(fwdSeg));
+        fwdReq.setInstructionProfile("gravel");
+        fwdReq.setLocale("fi");
+        fwdReq.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result fwdResult = generator.generate(fwdReq);
+        assertValidInstructionList(fwdResult);
+
+        boolean fwdHasE6 = hasInstructionWithProperties(fwdResult,
+                sign -> sign == Instruction.CONTINUE_ON_STREET,
+                extra -> "MINOR_ROAD".equals(extra.get("prev_predicted_highway"))
+                        && "CYCLEWAY".equals(extra.get("predicted_highway")));
+        assertTrue(fwdHasE6,
+                "E6 forward: expected a CONTINUE_ON_STREET at MINOR_ROAD→CYCLEWAY transition "
+                + "(road ends, cycleway picks up — forced-path branch must NOT suppress). "
+                + "Instructions: " + summarizeInstructions(fwdResult));
+
+        // ---- REVERSE: CYCLEWAY → MINOR_ROAD (E6 must NOT fire — original suppression intact) ----
+        TrailmapInstructionRequest revReq = new TrailmapInstructionRequest();
+        revReq.setWaypoints(List.of(
+                makeWaypoint("rev_start", 61.500109, 23.655586),
+                makeWaypoint("rev_end",   61.500518, 23.655585)));
+
+        TrailmapInstructionRequest.Segment revSeg = new TrailmapInstructionRequest.Segment();
+        revSeg.setStart("rev_start");
+        revSeg.setEnd("rev_end");
+        revSeg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        revSeg.setProfile("gravel");
+
+        revReq.setSegments(List.of(revSeg));
+        revReq.setInstructionProfile("gravel");
+        revReq.setLocale("fi");
+        revReq.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result revResult = generator.generate(revReq);
+        assertValidInstructionList(revResult);
+
+        boolean revHasReverseTransitionInstr = hasInstructionWithProperties(revResult,
+                sign -> sign != Instruction.FINISH,
+                extra -> "CYCLEWAY".equals(extra.get("prev_predicted_highway"))
+                        && "MINOR_ROAD".equals(extra.get("predicted_highway")));
+        assertFalse(revHasReverseTransitionInstr,
+                "E6 must be one-directional: CYCLEWAY→MINOR_ROAD transition must remain "
+                + "suppressed (no instruction with prev=CYCLEWAY, curr=MINOR_ROAD). "
+                + "Instructions: " + summarizeInstructions(revResult));
+    }
+
+    // ========== Test 20: M3 — profile-aware consecutive-fork merge thresholds ==========
+
+    /**
+     * Foot route, two same-direction KEEP_LEFT forks ~140m apart on a PATH (TbT
+     * generator output: KEEP_LEFT@123.8m → KEEP_LEFT@16.1m). The foot M3 horizon is
+     * 60m, so the leading 123.8m segment puts the chain over budget — must NOT merge.
+     *
+     * Origin: testM3StayLeftThresholds_footAndGravel in RouteInstructionGeneratorTest.
+     */
+    @Test
+    void m3_footProfile_keepsBeyondThreshold_doNotMerge() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("MdwMF-B90KYbDQq6Ul_Gf", 61.427946, 23.890105),
+                makeWaypoint("zmENlCkWzEeXzzMR1JHmB", 61.426671, 23.890025)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("MdwMF-B90KYbDQq6Ul_Gf");
+        seg.setEnd("zmENlCkWzEeXzzMR1JHmB");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("trailmap_foot");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("trailmap_foot");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+
+        int keepLeftCount = 0;
+        boolean anySequenceTag = false;
+        for (Instruction instr : result.instructions) {
+            if (instr.getSign() == Instruction.KEEP_LEFT) keepLeftCount++;
+            if (instr.getExtraInfoJSON().containsKey("sequence_tag")) anySequenceTag = true;
+        }
+        assertTrue(keepLeftCount >= 2,
+                "Expected at least 2 separate KEEP_LEFT instructions on the foot route "
+                + "(leading segment 123.8m exceeds 60m foot horizon → no merge). "
+                + "Instructions: " + summarizeInstructions(result));
+        assertFalse(anySequenceTag,
+                "M3 must NOT have produced a sequence_tag on this foot route. "
+                + "Instructions: " + summarizeInstructions(result));
+    }
+
+    /**
+     * Same waypoints as the foot test, but with profile=gravel — the M3 horizon for
+     * non-foot is 100m. The leading segment is 123.8m > 100m, so the chain is still
+     * over budget and must NOT merge.
+     */
+    @Test
+    void m3_gravelProfile_keepsBeyondThreshold_doNotMerge() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("wp1", 61.427946, 23.890105),
+                makeWaypoint("wp2", 61.426671, 23.890025)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("wp1");
+        seg.setEnd("wp2");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+
+        int keepLeftCount = 0;
+        boolean anySequenceTag = false;
+        for (Instruction instr : result.instructions) {
+            if (instr.getSign() == Instruction.KEEP_LEFT) keepLeftCount++;
+            if (instr.getExtraInfoJSON().containsKey("sequence_tag")) anySequenceTag = true;
+        }
+        assertTrue(keepLeftCount >= 2,
+                "Expected at least 2 separate KEEP_LEFT instructions on the gravel route "
+                + "(leading segment 123.8m exceeds 100m non-foot horizon → no merge). "
+                + "Instructions: " + summarizeInstructions(result));
+        assertFalse(anySequenceTag,
+                "M3 must NOT have produced a sequence_tag on this gravel route. "
+                + "Instructions: " + summarizeInstructions(result));
+    }
+
+    /**
+     * Synthetic InstructionList: two KEEP_LEFTs at 30m + 10m on PATH. With foot
+     * profile (60m horizon) the chain is within budget and must merge into a single
+     * instruction with sequence_tag="stay_left_2".
+     */
+    @Test
+    void m3_footProfile_keepsWithinThreshold_merge() {
+        InstructionList list = buildSyntheticTwoKeepList(Instruction.KEEP_LEFT, 30.0, 10.0, "PATH");
+        new InstructionPostProcessor().process(list, "trailmap_foot");
+
+        // Expect: merged KEEP_LEFT (40m) + FINISH = 2 instructions
+        assertEquals(2, list.size(),
+                "Foot M3 must merge KEEP_LEFT@30m + KEEP_LEFT@10m (within 60m horizon). "
+                + "Got: " + summarizeList(list));
+
+        Instruction merged = list.get(0);
+        assertEquals(Instruction.KEEP_LEFT, merged.getSign(),
+                "Merged instruction must be KEEP_LEFT. " + summarizeList(list));
+        assertEquals("stay_left_2", merged.getExtraInfoJSON().get("sequence_tag"),
+                "Merged instruction must carry sequence_tag=stay_left_2. " + summarizeList(list));
+        assertEquals(40.0, merged.getDistance(), 0.01,
+                "Merged distance must be 30+10=40m. " + summarizeList(list));
+    }
+
+    /**
+     * Synthetic InstructionList: two KEEP_LEFTs at 70m + 10m on PATH. With gravel
+     * profile (100m horizon) the chain is within budget and must merge. Note: this
+     * setup is OUTSIDE the foot horizon (60m), so the same instructions with foot
+     * profile would NOT merge — that asymmetry is the point of profile-awareness.
+     */
+    @Test
+    void m3_gravelProfile_keepsWithinThreshold_merge() {
+        InstructionList list = buildSyntheticTwoKeepList(Instruction.KEEP_LEFT, 70.0, 10.0, "PATH");
+        new InstructionPostProcessor().process(list, "gravel");
+
+        assertEquals(2, list.size(),
+                "Gravel M3 must merge KEEP_LEFT@70m + KEEP_LEFT@10m (within 100m horizon). "
+                + "Got: " + summarizeList(list));
+
+        Instruction merged = list.get(0);
+        assertEquals(Instruction.KEEP_LEFT, merged.getSign(),
+                "Merged instruction must be KEEP_LEFT. " + summarizeList(list));
+        assertEquals("stay_left_2", merged.getExtraInfoJSON().get("sequence_tag"),
+                "Merged instruction must carry sequence_tag=stay_left_2. " + summarizeList(list));
+        assertEquals(80.0, merged.getDistance(), 0.01,
+                "Merged distance must be 70+10=80m. " + summarizeList(list));
+
+        // Cross-check: same input under foot profile must NOT merge (70 > 60).
+        InstructionList footList = buildSyntheticTwoKeepList(Instruction.KEEP_LEFT, 70.0, 10.0, "PATH");
+        new InstructionPostProcessor().process(footList, "trailmap_foot");
+        assertEquals(3, footList.size(),
+                "Foot M3 must NOT merge KEEP_LEFT@70m (70m > 60m foot horizon). "
+                + "Got: " + summarizeList(footList));
+        assertFalse(footList.get(0).getExtraInfoJSON().containsKey("sequence_tag"),
+                "Foot M3: no sequence_tag expected when over horizon. " + summarizeList(footList));
+    }
+
+    /**
+     * Build a synthetic 3-instruction list: KEEP / KEEP / FINISH, all with
+     * predicted_highway set so M3's isTrailPH gate passes. Geometry is a degenerate
+     * 2-point polyline at (0,0)–(0,0) on each instruction — M3 only reads sign,
+     * distance, and predicted_highway, so geometry shape doesn't matter here.
+     */
+    private InstructionList buildSyntheticTwoKeepList(int keepSign, double dist1, double dist2, String predictedHighway) {
+        Translation tr = hopper.getTranslationMap().getWithFallBack(java.util.Locale.forLanguageTag("fi"));
+        InstructionList list = new InstructionList(tr);
+
+        PointList pl1 = new PointList(2, false);
+        pl1.add(0.0, 0.0);
+        pl1.add(0.0, 0.0);
+        Instruction k1 = new Instruction(keepSign, "", pl1);
+        k1.setDistance(dist1);
+        k1.setExtraInfo("predicted_highway", predictedHighway);
+        list.add(k1);
+
+        PointList pl2 = new PointList(2, false);
+        pl2.add(0.0, 0.0);
+        pl2.add(0.0, 0.0);
+        Instruction k2 = new Instruction(keepSign, "", pl2);
+        k2.setDistance(dist2);
+        k2.setExtraInfo("predicted_highway", predictedHighway);
+        list.add(k2);
+
+        PointList plF = new PointList(1, false);
+        plF.add(0.0, 0.0);
+        Instruction finish = new Instruction(Instruction.FINISH, "", plF);
+        finish.setDistance(0);
+        list.add(finish);
+
+        return list;
+    }
+
+    /** Compact dump of a synthetic InstructionList for assertion failure messages. */
+    private String summarizeList(InstructionList list) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < list.size(); i++) {
+            Instruction instr = list.get(i);
+            if (i > 0) sb.append(", ");
+            sb.append(String.format("%s@%.0fm%s", signName(instr.getSign()), instr.getDistance(),
+                    instr.getExtraInfoJSON().containsKey("sequence_tag")
+                            ? "(" + instr.getExtraInfoJSON().get("sequence_tag") + ")"
+                            : ""));
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    /**
+     * Validates the M4 short-zigzag collapse pass.
+     *
+     * Route 61.511523,23.687208 → 61.511789,23.687448 traverses an unnamed
+     * cycleway (CYCLEWAY/asphalt_or_unpaved) with a 3.5m connector edge between
+     * two opposite-direction ~46° turns. M2 first merges them into a "loivasti
+     * oikealle, sitten heti vasen" compound; M4 then detects the short connector
+     * (≤5m), opposite signs, near-zero net angle (-45.8 + 46.8 = +1°) on
+     * non-road PH, and collapses to CONTINUE_ON_STREET + trail_fork=true.
+     *
+     * Asserts:
+     *   1) No turn instruction (sign in {±1, ±2, ±3}) survives at this geometry —
+     *      M4 must have collapsed the M2 result.
+     *   2) A CONTINUE_ON_STREET with trail_fork=true exists (the M4 output).
+     *   3) The collapsed instruction has no then_turn (cleaned up).
+     *
+     * Origin: testShortZigzagAsStraight_61_511_23_687 in RouteInstructionGeneratorTest
+     */
+    @Test
+    void shortZigzagOnCycleway_m4CollapsesToStraight() {
+        TrailmapInstructionRequest req = new TrailmapInstructionRequest();
+        req.setWaypoints(List.of(
+                makeWaypoint("rhjZmjPbTweIoZcvbUs-t", 61.511523, 23.687208),
+                makeWaypoint("uOftI2IKTnT33Hpld0m_D", 61.511789, 23.687448)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("rhjZmjPbTweIoZcvbUs-t");
+        seg.setEnd("uOftI2IKTnT33Hpld0m_D");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        req.setSegments(List.of(seg));
+        req.setInstructionProfile("gravel");
+        req.setLocale("fi");
+        req.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(req);
+        assertValidInstructionList(result);
+
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, req.getInstructionProfile());
+
+        // 1) No surviving turn instruction (M4 must have collapsed the M2 merge).
+        boolean hasAnyTurn = false;
+        for (Instruction instr : result.instructions) {
+            int absSign = Math.abs(instr.getSign());
+            if (absSign >= 1 && absSign <= 3) { hasAnyTurn = true; break; }
+        }
+        assertFalse(hasAnyTurn,
+                "M4 collapse: zigzag must not produce a TURN instruction; expected only "
+                + "CONTINUE_ON_STREET (one with trail_fork=true) + FINISH. "
+                + "Instructions: " + summarizeInstructions(result));
+
+        // 2) The collapsed instruction is present: CONTINUE_ON_STREET on CYCLEWAY with trail_fork.
+        boolean hasCollapsed = hasInstructionWithProperties(result,
+                sign -> sign == Instruction.CONTINUE_ON_STREET,
+                extra -> Boolean.TRUE.equals(extra.get("trail_fork"))
+                        && "CYCLEWAY".equals(extra.get("predicted_highway")));
+        assertTrue(hasCollapsed,
+                "M4 collapse: expected a CONTINUE_ON_STREET on CYCLEWAY with trail_fork=true. "
+                + "Instructions: " + summarizeInstructions(result));
+
+        // 3) The collapsed instruction must have no then_turn (cleaned up by M4).
+        for (Instruction instr : result.instructions) {
+            if (instr.getSign() == Instruction.CONTINUE_ON_STREET
+                    && Boolean.TRUE.equals(instr.getExtraInfoJSON().get("trail_fork"))) {
+                assertFalse(instr.getExtraInfoJSON().containsKey("then_turn"),
+                        "M4 collapse: collapsed instruction must not retain then_turn. "
+                        + "Instructions: " + summarizeInstructions(result));
+            }
+        }
+    }
+
+    /**
+     * Validates the M2 closer-pair preference (look-ahead before merging).
+     *
+     * Route 61.508160,23.687510 → 61.508697,23.687776 produces three turns on a
+     * cycleway: TURN_RIGHT, TURN_LEFT, TURN_RIGHT with connectors 29.4m and 10m.
+     * The rider perceives turns 2+3 as the back-to-back pair (10m connector),
+     * not turns 1+2 (29.4m connector).
+     *
+     * Without the look-ahead, M2 greedy-from-top merged (1, 2) and left turn 3
+     * standalone. With the closer-pair preference, M2 skips (1, 2) because
+     * (2, 3) qualifies for M2 with a strictly shorter connector — letting the
+     * next iteration merge (2, 3) instead.
+     *
+     * Asserts:
+     *   1) Exactly one instruction carries `then_turn` (the M2 merge).
+     *   2) The merged instruction is the LEFT turn (the second turn of the
+     *      original three), not the first RIGHT turn.
+     *   3) The standalone (un-merged) turn is the first RIGHT turn.
+     *
+     * Origin: testThreeTurnGreedyMergeOrdering_61_508_23_687 in RouteInstructionGeneratorTest
+     */
+    @Test
+    void threeTurnSequence_m2PrefersCloserPair() {
+        TrailmapInstructionRequest req = new TrailmapInstructionRequest();
+        req.setWaypoints(List.of(
+                makeWaypoint("MWWB_hZK5KMowJtj-8ukR", 61.508160, 23.687510),
+                makeWaypoint("Ks6yCK3T3mqTw6AN83mwh", 61.508697, 23.687776)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("MWWB_hZK5KMowJtj-8ukR");
+        seg.setEnd("Ks6yCK3T3mqTw6AN83mwh");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        req.setSegments(List.of(seg));
+        req.setInstructionProfile("gravel");
+        req.setLocale("fi");
+        req.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(req);
+        assertValidInstructionList(result);
+
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, req.getInstructionProfile());
+
+        // 1) Exactly one merged instruction carries then_turn.
+        int thenTurnCount = 0;
+        for (Instruction instr : result.instructions) {
+            if (instr.getExtraInfoJSON().containsKey("then_turn")) thenTurnCount++;
+        }
+        assertEquals(1, thenTurnCount,
+                "Closer-pair preference: expected exactly one M2 merge (the closer pair). "
+                + "Instructions: " + summarizeInstructions(result));
+
+        // 2) The merged instruction is a LEFT turn whose then_turn points to a RIGHT — i.e.,
+        // the (turn 2 = LEFT, turn 3 = RIGHT) pair, NOT (turn 1 = RIGHT, turn 2 = LEFT).
+        boolean correctPair = hasInstructionWithProperties(result,
+                sign -> sign == Instruction.TURN_LEFT,
+                extra -> {
+                    Object thenTurnObj = extra.get("then_turn");
+                    if (!(thenTurnObj instanceof Map)) return false;
+                    Map<?, ?> tt = (Map<?, ?>) thenTurnObj;
+                    Object signObj = tt.get("sign");
+                    return signObj instanceof Number
+                            && ((Number) signObj).intValue() == Instruction.TURN_RIGHT;
+                });
+        assertTrue(correctPair,
+                "Closer-pair preference: M2 merge must be (TURN_LEFT, TURN_RIGHT) — the close "
+                + "pair (turns 2+3, 10m connector), not (TURN_RIGHT, TURN_LEFT) — the far pair "
+                + "(turns 1+2, 29.4m connector). Instructions: " + summarizeInstructions(result));
+
+        // 3) A standalone TURN_RIGHT instruction (the first turn) exists with no then_turn.
+        boolean standaloneFirstTurn = hasInstructionWithProperties(result,
+                sign -> sign == Instruction.TURN_RIGHT,
+                extra -> !extra.containsKey("then_turn"));
+        assertTrue(standaloneFirstTurn,
+                "Closer-pair preference: the first TURN_RIGHT must remain standalone "
+                + "(no then_turn). Instructions: " + summarizeInstructions(result));
+    }
+
+    // ========== Test 22: M1 must not cascade onto an already-merged M1 result ==========
+
+    /**
+     * Pre-fix: after M1 merged the road→service→cycleway sidepath crossing, the
+     * pass-1 {@code i--} re-check evaluated the merged instruction (still carrying
+     * the first turn's {@code turn_angle_deg}) against the next real navigation
+     * turn. The geometry gate read stale angle data and fired a second M1 — and
+     * then M2 absorbed the fourth turn into {@code then_turn}, collapsing four real
+     * turns into a single misleading "join right, then right in 23 m" prompt that
+     * silently dropped two left turns.
+     *
+     * Post-fix: {@code isJoinSidePathPattern} rejects when {@code first} already
+     * carries {@code join_direction} (symmetric to the existing {@code second}
+     * check). The cascade is blocked. The closer-pair preference in M2 then
+     * compounds the genuine LEFT+RIGHT pair (10m apart) and leaves the M1 join
+     * standalone — exactly what the rider needs.
+     *
+     * Origin: testOpenCase_61_524176_23_626523_to_61_524667_23_62469 in
+     * RouteInstructionGeneratorTest.
+     */
+    @Test
+    void m1_mustNotCascadeOntoExistingM1Result() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("3Tdlvr6-Gh7Ydrtdmunv7", 61.524176, 23.626523),
+                makeWaypoint("cGy_eDRCy7N1vrpP_mEDZ", 61.524667, 23.62469)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("3Tdlvr6-Gh7Ydrtdmunv7");
+        seg.setEnd("cGy_eDRCy7N1vrpP_mEDZ");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+
+        // 1) Locate the M1 join_right instruction (MINOR_ROAD → CYCLEWAY).
+        Instruction m1Instr = null;
+        for (Instruction instr : result.instructions) {
+            Map<String, Object> extra = instr.getExtraInfoJSON();
+            if (!"right".equals(extra.get("join_direction"))) continue;
+            if (!"CYCLEWAY".equals(extra.get("join_target_type"))) continue;
+            if (!"MINOR_ROAD".equals(extra.get("prev_predicted_highway"))) continue;
+            m1Instr = instr;
+            break;
+        }
+        assertNotNull(m1Instr,
+                "Expected an M1 join_right instruction (MINOR_ROAD → CYCLEWAY). "
+                + "Instructions: " + summarizeInstructions(result));
+
+        // 2) The M1 instruction must NOT carry then_turn — that would mean a second
+        //    real turn got absorbed into the join (the cascade-then-M2 failure mode).
+        assertFalse(m1Instr.getExtraInfoJSON().containsKey("then_turn"),
+                "M1 join instruction must remain standalone (no then_turn). The "
+                + "cascade fix prevents M1 from absorbing the next real navigation "
+                + "turn. Instructions: " + summarizeInstructions(result));
+
+        // 3) A real TURN_LEFT (turn_angle_deg ≥ 60°) on CYCLEWAY → CYCLEWAY exists,
+        //    distinct from the M1 join, capturing the cycleway-fork left turn.
+        Instruction realLeft = null;
+        for (Instruction instr : result.instructions) {
+            if (instr == m1Instr) continue;
+            if (instr.getSign() != Instruction.TURN_LEFT
+                    && instr.getSign() != Instruction.TURN_SHARP_LEFT) continue;
+            Map<String, Object> extra = instr.getExtraInfoJSON();
+            Object angleObj = extra.get("turn_angle_deg");
+            if (!(angleObj instanceof Number)) continue;
+            if (((Number) angleObj).doubleValue() < 60.0) continue;
+            if (!"CYCLEWAY".equals(extra.get("predicted_highway"))) continue;
+            if (!"CYCLEWAY".equals(extra.get("prev_predicted_highway"))) continue;
+            realLeft = instr;
+            break;
+        }
+        assertNotNull(realLeft,
+                "The cycleway-fork TURN_LEFT (turn_angle_deg ≥ 60°, CYCLEWAY → "
+                + "CYCLEWAY) must survive as its own instruction — pre-fix it was "
+                + "absorbed by the cascading M1. Instructions: " + summarizeInstructions(result));
+
+        // 4) The real left carries then_turn pointing to the final right (M2 closer-pair).
+        @SuppressWarnings("unchecked")
+        Map<String, Object> thenTurn = (Map<String, Object>) realLeft.getExtraInfoJSON().get("then_turn");
+        assertNotNull(thenTurn,
+                "The cycleway-fork TURN_LEFT must carry a then_turn pointing to the "
+                + "final right turn (M2 closer-pair preference). "
+                + "Instructions: " + summarizeInstructions(result));
+        assertEquals(Instruction.TURN_RIGHT, ((Number) thenTurn.get("sign")).intValue(),
+                "then_turn.sign must be TURN_RIGHT. then_turn=" + thenTurn);
+        assertEquals("CYCLEWAY", thenTurn.get("road_class"),
+                "then_turn.road_class must be CYCLEWAY. then_turn=" + thenTurn);
+    }
+
+    // ========== S6: Forced trail bend — suppress spurious "loiva oikea" on cycleway-only junctions ==========
+
+    /**
+     * Cycleway makes a 40° geometric right curve. The single non-route alt at the
+     * junction is at +135° (effectively a back-leg) — not a viable forward continuation.
+     * Pre-S6: leaving-current-street fallback fired on |Δ|>0.6 and emitted a spurious
+     * TURN_SLIGHT_RIGHT. Post-S6: the rider has no real navigation choice (only one
+     * forward option is the route itself) so no turn instruction is emitted.
+     *
+     * Origin: testLoivaOikeaCaseA_61_516_23_689 in RouteInstructionGeneratorTest.
+     */
+    @Test
+    void forcedTrailBend_geometricCurveOnly_noSpuriousTurn() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("YYC2p9mV_vF_7vF9wHiOJ", 61.516442, 23.68955),
+                makeWaypoint("HexkPdmGBeNOnBKWx4Ztx", 61.516993, 23.690446)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("YYC2p9mV_vF_7vF9wHiOJ");
+        seg.setEnd("HexkPdmGBeNOnBKWx4Ztx");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        for (Instruction instr : result.instructions) {
+            int sign = instr.getSign();
+            assertTrue(sign == Instruction.CONTINUE_ON_STREET || sign == Instruction.FINISH,
+                    "S6 forced-trail-bend (Case A): on a cycleway-only short route with no "
+                    + "viable forward alternative, no turn instruction may be emitted. Got "
+                    + signName(sign) + ". Instructions: " + summarizeInstructions(result));
+        }
+    }
+
+    /**
+     * Cycleway with informal name "Niemenrantaraitti". The non-route alt at the junction
+     * is the back-leg (also "Niemenrantaraitti", at +145°). Pre-S6: leaving-current-street
+     * fired via the name-match clause in GH's isLeavingCurrentStreet (the same name
+     * appears on an alt) and emitted TURN_SLIGHT_RIGHT. Post-S6: same-name reasoning is
+     * neutralised on non-road-infrastructure (S6 fires before leaving-current-street),
+     * the back-leg alt is not a viable forward → no turn instruction.
+     *
+     * Origin: testLoivaOikeaCaseB_61_519_23_697 in RouteInstructionGeneratorTest.
+     */
+    @Test
+    void forcedTrailBend_sameNameBackLeg_noSpuriousTurn() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("SIW9bPSooVQD68SLKIkKa", 61.519257, 23.697865),
+                makeWaypoint("HG6cnTmWgzlm-kuCYIUGq", 61.519525, 23.699756)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("SIW9bPSooVQD68SLKIkKa");
+        seg.setEnd("HG6cnTmWgzlm-kuCYIUGq");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        for (Instruction instr : result.instructions) {
+            int sign = instr.getSign();
+            assertTrue(sign == Instruction.CONTINUE_ON_STREET || sign == Instruction.FINISH,
+                    "S6 forced-trail-bend (Case B): on a named cycleway with a same-named "
+                    + "back-leg alt and no viable forward alternative, no turn instruction "
+                    + "may be emitted. Got " + signName(sign) + ". Instructions: "
+                    + summarizeInstructions(result));
+        }
+    }
+
+    // ========== Test 23: M1 continuation guard — real T-end where source way ends ==========
+
+    /**
+     * The route's source way (a service road) literally dead-ends at a tertiary road
+     * (Taivalkunnantie). Both alternatives at the T are the OTHER halves of
+     * Taivalkunnantie — no alternative continues the source way's direction. The
+     * rider must turn left at the T, then turn right onto a track. M1's "join via
+     * sidepath" semantics don't apply (source way doesn't continue past the first
+     * turn); these are two independent navigation events.
+     * <p>
+     * Pre-fix: M1 fired because source PH (SERVICE_ROAD) ≠ dest PH (GOOD_TRACK) and
+     * geometry passed (~80°/80° opposite turns, ~17° net). Geometry-only override
+     * for the T-junction guard incorrectly classified this as a sidepath crossing.
+     * <p>
+     * Post-fix: Stage 1's new {@code junction_has_straight_alt} field is false at
+     * the first turn junction (only alt is at -115.5°, not within ±30° of straight).
+     * M1's new continuation guard rejects the merge. Rider gets two separate turn
+     * instructions matching their actual experience.
+     * <p>
+     * Origin: testOpenCase_61_459038_23_451706_to_61_458822_23_452307 in
+     * RouteInstructionGeneratorTest.
+     */
+    @Test
+    void m1_realTJunctionRoadEnd_doesNotFire() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("WoqoZzlXA4lG2Bab89Lda", 61.459038, 23.451706),
+                makeWaypoint("pf-fnELpqBDCZPl1al26U", 61.458822, 23.452307)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("WoqoZzlXA4lG2Bab89Lda");
+        seg.setEnd("pf-fnELpqBDCZPl1al26U");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+
+        // 1) No instruction may carry join_direction — M1 must not have fired.
+        for (Instruction instr : result.instructions) {
+            assertFalse(instr.getExtraInfoJSON().containsKey("join_direction"),
+                    "M1 must NOT fire at a real T-end (source way dead-ends, no alt "
+                    + "within ±30° of straight). Found join_direction on instruction. "
+                    + "Instructions: " + summarizeInstructions(result));
+        }
+
+        // 2) The TURN_LEFT off the service road onto Taivalkunnantie must exist as
+        //    its own instruction (turn_angle_deg ≥ 60°, prev=SERVICE_ROAD,
+        //    curr=MINOR_ROAD).
+        Instruction tjLeft = null;
+        for (Instruction instr : result.instructions) {
+            if (instr.getSign() != Instruction.TURN_LEFT
+                    && instr.getSign() != Instruction.TURN_SHARP_LEFT) continue;
+            Map<String, Object> extra = instr.getExtraInfoJSON();
+            Object angleObj = extra.get("turn_angle_deg");
+            if (!(angleObj instanceof Number)) continue;
+            if (((Number) angleObj).doubleValue() < 60.0) continue;
+            if (!"SERVICE_ROAD".equals(extra.get("prev_predicted_highway"))) continue;
+            if (!"MINOR_ROAD".equals(extra.get("predicted_highway"))) continue;
+            tjLeft = instr;
+            break;
+        }
+        assertNotNull(tjLeft,
+                "Expected a standalone TURN_LEFT (≥60°) at the service-road T-end, "
+                + "transitioning SERVICE_ROAD → MINOR_ROAD (Taivalkunnantie). "
+                + "Instructions: " + summarizeInstructions(result));
+
+        // 3) The subsequent TURN_RIGHT onto the track is communicated to the rider —
+        //    either as its own instruction or via M2's then_turn compound. Both are
+        //    correct outcomes (the rider hears "left, then right" compound). What
+        //    matters is the right turn isn't *silently dropped*.
+        boolean rightTurnPresent = false;
+        for (Instruction instr : result.instructions) {
+            // (a) standalone TURN_RIGHT onto the track
+            if ((instr.getSign() == Instruction.TURN_RIGHT
+                    || instr.getSign() == Instruction.TURN_SHARP_RIGHT)
+                    && "GOOD_TRACK".equals(instr.getExtraInfoJSON().get("predicted_highway"))) {
+                rightTurnPresent = true;
+                break;
+            }
+            // (b) M2 compound: then_turn pointing to a right-direction turn
+            //     onto a track destination
+            Object thenTurnObj = instr.getExtraInfoJSON().get("then_turn");
+            if (thenTurnObj instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> thenTurn = (Map<String, Object>) thenTurnObj;
+                Object signObj = thenTurn.get("sign");
+                if (signObj instanceof Number) {
+                    int s = ((Number) signObj).intValue();
+                    if ((s == Instruction.TURN_RIGHT || s == Instruction.TURN_SHARP_RIGHT)
+                            && ("GOOD_TRACK".equals(thenTurn.get("predicted_highway"))
+                                || "TRACK".equals(thenTurn.get("road_class")))) {
+                        rightTurnPresent = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assertTrue(rightTurnPresent,
+                "The TURN_RIGHT off Taivalkunnantie onto the track must reach the "
+                + "rider — either as a standalone instruction or via M2 then_turn "
+                + "compound. The fix prevents M1 from absorbing it as a misleading "
+                + "join. Instructions: " + summarizeInstructions(result));
+    }
+
+    // ========== Case 1: missing right at cycleway/footway fork (E5 surface gate) ==========
+
+    /**
+     * Forced-path block. Rider on cycleway makes a TURN_LEFT (~+87°) onto an asphalt
+     * cycleway segment, then ~15m later a TURN_RIGHT (~-92°) onto an unpaved cycleway.
+     * At both junctions the only graph alt is a bike-blocked FOOTWAY (asphalt) running
+     * (near-)straight ahead. Pre-E5-surface-fix: the second turn was suppressed because
+     * the FOOTWAY alt's asphalt surface did not match the new edge's fine_gravel — E5's
+     * surface gate compared only against the route's NEW edge. Post-fix: E5 accepts a
+     * surface match against EITHER the prev or the route edge → both turns emit.
+     *
+     * Origin: testMissingRightAtCyclewayFootwayFork_61_470_23_865 in
+     * RouteInstructionGeneratorTest.
+     */
+    @Test
+    void missingRightAtCyclewayFootwayFork_e5AcceptsPrevOrCurrentSurface() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("h5GZQDYcrqZAwP5p5Tr_D", 61.470086, 23.865304),
+                makeWaypoint("QPU2Toex4WWPf7Qoccj7s", 61.469662, 23.865102)));
+
+        CustomModel cm = new CustomModel();
+        cm.addToPriority(Statement.If("predicted_highway == MAJOR_ROAD",
+                Statement.Op.MULTIPLY, "1.45"));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("h5GZQDYcrqZAwP5p5Tr_D");
+        seg.setEnd("QPU2Toex4WWPf7Qoccj7s");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+        seg.setCustomModel(cm);
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        // Stage 1 must emit both the left and the right turn. Both have |turn_angle_deg|
+        // ≈ 87-92° → |sign|=2 (TURN_LEFT / TURN_RIGHT).
+        boolean leftFound = hasInstructionWithProperties(result,
+                sign -> sign == Instruction.TURN_LEFT,
+                extra -> {
+                    Object a = extra.get("turn_angle_deg");
+                    return a instanceof Number && Math.abs(((Number) a).doubleValue() - 86.8) < 5.0;
+                });
+        boolean rightFound = hasInstructionWithProperties(result,
+                sign -> sign == Instruction.TURN_RIGHT,
+                extra -> {
+                    Object a = extra.get("turn_angle_deg");
+                    return a instanceof Number && Math.abs(((Number) a).doubleValue() + 91.7) < 5.0;
+                });
+        assertTrue(leftFound,
+                "Case 1: TURN_LEFT (~+87°) missing in Stage 1 output. The asphalt cycleway "
+                + "turn must be emitted. Instructions: " + summarizeInstructions(result));
+        assertTrue(rightFound,
+                "Case 1: TURN_RIGHT (~-92°) missing in Stage 1 output. E5 must accept the "
+                + "FOOTWAY alt's asphalt surface as confusable against the prev edge surface "
+                + "(also asphalt). Instructions: " + summarizeInstructions(result));
+
+        // After post-processing M2 should merge the two close turns into the LEFT with
+        // a then_turn for the RIGHT. Either the unmerged pair or the merged compound is
+        // acceptable as long as the right turn reaches the rider.
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+
+        boolean rightReachesRider = false;
+        for (Instruction instr : result.instructions) {
+            if (instr.getSign() == Instruction.TURN_RIGHT) {
+                rightReachesRider = true;
+                break;
+            }
+            Object thenTurn = instr.getExtraInfoJSON().get("then_turn");
+            if (thenTurn instanceof Map) {
+                Object s = ((Map<?, ?>) thenTurn).get("sign");
+                if (s instanceof Number && ((Number) s).intValue() == Instruction.TURN_RIGHT) {
+                    rightReachesRider = true;
+                    break;
+                }
+            }
+        }
+        assertTrue(rightReachesRider,
+                "Case 1: after post-processing the right turn must reach the rider — either "
+                + "standalone or via M2 then_turn compound. Instructions: "
+                + summarizeInstructions(result));
+    }
+
+    // ========== Case 2: missing left at cycleway/footway fork (S3 non-road escape) ==========
+
+    /**
+     * Single junction. Rider on a named non-asphalt cycleway ("Hatanpään rantareitti",
+     * fine_gravel). Route bends ~+45° left (|sign|=1, TURN_SLIGHT_LEFT). A same-surface
+     * FOOTWAY alt continues (near-)straight at Δ=-11.8°. Pre-S3-non-road-escape: S3's
+     * prominence-only suppression fired (alts FOOTWAY=4 < CYCLEWAY=7) and emitted no
+     * instruction. Post-fix: S3 consults hasForwardConfusableAlt, finds a forward
+     * confusable same-surface alt that's meaningfully straighter than the route, and
+     * escapes its IGNORE branch — emits the angle-based sign (TURN_SLIGHT_LEFT).
+     *
+     * Origin: testMissingLeftAtCyclewayFootwayFork_61_482_23_749 in
+     * RouteInstructionGeneratorTest.
+     */
+    @Test
+    void missingLeftAtCyclewayFootwayFork_s3EscapesOnForwardConfusableAlt() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("DxKC_cfqphflJnHtQsH9L", 61.482546, 23.749163),
+                makeWaypoint("lZ-H0lwAsW_NH7RB9xK_x", 61.482827, 23.748476)));
+
+        CustomModel cm = new CustomModel();
+        cm.addToPriority(Statement.If("predicted_highway == MAJOR_ROAD",
+                Statement.Op.MULTIPLY, "1.45"));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("DxKC_cfqphflJnHtQsH9L");
+        seg.setEnd("lZ-H0lwAsW_NH7RB9xK_x");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+        seg.setCustomModel(cm);
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        // The 45° left bend must emit a TURN_SLIGHT_LEFT, not be silently absorbed
+        // into the surrounding CONTINUE_ON_STREET.
+        boolean slightLeftFound = hasInstructionWithProperties(result,
+                sign -> sign == Instruction.TURN_SLIGHT_LEFT,
+                extra -> {
+                    Object a = extra.get("turn_angle_deg");
+                    return a instanceof Number && Math.abs(((Number) a).doubleValue() - 45.1) < 5.0;
+                });
+        assertTrue(slightLeftFound,
+                "Case 2: TURN_SLIGHT_LEFT (~+45°) missing. The named cycleway bend with a "
+                + "same-surface forward FOOTWAY alt must escape S3's prominence suppression "
+                + "via hasForwardConfusableAlt. Instructions: "
+                + summarizeInstructions(result));
+    }
+
+    // ========== Case 3: over-emission on long trail route (S3 escape + isConfusableFrom) ==========
+
+    /**
+     * Longer real-world route (~1 km on outdoor_way / good_track / path) where the
+     * pre-Option-B implementation of S3's escape over-emitted slight turns at junctions
+     * where the only alt was either a back-leg or a side branch (>50° off forward). User
+     * confirmed four specific extras as unwanted. Post-fix: hasForwardConfusableAlt uses
+     * strict PH-AND-surface plus a straighter-than-route angle gate; isConfusableFrom's
+     * CYCLEWAY case is split out and extended with FOOTWAY only. Same junctions no longer
+     * trigger spurious turn instructions.
+     *
+     * Origin: testOverEmissionLongerRoute_61_477_24_027 in RouteInstructionGeneratorTest.
+     */
+    @Test
+    void overEmissionLongTrailRoute_s3EscapeRequiresStraighterAndConfusable() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("70kiMv-9Goi-btiF14m7K", 61.477057, 24.027534),
+                makeWaypoint("AmTbWDt5hJMx5I7LGl1vy", 61.471512, 24.050015)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("70kiMv-9Goi-btiF14m7K");
+        seg.setEnd("AmTbWDt5hJMx5I7LGl1vy");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        // The four user-confirmed extras were at Δ values -21.0°, +13.3°, +30.6°, +11.8°.
+        // Each had an alt PATH (OUTDOOR_WAY → PATH per isConfusableFrom: NOT confusable)
+        // and any forward alt was NOT meaningfully straighter than the route. None of
+        // them should fire Stage 1's S3 escape.
+        double[] extraDeltas = { -21.0, 13.3, 30.6, 11.8 };
+        for (double targetDelta : extraDeltas) {
+            boolean spuriousEmit = hasInstructionWithProperties(result,
+                    sign -> sign == Instruction.TURN_SLIGHT_LEFT
+                            || sign == Instruction.TURN_SLIGHT_RIGHT,
+                    extra -> {
+                        Object a = extra.get("turn_angle_deg");
+                        if (!(a instanceof Number)) return false;
+                        double v = ((Number) a).doubleValue();
+                        // Also require alt to be PATH-typed (filters the legitimate turns)
+                        Object alts = extra.get("junction_alt_predicted_highways");
+                        if (alts == null) return false;
+                        String altsStr = alts.toString();
+                        return Math.abs(v - targetDelta) < 1.5
+                                && altsStr.contains("PATH");
+                    });
+            assertFalse(spuriousEmit,
+                    "Case 3: spurious TURN_SLIGHT_* at Δ≈" + targetDelta + "° with PATH "
+                    + "alt should be suppressed by S3 (alts not in isConfusableFrom's "
+                    + "CYCLEWAY/OUTDOOR_WAY bucket for PATH). Instructions: "
+                    + summarizeInstructions(result));
+        }
+
+        // The route's legitimate navigation events (hairpin at start, KEEP_LEFT/KEEP_RIGHT
+        // at real good_track forks, hairpin onto good_track, final TURN_LEFT onto
+        // Mäntyveräjäntie) must all still be present. Cheap check: at least 5 emitted
+        // instructions of |sign|≠0 in Stage 1 output (a sharply-reduced-but-not-zero count).
+        int emittedTurns = 0;
+        for (Instruction instr : result.instructions) {
+            int sign = instr.getSign();
+            if (sign != Instruction.CONTINUE_ON_STREET && sign != Instruction.FINISH) {
+                emittedTurns++;
+            }
+        }
+        assertTrue(emittedTurns >= 5,
+                "Case 3: too few real turns remain after suppression — the fix may be "
+                + "over-suppressing. Stage 1 emitted only " + emittedTurns + " turn-like "
+                + "instructions. Instructions: " + summarizeInstructions(result));
     }
 
     // ==================== Shared assertion helpers ====================
@@ -1555,16 +2845,25 @@ public class InstructionValidationTest {
     /**
      * No non-FINISH instruction should have distance below threshold.
      * These are snap artifacts that M0/C2 should have removed.
+     * <p>
+     * U-turn signs are exempt: a U-turn is a navigation event at a point (180° reversal),
+     * not a length-based instruction. At a cross-segment U-turn boundary the polyline
+     * "jog" can be only ~1 m even when the U-turn is real and required for the rider —
+     * suppressing it would leave the rider committed to a dead-end with no exit cue.
      */
     private void assertNoMicroArtifacts(RouteInstructionGenerator.Result result, double thresholdMeters) {
         for (int i = 0; i < result.instructions.size(); i++) {
             Instruction instr = result.instructions.get(i);
-            if (instr.getSign() == Instruction.FINISH) continue;
+            int sign = instr.getSign();
+            if (sign == Instruction.FINISH) continue;
+            if (sign == Instruction.U_TURN_UNKNOWN
+                    || sign == Instruction.U_TURN_LEFT
+                    || sign == Instruction.U_TURN_RIGHT) continue;
             // M2 "then_turn" silent instructions can have short distances — skip those
             Map<String, Object> extra = instr.getExtraInfoJSON();
             if ("silent".equals(extra.get("tbt_priority"))) continue;
             assertTrue(instr.getDistance() >= thresholdMeters,
-                    "Instruction [" + i + "] sign=" + signName(instr.getSign())
+                    "Instruction [" + i + "] sign=" + signName(sign)
                     + " has micro-distance " + String.format("%.1fm", instr.getDistance())
                     + " (threshold=" + thresholdMeters + "m). Snap artifact not suppressed?");
         }

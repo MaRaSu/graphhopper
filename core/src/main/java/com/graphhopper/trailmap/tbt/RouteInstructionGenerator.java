@@ -146,9 +146,25 @@ public class RouteInstructionGenerator {
                     // of a standalone synthetic path (no previous edge to compute angle against).
                     // If stitchEdgeChains detected a U-turn at the boundary, patch the first
                     // CONTINUE_ON_STREET to U_TURN_UNKNOWN so appendInstructions() won't strip it.
+                    // Also stamp _polyline_start_hint so remapInstructionGeometry anchors this
+                    // instruction at the boundary seam: the synthetic-path fromNode is the FAR
+                    // endpoint of the shared edge (the end opposite to the snap point) and is
+                    // therefore not in the actual route polyline, so coordinate matching has no
+                    // valid target and the fallback global-closest match lands at an arbitrary
+                    // point — stacking subsequent instructions on top of it.
                     if (uturnAtBoundary && !sectionInstructions.isEmpty()
                             && sectionInstructions.get(0).getSign() == Instruction.CONTINUE_ON_STREET) {
                         sectionInstructions.get(0).setSign(Instruction.U_TURN_UNKNOWN);
+                        // Anchor the U-turn at the snap point — the last polyline point of the
+                        // previous segment, which is the physical location where the rider
+                        // reverses direction. Index is fullPolyline.size() - 1 because the next
+                        // segment's polyline first point will dedup against this same point in
+                        // appendRoutePolyline; the gap-resumption hint uses fullPolyline.size()
+                        // because there is no such overlap in that case.
+                        if (fullPolyline.size() > 0) {
+                            sectionInstructions.get(0).setExtraInfo("_polyline_start_hint",
+                                    fullPolyline.size() - 1);
+                        }
                     }
 
                     boolean isLastRoutableChunk = isLastRoutableChunk(chunks, ci);
@@ -432,6 +448,7 @@ public class RouteInstructionGenerator {
      * 2. Edges share a node → direct concatenation (works naturally)
      * 3. Edges don't connect → micro-route between the snapped end of segment N and
      *    snapped start of segment N+1 to bridge the gap.
+     * Note: in case 3, the caller's {@code currentEdgeIds} list is mutated in place to prepend the bridging edges.
      */
     private boolean stitchEdgeChains(List<Integer> prevEdgeIds, List<Integer> currentEdgeIds,
                                    PointList prevPolyline, PointList currentPolyline,
@@ -585,6 +602,18 @@ public class RouteInstructionGenerator {
         EdgeIteratorState firstEdge = baseGraph.getEdgeIteratorState(edgeIds.get(0), Integer.MIN_VALUE);
         int nodeA = firstEdge.getBaseNode();
         int nodeB = firstEdge.getAdjNode();
+
+        // Defensive guard: same-edge U-turn pair would otherwise fall through to unreliable proximity.
+        if (edgeIds.size() >= 2 && edgeIds.get(0).intValue() == edgeIds.get(1).intValue()) {
+            NodeAccess nodeAccess = baseGraph.getNodeAccess();
+            DistanceCalcEarth distCalc = DistanceCalcEarth.DIST_EARTH;
+            double distA = distCalc.calcDist(startCoord.getLat(), startCoord.getLng(),
+                    nodeAccess.getLat(nodeA), nodeAccess.getLon(nodeA));
+            double distB = distCalc.calcDist(startCoord.getLat(), startCoord.getLng(),
+                    nodeAccess.getLat(nodeB), nodeAccess.getLon(nodeB));
+            // First traversal moves AWAY from the closer endpoint, so fromNode is the OTHER endpoint
+            return distA <= distB ? nodeB : nodeA;
+        }
 
         if (edgeIds.size() >= 2) {
             EdgeIteratorState secondEdge = baseGraph.getEdgeIteratorState(edgeIds.get(1), Integer.MIN_VALUE);
@@ -747,12 +776,13 @@ public class RouteInstructionGenerator {
                     bestDist = dist;
                     bestIdx = pi;
                 }
-                // Accept the first exact match (< ~0.11m). On out-and-back routes,
+                // Accept the first near-exact match (< ~0.55m). On out-and-back routes,
                 // the same node coordinate appears multiple times in the polyline;
-                // since searchFrom is past earlier occurrences, the first exact match
+                // since searchFrom is past earlier occurrences, the first near-exact match
                 // after searchFrom is the correct one. Continuing to scan could pick
                 // up a false near-match on a parallel trail segment further along.
-                if (bestDist < 1e-6) {
+                // Threshold loosened from 1e-6 to tolerate floating-point drift between code paths.
+                if (bestDist < 5e-6) {
                     break;
                 }
             }
@@ -793,7 +823,7 @@ public class RouteInstructionGenerator {
             // instruction's start point, which includes the segment from polyEnd-1 to polyEnd
             // that is not part of this instruction's PointList (which is [polyStart, polyEnd)).
             double oldDist = instr.getDistance();
-            if (oldDist > 0 && polyEnd > polyStart) {
+            if (oldDist > 1.0 && polyEnd > polyStart) {
                 double newDist = 0;
                 for (int pi = polyStart; pi < polyEnd; pi++) {
                     newDist += DistanceCalcEarth.DIST_EARTH.calcDist(
@@ -855,8 +885,13 @@ public class RouteInstructionGenerator {
             PointList points = new PointList(2, true);
             TrailmapInstructionRequest.Coordinates start = waypointMap.get(seg.getStart());
             TrailmapInstructionRequest.Coordinates end = waypointMap.get(seg.getEnd());
-            if (start != null) points.add(start.getLat(), start.getLng(), Double.NaN);
-            if (end != null) points.add(end.getLat(), end.getLng(), Double.NaN);
+            if (start == null || end == null) {
+                throw new IllegalArgumentException("Direct segment references unknown waypoint id(s): start='"
+                        + seg.getStart() + "'" + (start == null ? " (unresolved)" : "")
+                        + ", end='" + seg.getEnd() + "'" + (end == null ? " (unresolved)" : ""));
+            }
+            points.add(start.getLat(), start.getLng(), Double.NaN);
+            points.add(end.getLat(), end.getLng(), Double.NaN);
             return points;
         }
     }

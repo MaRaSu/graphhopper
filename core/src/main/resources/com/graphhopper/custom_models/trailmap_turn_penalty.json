@@ -1,0 +1,32 @@
+{
+  "turn_penalty": [
+    {
+      "if": "road_name_hash == 0 || road_name_hash != prev_road_name_hash",
+      "do": [
+
+        { "if": "change_angle >= 110 || change_angle <= -110", "add": "3" },
+        { "else_if": "(change_angle >= 80 && change_angle < 110) || (change_angle <= -80 && change_angle > -110)", "add": "1" },
+
+        { "if": "change_angle <= -10 && prev_predicted_highway == MAJOR_ROAD", "add": "10" },
+        { "else_if": "change_angle <= -10 && prev_predicted_highway == MINOR_ROAD", "add": "4" },
+
+        { "if": "change_angle >= 10 && prev_predicted_highway == MAJOR_ROAD", "add": "3" },
+
+        { "if": "predicted_highway == MAJOR_ROAD && prev_predicted_highway != MAJOR_ROAD",
+          "do": [
+            { "if": "change_angle <= -10", "add": "15" },
+            { "else": "", "add": "10" }
+          ]
+        },
+
+        { "if": "predicted_highway == MINOR_ROAD && prev_predicted_highway != MAJOR_ROAD && prev_predicted_highway != MINOR_ROAD",
+          "do": [
+            { "if": "change_angle <= -10", "add": "6" },
+            { "else": "", "add": "4" }
+          ]
+        }
+
+      ]
+    }
+  ]
+}
