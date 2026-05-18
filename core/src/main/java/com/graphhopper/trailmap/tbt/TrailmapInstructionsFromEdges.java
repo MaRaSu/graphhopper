@@ -293,9 +293,9 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
 
             // Sign reframer (Stage 1 junction-relative reframing layer).
             // Adjusts the rule-chain sign against the visible-alt distribution at the
-            // junction. Acts only on signs in the slight zone (CONTINUE/SLIGHT/KEEP);
-            // real turns and IGNORE pass through. May demote slight→CONTINUE or
-            // upgrade CONTINUE→KEEP depending on junction shape.
+            // junction. Acts on slight-zone signs (CONTINUE/SLIGHT/KEEP) and on
+            // TURN_LEFT/RIGHT (sign ±2) via Shape 6. May demote slight→CONTINUE,
+            // upgrade CONTINUE→KEEP, or demote TURN→SLIGHT depending on junction shape.
             int originalSign = sign;
             if (isReframerCandidate(sign)) {
                 int reframed = reframeSign(sign, edge, baseNode);
@@ -358,14 +358,21 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                 if (sign != originalSign && lastReframerShape != null) {
                     prevInstruction.setExtraInfo("reframed_from", originalSign);
                     prevInstruction.setExtraInfo("reframer_shape", lastReframerShape);
-                    // When the reframer demoted to CONTINUE because the rider sees a real
-                    // junction (side-turn off the route, or a sandwich of alts), stamp
-                    // trail_fork so the client fires its "continue" cue. The existing
-                    // hasConfusableAlternative criteria are tighter than the reframer's
-                    // visual-alt set, so the tag would otherwise be missing.
-                    if (sign == Instruction.CONTINUE_ON_STREET
-                            && ("shape_1_side_turn".equals(lastReframerShape)
-                                || "shape_4_sandwich".equals(lastReframerShape))) {
+                    // When the reframer relabels because the rider sees a real junction
+                    // (side-turn off the route, sandwich demote to CONTINUE, or sandwich
+                    // past-slight magnitude demote to TURN_SLIGHT), stamp trail_fork so
+                    // the client fires its fork cue. The existing hasConfusableAlternative
+                    // criteria are tighter than the reframer's visual-alt set, so the tag
+                    // would otherwise be missing.
+                    boolean stampTrailFork =
+                            (sign == Instruction.CONTINUE_ON_STREET
+                                && ("shape_1_side_turn".equals(lastReframerShape)
+                                    || "shape_4_sandwich".equals(lastReframerShape)))
+                            || ((sign == Instruction.TURN_SLIGHT_LEFT
+                                    || sign == Instruction.TURN_SLIGHT_RIGHT)
+                                && ("shape_4_sandwich_past_slight".equals(lastReframerShape)
+                                    || "shape_6_anchored".equals(lastReframerShape)));
+                    if (stampTrailFork) {
                         prevInstruction.setExtraInfo("trail_fork", true);
                     }
                 }
@@ -619,21 +626,30 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         // Guard 2 (non-road only): when the rider is on non-road infrastructure (trails,
         // cycleways, paths) prominence alone is not a reliable visual cue — an unpaved
         // cycleway and a same-surface footway can be visually identical despite different
-        // PH. On non-road, S3 escapes (emits the angle-based sign) only when at least one
-        // alt is *both* forward-pointing (within ±90° of incoming) and visually confusable
-        // with the route (same PH bucket per isConfusableFrom OR same major surface). A
-        // back-leg / U-turn-shaped alt is not a real navigation choice and shouldn't trigger
-        // an instruction even if its surface matches. On road infrastructure
-        // (motorway/major/minor/service) the road environment carries its own visual cues
-        // (signs, kerbs, markings) and prominence remains a fine proxy — S3 keeps its
-        // original behaviour there.
+        // PH. On non-road, S3 escapes (emits the angle-based sign) for two distinct
+        // perceptual shapes:
+        //   Shape A — Inertia-trap (hasForwardConfusableAlt): a visually-similar alt
+        //     goes noticeably straighter than the route, so the rider's go-forward
+        //     default would land on the wrong branch unless warned.
+        //   Shape B — Y-fork (hasYForkConfusableAlt): a visually-similar alt sits forward
+        //     at the junction with no clear "obvious continuation" claim; the rider
+        //     faces a real left-or-right choice between two similar-looking ways.
+        //     Forward-cone bounded, spread vs route gated by route deviation — see the
+        //     helper docstring for the perceptual rationale and thresholds.
+        // The two shapes can overlap mathematically (the escape fires either way); they
+        // are kept named separately to describe the two distinct rider experiences.
+        // On road infrastructure (motorway/major/minor/service) the road environment
+        // carries its own visual cues (signs, kerbs, markings) and prominence remains
+        // a fine proxy — S3 keeps its original behaviour there.
         if (currentPH != null && prevPH != null
                 && phProminence(prevPH) >= phProminence(currentPH)
                 && allAlternativesLowerProminence(outgoingEdges, currentPH)) {
             boolean bothNonRoad = !isRoadInfrastructure(currentPH) && !isRoadInfrastructure(prevPH);
             if (bothNonRoad
-                    && hasForwardConfusableAlt(outgoingEdges, edge, currentPH, delta,
-                            prevLat, prevLon, prevOrientation)) {
+                    && (hasForwardConfusableAlt(outgoingEdges, edge, currentPH, delta,
+                                prevLat, prevLon, prevOrientation)
+                        || hasYForkConfusableAlt(outgoingEdges, edge, currentPH, delta,
+                                prevLat, prevLon, prevOrientation))) {
                 return sign;
             }
             return Instruction.IGNORE;
@@ -1054,6 +1070,96 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     }
 
     /**
+     * S3 escape gate for the Y-fork shape: returns true iff at least one alt is a
+     * visually-similar forward co-branch where the rider perceives a real left-or-right
+     * choice between two similar-looking ways. Complementary to
+     * {@link #hasForwardConfusableAlt} (the inertia-trap shape, where the alt is
+     * dominantly straighter than the route).
+     * <p>
+     * Three AND-mandatory gates per alt:
+     * <ol>
+     *   <li><b>PH bucket</b> — {@code isConfusableFrom(currentPH, altPH)} must be true.
+     *       The alt must be the kind of way the rider could mistake for their continuation.</li>
+     *   <li><b>Surface</b> — same major surface (asphalt vs non-asphalt) per
+     *       {@link #surfacesClearlyDiffer}. ASPHALT_OR_UNPAVED is ambiguous and counts
+     *       as a match either way.</li>
+     *   <li><b>Spread vs. route, gated by route deviation</b> — the rider's perception
+     *       of "fork" depends on whether the route gives a clear "straight" reference:
+     *       <ul>
+     *         <li><b>Route near-straight</b> ({@code |routeDelta| ≤ ~11°}): alt's
+     *             absolute angle from straight must be ≤ ~30°. The rider has an
+     *             unambiguous straight reference; an alt further than ~30° from
+     *             straight reads as a side-branch, not a Y-limb.</li>
+     *         <li><b>Route in slight-turn zone</b> ({@code |routeDelta| > ~11°}):
+     *             spread {@code |routeDelta − altDelta| ≤ ~55°} AND alt's absolute
+     *             angle ≤ ~60° (forward cone). Neither branch is "the straight one";
+     *             both naturally sit in the slight area and the rider perceives them
+     *             as a Y even with the wider spread.</li>
+     *       </ul></li>
+     * </ol>
+     * No lower bound on spread: the few-meter angle sample we read at the junction
+     * node is not a trustworthy basis for filtering small-spread junctions, because
+     * real Y-forks can start with a sliver of an angle at the node and diverge
+     * downstream within 10–20 meters. The rider sees the diverging geometry; the
+     * node-local angle does not.
+     */
+    private boolean hasYForkConfusableAlt(InstructionsOutgoingEdges outgoing,
+                                           EdgeIteratorState routeEdge,
+                                           PredictedHighway currentPH,
+                                           double routeDelta,
+                                           double prevLat, double prevLon,
+                                           double prevOrientation) {
+        if (predictedHighwayEnc == null || currentPH == null) return false;
+        PredictedSurface routeSurface = predictedSurfaceEnc != null
+                ? routeEdge.get(predictedSurfaceEnc) : null;
+
+        // Route-deviation tier boundary. Matches the calculateSign() straight/slight
+        // boundary used everywhere else in the rule chain (|delta| < 0.2 rad ≈ 11°).
+        final double STRAIGHT_TIER = 0.2;
+        // Tier A — route near-straight: alt's absolute angle from straight must be small.
+        final double NEAR_STRAIGHT_ALT_MAX = 0.52;  // ~30°
+        // Tier B — route in slight-turn zone: spread between route and alt, plus
+        // forward-cone bound on alt's absolute angle.
+        final double SLIGHT_SPREAD_MAX    = 0.96;   // ~55°
+        final double FORWARD_CONE_MAX     = 1.05;   // ~60°
+
+        double routeDeviation = Math.abs(routeDelta);
+        boolean routeNearStraight = routeDeviation <= STRAIGHT_TIER;
+
+        for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
+            // (a) PH bucket
+            PredictedHighway altPH = alt.get(predictedHighwayEnc);
+            if (!isConfusableFrom(currentPH, altPH)) continue;
+
+            // (b) surface
+            if (predictedSurfaceEnc != null) {
+                PredictedSurface altSurface = alt.get(predictedSurfaceEnc);
+                if (surfacesClearlyDiffer(routeSurface, altSurface)) continue;
+            }
+
+            // (c) angle: tier-dependent spread bound
+            GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(alt, nodeAccess);
+            double altDelta = InstructionsHelper.calculateOrientationDelta(
+                    prevLat, prevLon, altPoint.getLat(), altPoint.getLon(), prevOrientation);
+            double altAbs = Math.abs(altDelta);
+
+            if (routeNearStraight) {
+                // Route gives a clear straight reference; alt's distance from straight
+                // is what determines whether it reads as a co-branch or a side-branch.
+                if (altAbs <= NEAR_STRAIGHT_ALT_MAX) return true;
+            } else {
+                // No clean straight reference; spread between route and alt is the
+                // perceptual signal. Forward cone still bounds the alt's absolute
+                // angle to keep clear side-turns out.
+                if (altAbs > FORWARD_CONE_MAX) continue;
+                double spread = Math.abs(routeDelta - altDelta);
+                if (spread <= SLIGHT_SPREAD_MAX) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Whether any non-route alternative at the junction is a "viable forward continuation"
      * — its outgoing direction is within ±90° of the incoming direction. Back-legs and
      * U-turn-shaped alts (>90° divergence) are not viable forward and don't constitute a
@@ -1184,10 +1290,36 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     //
     // After getTurn() decides a sign, the reframer compares the route's angle
     // against the junction's visible-alt distribution and may adjust the sign
-    // to better match rider perception. Five "shapes" of junction are
-    // recognised; three of them rewrite the sign (Shape 1 = no competition,
-    // Shape 3 = Y-fork with route on outside, Shape 4 = sandwich) and two pass
-    // through (Shape 2 = anchored straight reference, Shape 5 = real turn).
+    // to better match rider perception. Six "shapes" of junction are
+    // recognised; four rewrite the sign (Shape 1 = no competition, Shape 3 =
+    // Y-fork with route on outside, Shape 4 = sandwich, Shape 6 = soft real
+    // turn) and two pass through (Shape 2 = anchored straight reference,
+    // Shape 5 = real turn beyond Shape 6's scope).
+    //
+    // Shape 4 (sandwich) has two demote branches sharing the same
+    // alts-on-both-sides + non-road detection:
+    //   (a) near-straight route → CONTINUE_ON_STREET
+    //   (b) past-slight route + same-side more-extreme reference alt → demote
+    //       magnitude one bucket to TURN_SLIGHT_<route's direction>. The
+    //       reference alt is the rider's anchor for "real left/right" at the
+    //       junction, so the route's smaller deviation reads as "slight".
+    //
+    // Shape 6 (soft real turn) demotes TURN_LEFT/RIGHT → TURN_SLIGHT_LEFT/RIGHT
+    // at non-road junctions when the visible-alt distribution makes the turn
+    // read as soft despite the geometric angle being past 40°. Two branches
+    // share an asymmetric safety gate. The hard forbidden zone strictly
+    // disqualifies the demote when any alt sits between the route's angle and
+    // 20° on the opposite side. A soft zone on the opposite side covers alts
+    // in [20°, 35°] — they don't strictly disqualify but modulate the route-
+    // angle cap (40° at 20° up to 55° at 35°), capturing the Y-fork
+    // perception of an opposite-side slight-bucket alt:
+    //   (a) unanchored — base cap 55° (subject to the opposite-side soft
+    //       modifier), no same-side anchor present.
+    //   (b) anchored   — base cap dynamic (70° → 55° linearly as the closest
+    //       same-side anchor grows from 100° to 130°, subject to the opposite-
+    //       side soft modifier), with at least one same-side alt more extreme
+    //       than the route by ≥30°. The anchor is the rider's "real left/right"
+    //       reference; relabelling the route as "slight" prevents confusion.
     //
     // Visual-alt collection walks the unfiltered explorer to catch
     // access-blocked-but-visible alts (e.g. footways with bike=no when riding
@@ -1196,10 +1328,56 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     // Reframer thresholds (radians where noted). Picked conservatively; the
     // first-cut intent is "don't bite when the answer is uncertain."
     private static final double REFRAMER_FORWARD_CONE = Math.toRadians(75);
+    // Extended cone admitting visually-similar alts (same PH bucket per
+    // isConfusableFrom AND same surface major) into the back-leg zone. OSM
+    // sometimes mis-draws perceptually-forward turns (~85–90°) as back-leg-zone
+    // angles; when the alt is the same type/surface as the route, the rider
+    // perceives it as a real forward branch despite the geometric angle.
+    // Visually-distinct alts past REFRAMER_FORWARD_CONE remain excluded.
+    //
+    // Note: this 115° limit and Shape 6's SHAPE6_ANCHOR_NO_CAP_THRESHOLD (130°)
+    // are about different perceptual questions and intentionally do not match:
+    //   - This cone defines "what enters altDeltas at all" — i.e. which alts
+    //     EVERY shape sees as potential forward branches. Past 115° an alt is
+    //     a clear back-leg from a generic-forward-perception standpoint, and
+    //     Shape 1 no_competition / Shape 4 sandwich / Shape 3 / etc. should
+    //     NOT treat such alts as competitors.
+    //   - SHAPE6_ANCHOR_NO_CAP_THRESHOLD defines the upper end of the Shape 6
+    //     anchor-cap function (where label-separation benefit fully decays).
+    //     Shape 6 anchored fires only when a same-side more-extreme alt exists
+    //     in altDeltas; the cap function uses the alt's magnitude as input.
+    // Aligning these two for "consistency" would change other shapes' behavior
+    // (e.g. Shape 1 no_competition would stop demoting at junctions with a
+    // visually-similar 115°–130° alt, because altDeltas would no longer be
+    // empty). Different shapes ask different perceptual questions; "matching
+    // parameters across shapes for code symmetry" is a code-aesthetics goal,
+    // not a business-logic one, and should not drive changes here. The
+    // architectural cost is that Shape 6's anchor-cap region [115°, 130°] is
+    // not reachable through altDeltas — accepted in exchange for keeping each
+    // shape's cone matched to its own perceptual question. Today's field-
+    // reported case at (61.46739, 23.72984) reaches the demote anyway via the
+    // unanchored branch (with the PH-change guard now removed), so the
+    // rider-facing outcome is correct.
+    private static final double REFRAMER_VISUAL_SIMILAR_CONE = Math.toRadians(115);
     private static final double REFRAMER_REAL_TURN_CUTOFF = Math.toRadians(40);
     private static final double REFRAMER_ANCHORED_THRESHOLD = Math.toRadians(10);
     private static final double REFRAMER_ROUTE_NOISE_MARGIN = Math.toRadians(8);
-    private static final double REFRAMER_SHAPE4_ROUTE_CLAMP = Math.toRadians(12);
+    // Shape 4 near-straight clamp — the maximum |routeDelta| Shape 4 treats as
+    // "straight enough" to demote a sandwich to CONTINUE. Default is the floor
+    // (12°). When BOTH sandwich arms are clearly off-axis the clamp linearly
+    // relaxes up to a ceiling: the rider's perceived "central zone" widens with
+    // arm spread, but only modestly (Appendix E "preserve rule chain when in
+    // doubt" bias). See shape4RouteClampFor() — narrowest_arm 60°→12°, 90°→18°,
+    // linear in between, flat outside.
+    private static final double REFRAMER_SHAPE4_ROUTE_CLAMP_FLOOR = Math.toRadians(12);
+    private static final double REFRAMER_SHAPE4_ROUTE_CLAMP_CEILING = Math.toRadians(18);
+    private static final double REFRAMER_SHAPE4_RELAX_GATE = Math.toRadians(60);
+    private static final double REFRAMER_SHAPE4_RELAX_FULL = Math.toRadians(90);
+    // Shape 4 past-slight branch — minimum angular gap between the route and a
+    // same-side alt for that alt to count as the rider's "real left/right"
+    // anchor. Without a clear gap the alt feels like the same forward
+    // continuation as the route, not a more-extreme reference branch.
+    private static final double REFRAMER_SHAPE4_PAST_SLIGHT_REFERENCE_GAP = Math.toRadians(30);
     private static final double REFRAMER_SHAPE3A_ROUTE_CLAMP = Math.toRadians(30);
     private static final double REFRAMER_SHAPE3A_ALT_MAX_ABS = Math.toRadians(45);
     private static final double REFRAMER_SHAPE3B_ROUTE_CLAMP = Math.toRadians(25);
@@ -1211,17 +1389,52 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     private static final double REFRAMER_SHAPE1_ROUTE_NEAR_STRAIGHT = Math.toRadians(20);
     private static final double REFRAMER_SHAPE1_ALT_CLEARLY_OFF = Math.toRadians(60);
 
+    // Shape 6 — Soft real-turn. Demotes TURN_LEFT/RIGHT → TURN_SLIGHT_LEFT/RIGHT
+    // at non-road junctions when the visible-alt distribution makes the turn
+    // read as soft despite the geometric angle being past 40°.
+    //
+    // SHAPE6_OPPOSITE_TOLERANCE — opposite-side alts strictly inside this absolute
+    //   angle of straight (along with same-side alts less extreme than the route)
+    //   form the hard forbidden zone: their presence disqualifies the demote.
+    //   They act as a "straight reference" or "competing same-side branch" the
+    //   rider would scan for.
+    // SHAPE6_OPPOSITE_SOFT_MAX — opposite-side alts in [SHAPE6_OPPOSITE_TOLERANCE,
+    //   SHAPE6_OPPOSITE_SOFT_MAX] sit in the rider's slight-bucket on the other
+    //   side and signal a Y-fork shape. They don't strictly disqualify but
+    //   modulate the route-angle cap linearly: at 20° the cap collapses to 40°
+    //   (no fire — route must be > 40° for Shape 6), at 35° the cap is the
+    //   full unanchored 55°. Beyond 35° the opposite-side alt is far enough to
+    //   register as a clear side-branch and stops influencing the cap.
+    // SHAPE6_ROUTE_CAP_UNANCHORED — route-angle cap for Branch 6a (no same-side
+    //   anchor). Up to ~55° feels slight to the rider when no alt argues otherwise.
+    // SHAPE6_ROUTE_CAP_ANCHORED_MAX — route-angle cap for Branch 6b (same-side
+    //   anchor close enough to be perceptually confusable with the route).
+    // SHAPE6_ANCHOR_FULL_CAP_THRESHOLD / SHAPE6_ANCHOR_NO_CAP_THRESHOLD — anchor
+    //   magnitudes bounding the linear taper from ANCHORED_MAX down to
+    //   UNANCHORED. Anchors past NO_CAP_THRESHOLD are perceptually "tight" and
+    //   provide no label-separation benefit (rider would not confuse them with
+    //   a route at 55–70°), so the cap collapses to the unanchored value.
+    private static final double SHAPE6_OPPOSITE_TOLERANCE = Math.toRadians(20);
+    private static final double SHAPE6_OPPOSITE_SOFT_MAX = Math.toRadians(35);
+    private static final double SHAPE6_ROUTE_CAP_UNANCHORED = Math.toRadians(55);
+    private static final double SHAPE6_ROUTE_CAP_ANCHORED_MAX = Math.toRadians(70);
+    private static final double SHAPE6_ANCHOR_FULL_CAP_THRESHOLD = Math.toRadians(100);
+    private static final double SHAPE6_ANCHOR_NO_CAP_THRESHOLD = Math.toRadians(130);
+
     /**
      * Whether the reframer should act on this sign. Acts on CONTINUE_ON_STREET,
-     * TURN_SLIGHT_LEFT/RIGHT, KEEP_LEFT/RIGHT. Passes through all other signs
-     * (real turns, sharp turns, ferries, u-turns, IGNORE, etc.).
+     * TURN_SLIGHT_LEFT/RIGHT, KEEP_LEFT/RIGHT, and TURN_LEFT/RIGHT (Shape 6
+     * demote candidates). Passes through all other signs (sharp turns,
+     * ferries, u-turns, IGNORE, etc.).
      */
     private static boolean isReframerCandidate(int sign) {
         return sign == Instruction.CONTINUE_ON_STREET
                 || sign == Instruction.TURN_SLIGHT_LEFT
                 || sign == Instruction.TURN_SLIGHT_RIGHT
                 || sign == Instruction.KEEP_LEFT
-                || sign == Instruction.KEEP_RIGHT;
+                || sign == Instruction.KEEP_RIGHT
+                || sign == Instruction.TURN_LEFT
+                || sign == Instruction.TURN_RIGHT;
     }
 
     /**
@@ -1237,21 +1450,163 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         double routeDelta = InstructionsHelper.calculateOrientationDelta(
                 prevLat, prevLon, routePoint.getLat(), routePoint.getLon(), prevOrientation);
 
-        // Shape 5 — route is past the slight bucket. The angular event is real;
-        // never reframe.
-        if (Math.abs(routeDelta) > REFRAMER_REAL_TURN_CUTOFF) {
-            return decidedSign;
-        }
-
         // Type-change detection. F1 emits angular signs intentionally when the route
         // crosses a PredictedHighway or major-surface (asphalt/non-asphalt) boundary;
         // those intentional cues should not be upgraded to KEEP by Shape 3.
         boolean typeChange = isTypeChangeAtJunction(routeEdge);
 
         // Collect visible alts at the junction (unfiltered explorer + visibility filters).
+        // Done before Shape 5 because the past-slight Shape 4 branch needs the alt set
+        // to detect the sandwich + same-side reference shape on past-slight routes.
         PredictedSurface routeSurface = predictedSurfaceEnc != null
                 ? routeEdge.get(predictedSurfaceEnc) : null;
         List<Double> altDeltas = collectVisualAltDeltas(baseNode, routeEdge, routeSurface);
+
+        // Classify alts relative to the route's angular position. Three flags:
+        //   leftOfRoute / rightOfRoute   — any alt on that side (sandwich detection)
+        //   sameSideMoreExtreme          — an alt on the route's side AND further than
+        //                                  the route by at least the reference gap
+        //                                  (rider's "real left/right" anchor for the
+        //                                  past-slight Shape 4 branch).
+        boolean leftOfRoute = false;
+        boolean rightOfRoute = false;
+        boolean sameSideMoreExtreme = false;
+        for (double altDelta : altDeltas) {
+            if (altDelta > routeDelta + REFRAMER_ROUTE_NOISE_MARGIN) leftOfRoute = true;
+            else if (altDelta < routeDelta - REFRAMER_ROUTE_NOISE_MARGIN) rightOfRoute = true;
+            if (routeDelta > 0
+                    && altDelta > routeDelta + REFRAMER_SHAPE4_PAST_SLIGHT_REFERENCE_GAP) {
+                sameSideMoreExtreme = true;
+            } else if (routeDelta < 0
+                    && altDelta < routeDelta - REFRAMER_SHAPE4_PAST_SLIGHT_REFERENCE_GAP) {
+                sameSideMoreExtreme = true;
+            }
+        }
+
+        // Shape 4 (sandwich) past-slight branch — the route is past the slight bucket
+        // but sits in the middle of a fan with at least one same-side alt that is more
+        // extreme. The rule chain emitted KEEP_LEFT/RIGHT (fork-handler interpretation
+        // of a 2-arm Y) but the rider sees a 3-arm fan with the route as the middle;
+        // "stay left/right" then points the rider at the wrong (more-extreme) branch.
+        // Demote magnitude one bucket to TURN_SLIGHT_<route's direction>. Must run
+        // before Shape 5's past-slight short-circuit. Limited to non-road junctions
+        // (same scope as the existing near-straight branch).
+        if (Math.abs(routeDelta) > REFRAMER_REAL_TURN_CUTOFF
+                && (decidedSign == Instruction.KEEP_LEFT
+                    || decidedSign == Instruction.KEEP_RIGHT)
+                && leftOfRoute && rightOfRoute && sameSideMoreExtreme
+                && bothNonRoadAtJunction(routeEdge)) {
+            lastReframerShape = "shape_4_sandwich_past_slight";
+            return routeDelta > 0
+                    ? Instruction.TURN_SLIGHT_LEFT
+                    : Instruction.TURN_SLIGHT_RIGHT;
+        }
+
+        // Shape 6 — Soft real turn. Demote TURN_LEFT/RIGHT → TURN_SLIGHT_LEFT/RIGHT
+        // when the junction's visible-alt distribution makes the turn read as soft
+        // despite the geometric angle being past 40°. Two branches share an
+        // asymmetric safety gate:
+        //   (i)  Hard forbidden zone — no alt strictly between the route angle and
+        //        20° on the opposite side (same-side less-extreme alts would compete
+        //        with the route, opposite-side near-straight alts would anchor
+        //        "straight" against which the route's deviation reads as a real turn).
+        //   (ii) Soft opposite-side zone — opposite-side alts in [20°, 35°] sit in
+        //        the rider's perceptual slight-bucket on the other side and signal
+        //        a Y-fork shape. They modulate the route-angle cap linearly: at 20°
+        //        the cap collapses to 40° (no fire); at 35° the cap is the full
+        //        55° (or anchored max). Beyond 35° the alt is a clear side-branch
+        //        and doesn't influence the cap.
+        //   6a (unanchored) — route up to 55° (subject to the soft zone modifier),
+        //      no same-side anchor.
+        //   6b (anchored)   — route up to a dynamic cap (70°→55° as the closest
+        //      same-side anchor's magnitude grows from 100° to 130°, subject to
+        //      the soft zone modifier), at least one same-side alt more extreme
+        //      than the route by ≥30°. The anchor is the rider's "real left/right"
+        //      reference; relabelling avoids confusion with the more-extreme branch.
+        // Scope: non-road junctions only. PH change at the junction is NOT a
+        // guard: anchored fires because the disambiguation work is independent
+        // of the type change; unanchored fires because the alt set can lose a
+        // real same-side anchor when its OSM angle exceeds the visual-similar
+        // cone, and the demote then provides the disambiguation the rider
+        // actually needs. Surface change is also NOT a guard — perceived
+        // softness is independent of surface continuity.
+        if ((decidedSign == Instruction.TURN_LEFT || decidedSign == Instruction.TURN_RIGHT)
+                && Math.abs(routeDelta) > REFRAMER_REAL_TURN_CUTOFF
+                && bothNonRoadAtJunction(routeEdge)) {
+
+            boolean forbiddenAltExists = false;
+            double closestAnchorAbs = Double.POSITIVE_INFINITY;
+            // Smallest |altDelta| of any opposite-side alt in the soft zone
+            // [SHAPE6_OPPOSITE_TOLERANCE, SHAPE6_OPPOSITE_SOFT_MAX]. The smallest
+            // (closest to the forbidden boundary) wins because it shrinks the cap
+            // the most — that alt is the rider's nearest "slight branch on the
+            // other side" anchoring the Y-fork perception.
+            double closestOppositeSoftAbs = Double.POSITIVE_INFINITY;
+            for (double altDelta : altDeltas) {
+                if (routeDelta > 0) {
+                    // Route on left (positive delta). Forbidden zone is (-20°, routeDelta):
+                    // any alt to the right of route by less than the full route magnitude
+                    // OR within 20° to the right of straight competes/anchors.
+                    if (altDelta > -SHAPE6_OPPOSITE_TOLERANCE && altDelta < routeDelta) {
+                        forbiddenAltExists = true;
+                    }
+                    // Same-side anchor: further left than route by ≥ 30°.
+                    if (altDelta >= routeDelta + REFRAMER_SHAPE4_PAST_SLIGHT_REFERENCE_GAP) {
+                        double absAlt = Math.abs(altDelta);
+                        if (absAlt < closestAnchorAbs) closestAnchorAbs = absAlt;
+                    }
+                    // Opposite-side soft zone: altDelta in [-35°, -20°].
+                    if (altDelta >= -SHAPE6_OPPOSITE_SOFT_MAX
+                            && altDelta <= -SHAPE6_OPPOSITE_TOLERANCE) {
+                        double absAlt = Math.abs(altDelta);
+                        if (absAlt < closestOppositeSoftAbs) closestOppositeSoftAbs = absAlt;
+                    }
+                } else {
+                    // Route on right (negative delta). Forbidden zone is (routeDelta, +20°).
+                    if (altDelta < SHAPE6_OPPOSITE_TOLERANCE && altDelta > routeDelta) {
+                        forbiddenAltExists = true;
+                    }
+                    // Same-side anchor: further right than route by ≥ 30°.
+                    if (altDelta <= routeDelta - REFRAMER_SHAPE4_PAST_SLIGHT_REFERENCE_GAP) {
+                        double absAlt = Math.abs(altDelta);
+                        if (absAlt < closestAnchorAbs) closestAnchorAbs = absAlt;
+                    }
+                    // Opposite-side soft zone: altDelta in [+20°, +35°].
+                    if (altDelta >= SHAPE6_OPPOSITE_TOLERANCE
+                            && altDelta <= SHAPE6_OPPOSITE_SOFT_MAX) {
+                        double absAlt = Math.abs(altDelta);
+                        if (absAlt < closestOppositeSoftAbs) closestOppositeSoftAbs = absAlt;
+                    }
+                }
+            }
+
+            if (!forbiddenAltExists) {
+                double routeCap;
+                String shapeLabel;
+                if (closestAnchorAbs == Double.POSITIVE_INFINITY) {
+                    routeCap = SHAPE6_ROUTE_CAP_UNANCHORED;
+                    shapeLabel = "shape_6_unanchored";
+                } else {
+                    routeCap = shape6AnchoredCap(closestAnchorAbs);
+                    shapeLabel = "shape_6_anchored";
+                }
+                if (closestOppositeSoftAbs != Double.POSITIVE_INFINITY) {
+                    routeCap = Math.min(routeCap, shape6OppositeSoftCap(closestOppositeSoftAbs));
+                }
+                if (Math.abs(routeDelta) <= routeCap) {
+                    lastReframerShape = shapeLabel;
+                    return routeDelta > 0
+                            ? Instruction.TURN_SLIGHT_LEFT
+                            : Instruction.TURN_SLIGHT_RIGHT;
+                }
+            }
+        }
+
+        // Shape 5 — route is past the slight bucket. The angular event is real;
+        // never reframe.
+        if (Math.abs(routeDelta) > REFRAMER_REAL_TURN_CUTOFF) {
+            return decidedSign;
+        }
 
         // Shape 2 — a clear straight reference exists; the rule chain's sign is right.
         for (double altDelta : altDeltas) {
@@ -1272,20 +1627,17 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             return decidedSign;
         }
 
-        // Classify alts relative to the route's angular position.
-        boolean leftOfRoute = false;
-        boolean rightOfRoute = false;
-        for (double altDelta : altDeltas) {
-            if (altDelta > routeDelta + REFRAMER_ROUTE_NOISE_MARGIN) leftOfRoute = true;
-            else if (altDelta < routeDelta - REFRAMER_ROUTE_NOISE_MARGIN) rightOfRoute = true;
-        }
-
-        // Shape 4 — sandwich: alts on both sides of route. No KEEP direction works.
-        // Demote near-straight routes to CONTINUE; pass through if route is off-axis enough
-        // that the rider physically feels the bend (route clamp guards against false demotion).
-        // Limited to non-road junctions (see bothNonRoadAtJunction).
+        // Shape 4 (sandwich) near-straight branch — alts on both sides of the route.
+        // No KEEP direction works. Demote near-straight routes to CONTINUE; pass
+        // through if the route is off-axis enough that the rider physically feels
+        // the bend. The "near-straight" clamp scales with the narrowest sandwich
+        // arm (see shape4RouteClampFor): a wider fan widens the rider's perceived
+        // central zone, so the clamp linearly relaxes from 12° (default) up to 18°
+        // when both arms are clearly off. Limited to non-road junctions (see
+        // bothNonRoadAtJunction).
         if (leftOfRoute && rightOfRoute) {
-            if (Math.abs(routeDelta) <= REFRAMER_SHAPE4_ROUTE_CLAMP
+            double routeClamp = shape4RouteClampFor(routeDelta, altDeltas);
+            if (Math.abs(routeDelta) <= routeClamp
                     && bothNonRoadAtJunction(routeEdge)
                     && (decidedSign == Instruction.TURN_SLIGHT_LEFT
                         || decidedSign == Instruction.TURN_SLIGHT_RIGHT
@@ -1392,6 +1744,86 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     }
 
     /**
+     * Compute Shape 4's near-straight route clamp for this junction. Linearly
+     * relaxes from {@link #REFRAMER_SHAPE4_ROUTE_CLAMP_FLOOR} (12°) up to
+     * {@link #REFRAMER_SHAPE4_ROUTE_CLAMP_CEILING} (18°) as the narrowest sandwich
+     * arm grows from {@link #REFRAMER_SHAPE4_RELAX_GATE} (60°) to
+     * {@link #REFRAMER_SHAPE4_RELAX_FULL} (90°). Below the gate the floor applies
+     * (no relaxation); above the full point the ceiling applies (no further
+     * relaxation). The narrowest arm is the smaller of the closest left-of-route
+     * alt's |altDelta| and the closest right-of-route alt's |altDelta|; if either
+     * side has no alt the floor applies.
+     */
+    private static double shape4RouteClampFor(double routeDelta, List<Double> altDeltas) {
+        double closestLeftAbs = Double.POSITIVE_INFINITY;
+        double closestRightAbs = Double.POSITIVE_INFINITY;
+        for (double altDelta : altDeltas) {
+            double abs = Math.abs(altDelta);
+            if (altDelta > routeDelta + REFRAMER_ROUTE_NOISE_MARGIN) {
+                if (abs < closestLeftAbs) closestLeftAbs = abs;
+            } else if (altDelta < routeDelta - REFRAMER_ROUTE_NOISE_MARGIN) {
+                if (abs < closestRightAbs) closestRightAbs = abs;
+            }
+        }
+        if (closestLeftAbs == Double.POSITIVE_INFINITY
+                || closestRightAbs == Double.POSITIVE_INFINITY) {
+            return REFRAMER_SHAPE4_ROUTE_CLAMP_FLOOR;
+        }
+        double narrowestArm = Math.min(closestLeftAbs, closestRightAbs);
+        if (narrowestArm <= REFRAMER_SHAPE4_RELAX_GATE) return REFRAMER_SHAPE4_ROUTE_CLAMP_FLOOR;
+        if (narrowestArm >= REFRAMER_SHAPE4_RELAX_FULL) return REFRAMER_SHAPE4_ROUTE_CLAMP_CEILING;
+        double t = (narrowestArm - REFRAMER_SHAPE4_RELAX_GATE)
+                / (REFRAMER_SHAPE4_RELAX_FULL - REFRAMER_SHAPE4_RELAX_GATE);
+        return REFRAMER_SHAPE4_ROUTE_CLAMP_FLOOR
+                + t * (REFRAMER_SHAPE4_ROUTE_CLAMP_CEILING - REFRAMER_SHAPE4_ROUTE_CLAMP_FLOOR);
+    }
+
+    /**
+     * Compute Shape 6's route-angle cap given the closest same-side anchor's
+     * absolute magnitude. Linearly tapers from {@link #SHAPE6_ROUTE_CAP_ANCHORED_MAX}
+     * (70°) down to {@link #SHAPE6_ROUTE_CAP_UNANCHORED} (55°) as the anchor grows
+     * from {@link #SHAPE6_ANCHOR_FULL_CAP_THRESHOLD} (100°) to
+     * {@link #SHAPE6_ANCHOR_NO_CAP_THRESHOLD} (130°). Below the full-cap threshold
+     * the maximum applies; above the no-cap threshold the cap collapses to the
+     * unanchored value (anchor is perceptually "tight" and no label-separation
+     * benefit remains).
+     */
+    private static double shape6AnchoredCap(double anchorAbs) {
+        if (anchorAbs <= SHAPE6_ANCHOR_FULL_CAP_THRESHOLD) {
+            return SHAPE6_ROUTE_CAP_ANCHORED_MAX;
+        }
+        if (anchorAbs >= SHAPE6_ANCHOR_NO_CAP_THRESHOLD) {
+            return SHAPE6_ROUTE_CAP_UNANCHORED;
+        }
+        double t = (anchorAbs - SHAPE6_ANCHOR_FULL_CAP_THRESHOLD)
+                / (SHAPE6_ANCHOR_NO_CAP_THRESHOLD - SHAPE6_ANCHOR_FULL_CAP_THRESHOLD);
+        return SHAPE6_ROUTE_CAP_ANCHORED_MAX
+                + t * (SHAPE6_ROUTE_CAP_UNANCHORED - SHAPE6_ROUTE_CAP_ANCHORED_MAX);
+    }
+
+    /**
+     * Compute Shape 6's opposite-side soft-zone cap given the closest opposite-side
+     * alt magnitude in [{@link #SHAPE6_OPPOSITE_TOLERANCE} (20°),
+     * {@link #SHAPE6_OPPOSITE_SOFT_MAX} (35°)]. Linearly ramps from
+     * {@link #REFRAMER_REAL_TURN_CUTOFF} (40°, the lower bound of sign ±2 — so the
+     * cap effectively forbids firing) at 20° up to {@link #SHAPE6_ROUTE_CAP_UNANCHORED}
+     * (55°) at 35°. The closer the opposite-side alt is to the 20° boundary, the
+     * stronger the Y-fork perception and the tighter the cap.
+     */
+    private static double shape6OppositeSoftCap(double oppositeAbs) {
+        if (oppositeAbs <= SHAPE6_OPPOSITE_TOLERANCE) {
+            return REFRAMER_REAL_TURN_CUTOFF;
+        }
+        if (oppositeAbs >= SHAPE6_OPPOSITE_SOFT_MAX) {
+            return SHAPE6_ROUTE_CAP_UNANCHORED;
+        }
+        double t = (oppositeAbs - SHAPE6_OPPOSITE_TOLERANCE)
+                / (SHAPE6_OPPOSITE_SOFT_MAX - SHAPE6_OPPOSITE_TOLERANCE);
+        return REFRAMER_REAL_TURN_CUTOFF
+                + t * (SHAPE6_ROUTE_CAP_UNANCHORED - REFRAMER_REAL_TURN_CUTOFF);
+    }
+
+    /**
      * Whether neither side of the junction is road infrastructure (motorway / major
      * road / minor road / service road). Used to gate Shape 1 side-turn and Shape 4
      * sandwich demotions — the reframer's demote-to-CONTINUE logic targets trail-
@@ -1434,23 +1866,35 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     /**
      * Collect visible alts at {@code baseNode} (the junction node). Walks the
      * unfiltered explorer to catch access-blocked-but-visible alts, then applies
-     * forward-cone and surface visibility gates.
+     * surface visibility and forward-cone gates. Visually-similar alts (same PH
+     * bucket per {@link #isConfusableFrom} AND same surface major) get an extended
+     * cone admission into the back-leg zone — the rider perceives them as real
+     * forward branches even when OSM mis-draws the angle as sharper than reality.
      */
     private List<Double> collectVisualAltDeltas(int baseNode, EdgeIteratorState routeEdge,
                                                  PredictedSurface routeSurface) {
         List<Double> deltas = new ArrayList<>();
+        PredictedHighway routePH = predictedHighwayEnc != null
+                ? routeEdge.get(predictedHighwayEnc) : null;
+        PredictedSurface prevSurface = (prevEdge != null && predictedSurfaceEnc != null)
+                ? prevEdge.get(predictedSurfaceEnc) : null;
         EdgeIterator iter = allExplorer.setBaseNode(baseNode);
         while (iter.next()) {
             if (iter.getEdge() == routeEdge.getEdge()) continue;
             if (prevEdge != null && iter.getEdge() == prevEdge.getEdge()) continue;
 
-            // Surface visibility: drop alts whose major surface clearly differs.
-            // Treat ASPHALT_OR_UNPAVED (unknown) as ambiguous — always keep.
-            if (predictedSurfaceEnc != null && routeSurface != null
-                    && routeSurface != PredictedSurface.ASPHALT_OR_UNPAVED) {
+            // Surface visibility: an alt counts as visually similar if it matches
+            // either the rider's prev edge surface OR the route's surface — the
+            // rider's frame of reference at the junction spans both. Drop only when
+            // surface evidence from BOTH sides is available and BOTH sides clearly
+            // reject the alt. ASPHALT_OR_UNPAVED at any of the three positions is
+            // ambiguous (no signal); surfacesClearlyDiffer already returns false in
+            // that case, so a side with unknown surface cannot contribute a
+            // contradiction.
+            if (predictedSurfaceEnc != null) {
                 PredictedSurface altSurface = iter.get(predictedSurfaceEnc);
-                if (altSurface != PredictedSurface.ASPHALT_OR_UNPAVED
-                        && isAsphalt(altSurface) != isAsphalt(routeSurface)) {
+                if (surfacesClearlyDiffer(altSurface, prevSurface)
+                        && surfacesClearlyDiffer(altSurface, routeSurface)) {
                     continue;
                 }
             }
@@ -1458,9 +1902,20 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(iter, nodeAccess);
             double altDelta = InstructionsHelper.calculateOrientationDelta(
                     prevLat, prevLon, altPoint.getLat(), altPoint.getLon(), prevOrientation);
+            double absAlt = Math.abs(altDelta);
 
-            // Forward cone: drop back-legs and clearly-sharp side-turns.
-            if (Math.abs(altDelta) > REFRAMER_FORWARD_CONE) continue;
+            // Forward cone: standard 75° admission. Visually-similar alts (same PH
+            // bucket + same surface major — surface already gated above) get an
+            // extended cone up to 115°: OSM imprecision can mis-draw genuinely
+            // forward-perceptible turns (~85–90°) as back-leg-zone angles, and
+            // when the alt is the same type/surface as the route the rider
+            // perceives it as a real forward branch despite the geometric angle.
+            if (absAlt > REFRAMER_FORWARD_CONE) {
+                if (absAlt > REFRAMER_VISUAL_SIMILAR_CONE) continue;
+                if (predictedHighwayEnc == null || routePH == null) continue;
+                PredictedHighway altPH = iter.get(predictedHighwayEnc);
+                if (altPH == null || !isConfusableFrom(routePH, altPH)) continue;
+            }
 
             deltas.add(altDelta);
         }
