@@ -1,0 +1,437 @@
+package com.graphhopper.trailmap.convert;
+
+import com.graphhopper.GHRequest;
+import com.graphhopper.GHResponse;
+import com.graphhopper.GraphHopper;
+import com.graphhopper.ResponsePath;
+import com.graphhopper.matching.EdgeMatch;
+import com.graphhopper.util.CustomModel;
+import com.graphhopper.util.DistanceCalcEarth;
+import com.graphhopper.util.FetchMode;
+import com.graphhopper.util.PointList;
+import com.graphhopper.util.details.PathDetail;
+import com.graphhopper.util.shapes.GHPoint;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Stage 3 of the conversion pipeline.
+ *
+ * <p>Candidate waypoints are the snap points of matched observations within the region.
+ * The "expected edges" between any two candidates are the slice of matched EdgeMatches
+ * between the two observations' matched edges (inclusive). A probe is a {@code /route}
+ * call from candidate[i] to candidate[j] whose returned edge sequence is compared
+ * (interior) against this expected slice.
+ *
+ * <p>Algorithm (exponential extension + binary refinement) per region:
+ * <pre>
+ *   cursor = 0
+ *   chosen = [candidate[0]]
+ *   while cursor &lt; lastCandidate:
+ *       extend exponentially from cursor; record last passing index `lastOk`
+ *       binary-refine between lastOk+1 and last tried (or lastOk if everything passed)
+ *       append candidate[best]; cursor = best
+ * </pre>
+ *
+ * <p>Probe comparison tolerates one virtual edge on each side (QueryGraph inserts these
+ * at start/end snaps).
+ */
+public class RoutedRegionOptimizer {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(RoutedRegionOptimizer.class);
+
+    /** Hard cap on probe calls per region to prevent runaway. */
+    private static final int MAX_PROBES_PER_REGION = 400;
+
+    /** When true, the first few probes per region log expected vs actual edge sequences. */
+    private static final boolean DEBUG_FIRST_PROBES = false;
+    private static final int DEBUG_PROBE_LIMIT = 3;
+
+    /**
+     * Max allowed point-wise deviation (m) between GH /route's polyline and the matched
+     * polyline for the geometric-similarity fallback. When strict edge-ID comparison
+     * fails (typical case: MapMatching's HMM picked a different edge sequence than
+     * GH /route for the same endpoints) but the two polylines stay close geographically,
+     * we accept the probe — both paths represent essentially the same physical route.
+     */
+    private static final double GEOMETRIC_FALLBACK_MAX_DEV_M = 15.0;
+
+    /**
+     * Max allowed length-ratio mismatch between GH /route's distance and the matched
+     * path's distance for the geometric fallback to consider them "the same path".
+     * If they differ by more than this fraction, they're topologically different routes
+     * (e.g. a straight shortcut vs a long detour around an obstacle) — reject before
+     * the geometric proximity check, which can otherwise be fooled by detour polylines
+     * that happen to pass near the shortcut at various points.
+     */
+    private static final double GEOMETRIC_FALLBACK_MAX_LEN_RATIO_DIFF = 0.20;
+
+    private static final DistanceCalcEarth DIST = DistanceCalcEarth.DIST_EARTH;
+
+    private final GraphHopper graphHopper;
+
+    public RoutedRegionOptimizer(GraphHopper graphHopper) {
+        this.graphHopper = graphHopper;
+    }
+
+    /**
+     * Result of optimization: chosen waypoints + per-leg distances.
+     * Leg {@code i} is from waypoints[i] to waypoints[i+1].
+     */
+    public record Result(List<GHPoint> waypoints, List<Double> legDistancesM) {
+        public double totalDistanceM() {
+            return legDistancesM.stream().mapToDouble(Double::doubleValue).sum();
+        }
+    }
+
+    private int debugProbesLogged = 0;
+
+    public Result optimize(TrackRegion.Matched region, String profile, CustomModel customModel) {
+        debugProbesLogged = 0;
+        List<GHPoint> candidates = region.obsSnapPoints();
+        int[] candEdgeIdx = region.obsEdgeIdxInSlice();
+        List<EdgeMatch> edges = region.edgeMatches();
+
+        if (candidates.size() < 2 || edges.isEmpty()) {
+            // Degenerate: nothing to optimize. Return start + end snap as the route.
+            return new Result(List.of(region.startSnap(), region.endSnap()),
+                    List.of(region.matchedLengthM()));
+        }
+
+        // Pre-extract edge IDs from the slice
+        int[] sliceEdgeIds = new int[edges.size()];
+        for (int i = 0; i < edges.size(); i++) {
+            sliceEdgeIds[i] = edges.get(i).getEdgeState().getEdge();
+        }
+
+        // De-duplicate consecutive candidates that snap to the same edge AND are very close
+        // (within a few meters). These add no information to the optimization.
+        // Always keep first and last candidates.
+
+        List<GHPoint> chosen = new ArrayList<>();
+        List<Double> legs = new ArrayList<>();
+        chosen.add(candidates.get(0));
+
+        int cursor = 0; // index into `candidates`
+        int probes = 0;
+        final int lastCand = candidates.size() - 1;
+
+        while (cursor < lastCand) {
+            // Exponential extension from cursor
+            int step = 1;
+            int lastOk = -1;
+            double lastOkRouteM = 0;
+            int lastTried = cursor;
+
+            while (true) {
+                // Determine next probe target. When step overshoots lastCand, clamp to
+                // lastCand for one final attempt — otherwise we'd settle at the last
+                // successful "step" and leave the endpoint unreached, producing an
+                // unnecessary trailing routed sub-segment.
+                int probeIdx;
+                boolean clampedToEnd;
+                if (cursor + step <= lastCand) {
+                    probeIdx = cursor + step;
+                    clampedToEnd = false;
+                } else if (lastTried < lastCand) {
+                    probeIdx = lastCand;
+                    clampedToEnd = true;
+                } else {
+                    break;
+                }
+                lastTried = probeIdx;
+                ProbeResult pr = probe(candidates, candEdgeIdx, sliceEdgeIds, edges,
+                        cursor, probeIdx, profile, customModel);
+                probes++;
+                if (pr.ok) {
+                    lastOk = probeIdx;
+                    lastOkRouteM = pr.distanceM;
+                    if (probeIdx == lastCand) break;
+                    step *= 2;
+                } else {
+                    break;
+                }
+                if (clampedToEnd) break;
+                if (probes >= MAX_PROBES_PER_REGION) break;
+            }
+
+            if (lastOk < 0) {
+                // No extension worked even by 1 — force a single step (matched edges must be
+                // traversable at the smallest granularity). Use a permissive probe to get a
+                // distance estimate; if that also fails, fall back to the matched-path length
+                // for this leg.
+                int next = cursor + 1;
+                ProbeResult pr = probe(candidates, candEdgeIdx, sliceEdgeIds, edges,
+                        cursor, next, profile, customModel);
+                probes++;
+                double dist;
+                if (pr.ok) {
+                    dist = pr.distanceM;
+                } else {
+                    // Fall back: sum matched-edge lengths between cursor and next
+                    int from = candEdgeIdx[cursor];
+                    int to = candEdgeIdx[next];
+                    dist = 0;
+                    for (int e = Math.min(from, to); e <= Math.max(from, to); e++) {
+                        dist += edges.get(e).getEdgeState().getDistance();
+                    }
+                    LOGGER.debug("optimize: forced step {} → {} (probe failed; using matched length {}m)",
+                            cursor, next, String.format("%.1f", dist));
+                }
+                chosen.add(candidates.get(next));
+                legs.add(dist);
+                cursor = next;
+                if (probes >= MAX_PROBES_PER_REGION) break;
+                continue;
+            }
+
+            // Binary refine between lastOk+1 (known not yet accepted) and lastTried (last failed)
+            int lo = lastOk + 1;
+            int hi = lastTried;
+            int best = lastOk;
+            double bestDist = lastOkRouteM;
+            while (lo <= hi) {
+                int mid = (lo + hi) / 2;
+                ProbeResult pr = probe(candidates, candEdgeIdx, sliceEdgeIds, edges,
+                        cursor, mid, profile, customModel);
+                probes++;
+                if (pr.ok) {
+                    best = mid;
+                    bestDist = pr.distanceM;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+                if (probes >= MAX_PROBES_PER_REGION) break;
+            }
+
+            chosen.add(candidates.get(best));
+            legs.add(bestDist);
+            cursor = best;
+
+            if (probes >= MAX_PROBES_PER_REGION) {
+                LOGGER.warn("optimize: hit probe cap {} for region [{}..{}]; stopping early",
+                        MAX_PROBES_PER_REGION, region.firstObservation(), region.lastObservation());
+                break;
+            }
+        }
+
+        LOGGER.debug("optimize: region [{}..{}] {} candidates → {} waypoints in {} probes",
+                region.firstObservation(), region.lastObservation(),
+                candidates.size(), chosen.size(), probes);
+        return new Result(chosen, legs);
+    }
+
+    private record ProbeResult(boolean ok, double distanceM) {}
+
+    /**
+     * Route from candidate[start] to candidate[end] and compare the resulting edge
+     * sequence to the matched-edge slice between their EdgeMatch indices.
+     *
+     * <p>The expected slice is {@code sliceEdgeIds[candEdgeIdx[start] .. candEdgeIdx[end]]}
+     * (inclusive). Tolerates one virtual edge at the start and up to two at the end of the
+     * route's edge_id sequence (QueryGraph inserts these at snap points).
+     */
+    private ProbeResult probe(List<GHPoint> candidates,
+                              int[] candEdgeIdx,
+                              int[] sliceEdgeIds,
+                              List<EdgeMatch> sliceEdges,
+                              int start, int end,
+                              String profile, CustomModel customModel) {
+        boolean dbg = DEBUG_FIRST_PROBES && debugProbesLogged < DEBUG_PROBE_LIMIT;
+        GHPoint pStart = candidates.get(start);
+        GHPoint pEnd = candidates.get(end);
+        int eFrom = Math.min(candEdgeIdx[start], candEdgeIdx[end]);
+        int eTo = Math.max(candEdgeIdx[start], candEdgeIdx[end]);
+        if (dbg) {
+            debugProbesLogged++;
+            StringBuilder exp = new StringBuilder();
+            for (int e = eFrom; e <= eTo; e++) {
+                if (exp.length() > 0) exp.append(',');
+                exp.append(sliceEdgeIds[e]);
+            }
+            LOGGER.info("PROBE start={} ({},{}) end={} ({},{}) expected edges[{}..{}]=[{}]",
+                    start, String.format("%.6f", pStart.lat), String.format("%.6f", pStart.lon),
+                    end, String.format("%.6f", pEnd.lat), String.format("%.6f", pEnd.lon),
+                    eFrom, eTo, exp);
+        }
+
+        GHRequest req = new GHRequest(pStart, pEnd);
+        req.setProfile(profile);
+        if (customModel != null) {
+            req.setCustomModel(customModel);
+        }
+        req.setPathDetails(List.of("edge_id"));
+        req.putHint("instructions", false);
+        req.putHint("calc_points", true);
+
+        GHResponse rsp;
+        try {
+            rsp = graphHopper.route(req);
+        } catch (Exception e) {
+            if (dbg) LOGGER.info("PROBE → routing threw: {}", e.getMessage());
+            return new ProbeResult(false, 0);
+        }
+        if (rsp.hasErrors()) {
+            if (dbg) LOGGER.info("PROBE → response has errors: {}",
+                    rsp.getErrors().stream().map(Throwable::getMessage).toList());
+            return new ProbeResult(false, 0);
+        }
+        ResponsePath path = rsp.getBest();
+        List<PathDetail> details = path.getPathDetails().get("edge_id");
+        if (details == null || details.isEmpty()) {
+            if (dbg) LOGGER.info("PROBE → no edge_id details, distance={}m",
+                    String.format("%.1f", path.getDistance()));
+            return new ProbeResult(false, 0);
+        }
+
+        // Dedup consecutive identical edge IDs
+        int[] routeEdges = new int[details.size()];
+        int routeLen = 0;
+        int prev = Integer.MIN_VALUE;
+        for (PathDetail d : details) {
+            int eid = ((Number) d.getValue()).intValue();
+            if (eid != prev) {
+                routeEdges[routeLen++] = eid;
+                prev = eid;
+            }
+        }
+        if (routeLen == 0) return new ProbeResult(false, 0);
+
+        if (dbg) {
+            StringBuilder act = new StringBuilder();
+            for (int i = 0; i < routeLen; i++) {
+                if (act.length() > 0) act.append(',');
+                act.append(routeEdges[i]);
+            }
+            LOGGER.info("PROBE → actual edges[{}]=[{}] dist={}m",
+                    routeLen, act, String.format("%.1f", path.getDistance()));
+        }
+
+        // Special case: both candidates on the same edge → route should traverse just that one edge.
+        // If routeEdges contains that edge anywhere (typically as the only "real" edge between
+        // virtual connectors), accept.
+        if (eFrom == eTo) {
+            int target = sliceEdgeIds[eFrom];
+            for (int i = 0; i < routeLen; i++) {
+                if (routeEdges[i] == target) return new ProbeResult(true, path.getDistance());
+            }
+            return geometricFallback(sliceEdges, eFrom, eTo, path);
+        }
+
+        // Find first expected edge inside the route (skip up to 1 leading virtual edge)
+        int target0 = sliceEdgeIds[eFrom];
+        int rIdx = -1;
+        for (int i = 0; i < Math.min(2, routeLen); i++) {
+            if (routeEdges[i] == target0) { rIdx = i; break; }
+        }
+        if (rIdx < 0) return geometricFallback(sliceEdges, eFrom, eTo, path);
+
+        // Walk through the expected sequence; route must produce it in order.
+        for (int e = eFrom; e <= eTo; e++) {
+            if (rIdx >= routeLen) return geometricFallback(sliceEdges, eFrom, eTo, path);
+            if (routeEdges[rIdx] != sliceEdgeIds[e]) return geometricFallback(sliceEdges, eFrom, eTo, path);
+            rIdx++;
+        }
+        // Allow up to 2 trailing extras (snap-to-edge virtual connectors at the end snap)
+        if (routeLen - rIdx > 2) return geometricFallback(sliceEdges, eFrom, eTo, path);
+
+        return new ProbeResult(true, path.getDistance());
+    }
+
+    /**
+     * Geometric similarity fallback. When strict edge-ID comparison fails, build the
+     * expected polyline by concatenating the matched-edge geometries in the slice range
+     * and compute the maximum distance from any GH /route polyline vertex to the matched
+     * polyline. If it stays under {@link #GEOMETRIC_FALLBACK_MAX_DEV_M}, the two paths
+     * are physically the same route under different edge IDs (typically a MapMatching
+     * HMM artifact where its path output picks edges that differ from the per-observation
+     * snap edges); accept the probe.
+     */
+    private ProbeResult geometricFallback(List<EdgeMatch> sliceEdges, int eFrom, int eTo,
+                                          ResponsePath path) {
+        // Length-ratio gate. If GH /route's distance differs significantly from the
+        // matched-path distance for the same slice, they're topologically different
+        // routes (e.g. a 152m straight shortcut vs a 530m road detour around a railway).
+        // The point-wise geometric check below can be fooled in such cases because the
+        // shortcut may pass near pieces of the detour polyline geographically. Reject
+        // here so the optimizer doesn't accept a path that's plainly a different route.
+        double expectedLen = 0;
+        for (int i = eFrom; i <= eTo; i++) {
+            expectedLen += sliceEdges.get(i).getEdgeState().getDistance();
+        }
+        double routeLen = path.getDistance();
+        if (expectedLen > 0) {
+            double ratioDiff = Math.abs(routeLen - expectedLen) / Math.max(routeLen, expectedLen);
+            if (ratioDiff > GEOMETRIC_FALLBACK_MAX_LEN_RATIO_DIFF) {
+                return new ProbeResult(false, 0);
+            }
+        }
+
+        PointList expected = new PointList(64, false);
+        for (int i = eFrom; i <= eTo; i++) {
+            PointList g = sliceEdges.get(i).getEdgeState().fetchWayGeometry(
+                    i == eFrom ? FetchMode.ALL : FetchMode.PILLAR_AND_ADJ);
+            for (int j = 0; j < g.size(); j++) {
+                expected.add(g.getLat(j), g.getLon(j));
+            }
+        }
+        if (expected.size() < 2) return new ProbeResult(false, 0);
+
+        PointList route = path.getPoints();
+        if (route.size() < 2) return new ProbeResult(false, 0);
+
+        // Max distance from any GH-route point to the matched polyline.
+        double maxDev = 0;
+        for (int i = 0; i < route.size(); i++) {
+            double d = pointToPolylineDistance(route.getLat(i), route.getLon(i), expected);
+            if (d > maxDev) maxDev = d;
+            if (maxDev > GEOMETRIC_FALLBACK_MAX_DEV_M) {
+                return new ProbeResult(false, 0); // early exit
+            }
+        }
+        return new ProbeResult(true, path.getDistance());
+    }
+
+    /** Min distance from a single point to a polyline (perpendicular-to-segment, clamped). */
+    private static double pointToPolylineDistance(double pLat, double pLon, PointList line) {
+        double min = Double.POSITIVE_INFINITY;
+        for (int i = 0; i + 1 < line.size(); i++) {
+            double d = pointToSegmentDistance(pLat, pLon,
+                    line.getLat(i), line.getLon(i),
+                    line.getLat(i + 1), line.getLon(i + 1));
+            if (d < min) min = d;
+        }
+        return min;
+    }
+
+    /** Perpendicular point-to-segment distance in meters, clamped to segment endpoints. */
+    private static double pointToSegmentDistance(double pLat, double pLon,
+                                                 double aLat, double aLon,
+                                                 double bLat, double bLon) {
+        // Local equirectangular projection — accurate at the scales we test.
+        double meanLatRad = Math.toRadians((aLat + bLat) * 0.5);
+        double mPerDegLat = 111_320.0;
+        double mPerDegLon = 111_320.0 * Math.cos(meanLatRad);
+
+        double ax = aLon * mPerDegLon, ay = aLat * mPerDegLat;
+        double bx = bLon * mPerDegLon, by = bLat * mPerDegLat;
+        double px = pLon * mPerDegLon, py = pLat * mPerDegLat;
+
+        double dx = bx - ax, dy = by - ay;
+        double segLenSq = dx * dx + dy * dy;
+        if (segLenSq == 0) {
+            return DIST.calcDist(pLat, pLon, aLat, aLon);
+        }
+        double t = ((px - ax) * dx + (py - ay) * dy) / segLenSq;
+        if (t < 0) t = 0;
+        else if (t > 1) t = 1;
+        double cx = ax + t * dx;
+        double cy = ay + t * dy;
+        double ex = px - cx, ey = py - cy;
+        return Math.sqrt(ex * ex + ey * ey);
+    }
+}

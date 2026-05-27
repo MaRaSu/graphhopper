@@ -1,0 +1,439 @@
+package com.graphhopper.trailmap.convert;
+
+import com.graphhopper.GHRequest;
+import com.graphhopper.GHResponse;
+import com.graphhopper.GraphHopper;
+import com.graphhopper.ResponsePath;
+import com.graphhopper.matching.EdgeMatch;
+import com.graphhopper.util.CustomModel;
+import com.graphhopper.util.details.PathDetail;
+import com.graphhopper.util.shapes.GHPoint;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Stage 3 of the conversion pipeline. Given one {@link TrackRegion.Matched}, choose the
+ * minimum waypoint subset such that calling {@code /route} between consecutive chosen
+ * waypoints reproduces the user's path for the region.
+ *
+ * <h2>Probe verdict — the edge_key rule</h2>
+ *
+ * <p>For each probe from {@code candidate[i]} to {@code candidate[j]}, build an
+ * <i>expected</i> edge_key sequence {@code E} from a per-region {@link ReferenceMode
+ * reference} (see below), call {@code /route(snap[i], snap[j])} with the rendering
+ * profile to get the <i>actual</i> edge_key sequence {@code A}, and apply:
+ *
+ * <p><b>PASS iff {@code A == E[x..len(E)-y]} for some {@code x, y ∈ {0,1}}.</b>
+ *
+ * <p>The {@code x,y} tolerance handles the snap-at-junction case where {@code /route}
+ * doesn't materially traverse the boundary edge (snap landed at the edge's exit node).
+ * Otherwise the rule is strict.
+ *
+ * <h2>Reference choice — {@link ReferenceMode}</h2>
+ *
+ * <p>What does "expected" mean? Two options, switchable per construction:
+ *
+ * <ul>
+ *   <li>{@link ReferenceMode#ROUTE_GROUND_TRUTH} (default). Use
+ *       {@code /route(all_snaps_in_region)} with the rendering profile as the reference.
+ *       Each probe compares against the corresponding range of that ground-truth route.
+ *       <b>Profile-invariant</b> (matcher's matching_profile irrelevant), and tolerant
+ *       of micro-edge ID differences at structurally complex graph nodes (crossings,
+ *       turn-restricted junctions, lane splits) that can arise when
+ *       {@code matching_profile != profile}. The matcher contributes only the snap
+ *       points (anchors); {@code /route} determines the edges between them.</li>
+ *   <li>{@link ReferenceMode#MATCHER_EDGES}. Use the matcher's {@code EdgeMatch} slice
+ *       as the reference (original behavior). Fails when matcher and {@code /route}
+ *       pick different micro-edges through the same junction due to profile
+ *       differences, even when both produce visually identical rendered paths.</li>
+ * </ul>
+ *
+ * <p>The two strategies are factored as inner {@link RegionReference} implementations
+ * so a future hybrid (e.g., ground-truth with a geographic-deviation fallback to
+ * coords when {@code /route} picks a path far from the matcher's geometry) can be added
+ * alongside without disturbing what's here.
+ *
+ * <h2>Search</h2>
+ *
+ * <p>Exponential extension + binary refinement per region. When the smallest possible
+ * probe ({@code cursor → cursor+1}) fails the rule, the leg is emitted as a
+ * <b>coordinates segment</b> (see {@link Result#legIsCoords()}) instead of forcing a
+ * routed leg through whatever path {@code /route} picks.
+ */
+public class RoutedRegionOptimizer {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(RoutedRegionOptimizer.class);
+
+    /** Hard cap on probe calls per region to prevent runaway. */
+    private static final int MAX_PROBES_PER_REGION = 400;
+
+    /**
+     * Which reference the probe rule should compare {@code /route}'s output against.
+     * See class-level javadoc.
+     */
+    public enum ReferenceMode { MATCHER_EDGES, ROUTE_GROUND_TRUTH }
+
+    public static final ReferenceMode DEFAULT_REFERENCE_MODE = ReferenceMode.ROUTE_GROUND_TRUTH;
+
+    private final GraphHopper graphHopper;
+    private final ReferenceMode referenceMode;
+
+    public RoutedRegionOptimizer(GraphHopper graphHopper) {
+        this(graphHopper, DEFAULT_REFERENCE_MODE);
+    }
+
+    public RoutedRegionOptimizer(GraphHopper graphHopper, ReferenceMode referenceMode) {
+        this.graphHopper = graphHopper;
+        this.referenceMode = referenceMode;
+    }
+
+    public ReferenceMode getReferenceMode() {
+        return referenceMode;
+    }
+
+    /**
+     * Result of optimization. Each leg is either a routed leg (rendered by the client
+     * via {@code /route} between {@code waypoints[i]} and {@code waypoints[i+1]}) or a
+     * coordinates leg (raw GPX from {@code waypointObsIndices[i]} to
+     * {@code waypointObsIndices[i+1]}; escalation when the matcher's path can't be
+     * reproduced via {@code /route} at any granularity).
+     */
+    public record Result(
+            List<GHPoint> waypoints,
+            List<Integer> waypointObsIndices,
+            List<Double> legDistancesM,
+            List<Boolean> legIsCoords
+    ) {
+        public double totalDistanceM() {
+            return legDistancesM.stream().mapToDouble(Double::doubleValue).sum();
+        }
+    }
+
+    public Result optimize(TrackRegion.Matched region, String profile, CustomModel customModel) {
+        List<GHPoint> candidates = region.obsSnapPoints();
+        List<Integer> candObs = region.matchedObsIndices();
+
+        if (candidates.size() < 2 || region.edgeMatches().isEmpty()) {
+            // Degenerate. Return start + end snap as a single routed leg.
+            return new Result(
+                    List.of(region.startSnap(), region.endSnap()),
+                    List.of(region.firstObservation(), region.lastObservation()),
+                    List.of(region.matchedLengthM()),
+                    List.of(false));
+        }
+
+        // Build the per-region reference once (the strategy depends on referenceMode).
+        RegionReference ref = buildReference(region, profile, customModel);
+
+        List<GHPoint> chosenSnaps = new ArrayList<>();
+        List<Integer> chosenObs = new ArrayList<>();
+        List<Double> legDists = new ArrayList<>();
+        List<Boolean> legCoords = new ArrayList<>();
+        chosenSnaps.add(candidates.get(0));
+        chosenObs.add(candObs.get(0));
+
+        int cursor = 0;
+        final int lastCand = candidates.size() - 1;
+        int probes = 0;
+
+        while (cursor < lastCand) {
+            int step = 1;
+            int lastOk = -1;
+            double lastOkDist = 0;
+            int lastTried = cursor;
+
+            // Exponential extension.
+            while (true) {
+                int probeIdx = Math.min(cursor + step, lastCand);
+                if (probeIdx == lastTried && probeIdx != cursor + step) break;
+                lastTried = probeIdx;
+                ProbeOutcome po = probe(candidates, ref, cursor, probeIdx, profile, customModel);
+                probes++;
+                if (po.pass) {
+                    lastOk = probeIdx;
+                    lastOkDist = po.distanceM;
+                    if (probeIdx == lastCand) break;
+                    if (cursor + step >= lastCand) break;
+                    step *= 2;
+                } else {
+                    break;
+                }
+                if (probes >= MAX_PROBES_PER_REGION) break;
+            }
+
+            if (lastOk < 0) {
+                // Smallest probe (cursor → cursor+1) failed the rule: emit a coordinates
+                // leg between these two waypoints rather than forcing a routed segment
+                // through whatever path /route happened to pick.
+                int next = cursor + 1;
+                chosenSnaps.add(candidates.get(next));
+                chosenObs.add(candObs.get(next));
+                legDists.add(0.0); // converter computes coords-leg length from GPX
+                legCoords.add(true);
+                LOGGER.debug("optimize: escalate to COORDS at cand[{}]→cand[{}] (obs[{}]→obs[{}])",
+                        cursor, next, candObs.get(cursor), candObs.get(next));
+                cursor = next;
+                if (probes >= MAX_PROBES_PER_REGION) break;
+                continue;
+            }
+
+            // Binary refine between lastOk+1 and lastTried (if exponential extension overshot).
+            int best = lastOk;
+            double bestDist = lastOkDist;
+            if (lastTried > lastOk) {
+                int lo = lastOk + 1;
+                int hi = lastTried;
+                while (lo <= hi) {
+                    int mid = (lo + hi) / 2;
+                    ProbeOutcome po = probe(candidates, ref, cursor, mid, profile, customModel);
+                    probes++;
+                    if (po.pass) {
+                        best = mid;
+                        bestDist = po.distanceM;
+                        lo = mid + 1;
+                    } else {
+                        hi = mid - 1;
+                    }
+                    if (probes >= MAX_PROBES_PER_REGION) break;
+                }
+            }
+
+            chosenSnaps.add(candidates.get(best));
+            chosenObs.add(candObs.get(best));
+            legDists.add(bestDist);
+            legCoords.add(false);
+            cursor = best;
+
+            if (probes >= MAX_PROBES_PER_REGION) {
+                LOGGER.warn("optimize: hit probe cap {} for region [{}..{}]; stopping early",
+                        MAX_PROBES_PER_REGION, region.firstObservation(), region.lastObservation());
+                break;
+            }
+        }
+
+        LOGGER.debug("optimize[{}]: region [{}..{}] {} candidates → {} waypoints ({} routed + {} coords) in {} probes",
+                referenceMode, region.firstObservation(), region.lastObservation(),
+                candidates.size(), chosenSnaps.size(),
+                (int) legCoords.stream().filter(b -> !b).count(),
+                (int) legCoords.stream().filter(b -> b).count(),
+                probes);
+        return new Result(chosenSnaps, chosenObs, legDists, legCoords);
+    }
+
+    private RegionReference buildReference(TrackRegion.Matched region, String profile, CustomModel customModel) {
+        if (referenceMode == ReferenceMode.MATCHER_EDGES) {
+            return new MatcherEdgesReference(region);
+        }
+        // ROUTE_GROUND_TRUTH — try first, fall back to matcher reference if /route fails.
+        try {
+            return new RouteGroundTruthReference(graphHopper, region, profile, customModel);
+        } catch (RuntimeException e) {
+            LOGGER.warn("RouteGroundTruth reference build failed for region [{}..{}]; "
+                            + "falling back to matcher reference: {}",
+                    region.firstObservation(), region.lastObservation(), e.getMessage());
+            return new MatcherEdgesReference(region);
+        }
+    }
+
+    private record ProbeOutcome(boolean pass, double distanceM) {}
+
+    /**
+     * Probe: route from {@code candidate[start]} to {@code candidate[end]} and apply the
+     * edge_key rule against the per-region reference's expected sequence.
+     */
+    private ProbeOutcome probe(List<GHPoint> candidates,
+                               RegionReference ref,
+                               int start, int end,
+                               String profile, CustomModel customModel) {
+        GHPoint pStart = candidates.get(start);
+        GHPoint pEnd = candidates.get(end);
+
+        int[] E = ref.expected(start, end);
+
+        GHRequest req = new GHRequest(pStart, pEnd);
+        req.setProfile(profile);
+        if (customModel != null) req.setCustomModel(customModel);
+        req.setPathDetails(List.of("edge_key"));
+        req.putHint("instructions", false);
+        // calc_points must be true — edge_key PathDetail is empty when false.
+        req.putHint("calc_points", true);
+
+        GHResponse rsp;
+        try {
+            rsp = graphHopper.route(req);
+        } catch (Exception e) {
+            return new ProbeOutcome(false, 0);
+        }
+        if (rsp.hasErrors()) return new ProbeOutcome(false, 0);
+
+        ResponsePath path = rsp.getBest();
+        List<PathDetail> ekDetails = path.getPathDetails().get("edge_key");
+        if (ekDetails == null) return new ProbeOutcome(false, 0);
+
+        int[] A = dedupConsecutive(pdValuesInt(ekDetails));
+        boolean pass = applyEdgeKeyRule(E, A);
+        return new ProbeOutcome(pass, path.getDistance());
+    }
+
+    /**
+     * The comparison rule. Pass iff {@code A} equals {@code E} with at most one leading
+     * edge and one trailing edge dropped.
+     */
+    static boolean applyEdgeKeyRule(int[] E, int[] A) {
+        if (Arrays.equals(E, A)) return true;
+        for (int x = 0; x <= 1; x++) {
+            for (int y = 0; y <= 1; y++) {
+                if (x == 0 && y == 0) continue;
+                int remaining = E.length - x - y;
+                if (remaining < 0) continue;
+                if (remaining == 0) {
+                    if (A.length == 0) return true;
+                    continue;
+                }
+                int[] sub = Arrays.copyOfRange(E, x, E.length - y);
+                if (Arrays.equals(sub, A)) return true;
+            }
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Reference strategies — what the probe compares /route against.
+    // ------------------------------------------------------------------------
+
+    /**
+     * Source of the expected edge_key sequence per probe. Implementations decide what
+     * "expected" means; the probe compares the rendering-profile {@code /route}'s output
+     * against this expected sequence under the boundary-tolerant equality rule.
+     */
+    private interface RegionReference {
+        /**
+         * Expected edge_key sequence (dedup'd) for a probe from {@code candStart} to
+         * {@code candEnd}. Both ends are candidate indices in the region.
+         */
+        int[] expected(int candStart, int candEnd);
+    }
+
+    /**
+     * Original reference: use the matcher's {@code EdgeMatch} slice. Falls into trouble
+     * when {@code matching_profile != profile} causes the matcher and {@code /route} to
+     * pick different micro-edges through the same junction; see class-level javadoc.
+     */
+    private static final class MatcherEdgesReference implements RegionReference {
+        private final List<EdgeMatch> slice;
+        private final int[] candEdgeIdx;
+
+        MatcherEdgesReference(TrackRegion.Matched region) {
+            this.slice = region.edgeMatches();
+            this.candEdgeIdx = region.obsEdgeIdxInSlice();
+        }
+
+        @Override
+        public int[] expected(int candStart, int candEnd) {
+            int eFrom = Math.min(candEdgeIdx[candStart], candEdgeIdx[candEnd]);
+            int eTo = Math.max(candEdgeIdx[candStart], candEdgeIdx[candEnd]);
+            int[] keys = new int[eTo - eFrom + 1];
+            for (int i = eFrom; i <= eTo; i++) {
+                keys[i - eFrom] = slice.get(i).getEdgeState().getEdgeKey();
+            }
+            return dedupConsecutive(keys);
+        }
+    }
+
+    /**
+     * OSRM-style ground truth: one {@code /route} call with ALL region snap points as
+     * via-points, using the rendering profile. The per-leg edge_keys are extracted from
+     * the response and concatenated for multi-step probes. The matcher's matching
+     * profile is irrelevant; only the snap points are consumed.
+     */
+    private static final class RouteGroundTruthReference implements RegionReference {
+        private final int[][] legKeys;
+
+        RouteGroundTruthReference(GraphHopper gh,
+                                  TrackRegion.Matched region,
+                                  String profile, CustomModel customModel) {
+            List<GHPoint> snaps = region.obsSnapPoints();
+            GHRequest req = new GHRequest(snaps);
+            req.setProfile(profile);
+            if (customModel != null) req.setCustomModel(customModel);
+            req.setPathDetails(List.of("edge_key"));
+            req.putHint("instructions", false);
+            req.putHint("calc_points", true);
+
+            GHResponse rsp = gh.route(req);
+            if (rsp.hasErrors()) {
+                throw new RuntimeException("ground-truth /route hasErrors: " + rsp.getErrors());
+            }
+            ResponsePath path = rsp.getBest();
+            List<Integer> wpIndices = path.getWaypointIndices();
+            List<PathDetail> ek = path.getPathDetails().get("edge_key");
+            if (wpIndices == null || wpIndices.size() < 2 || ek == null) {
+                throw new RuntimeException("ground-truth /route missing waypointIndices or edge_key");
+            }
+
+            // For each leg (i → i+1), collect edge_keys whose interval [first, last]
+            // overlaps with the leg's polyline range [wpIndices[i], wpIndices[i+1]].
+            // An edge straddling a via-boundary will appear in both adjacent legs and
+            // get dedup'd at concatenation time.
+            int legCount = wpIndices.size() - 1;
+            this.legKeys = new int[legCount][];
+            for (int leg = 0; leg < legCount; leg++) {
+                int legStart = wpIndices.get(leg);
+                int legEnd = wpIndices.get(leg + 1);
+                List<Integer> keys = new ArrayList<>();
+                for (PathDetail d : ek) {
+                    int dFirst = d.getFirst();
+                    int dLast = d.getLast();
+                    if (dFirst < legEnd && dLast > legStart) {
+                        keys.add(((Number) d.getValue()).intValue());
+                    }
+                }
+                int[] arr = new int[keys.size()];
+                for (int k = 0; k < keys.size(); k++) arr[k] = keys.get(k);
+                legKeys[leg] = dedupConsecutive(arr);
+            }
+        }
+
+        @Override
+        public int[] expected(int candStart, int candEnd) {
+            // Concatenate legs[candStart..candEnd-1], then dedup at the seams.
+            List<Integer> all = new ArrayList<>();
+            for (int leg = candStart; leg < candEnd && leg < legKeys.length; leg++) {
+                for (int k : legKeys[leg]) all.add(k);
+            }
+            int[] arr = new int[all.size()];
+            for (int i = 0; i < arr.length; i++) arr[i] = all.get(i);
+            return dedupConsecutive(arr);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------------
+
+    private static int[] dedupConsecutive(int[] xs) {
+        if (xs.length == 0) return xs;
+        int[] out = new int[xs.length];
+        int n = 0;
+        int prev = Integer.MIN_VALUE;
+        for (int x : xs) {
+            if (x != prev) {
+                out[n++] = x;
+                prev = x;
+            }
+        }
+        return Arrays.copyOf(out, n);
+    }
+
+    private static int[] pdValuesInt(List<PathDetail> details) {
+        int[] out = new int[details.size()];
+        for (int i = 0; i < details.size(); i++) {
+            out[i] = ((Number) details.get(i).getValue()).intValue();
+        }
+        return out;
+    }
+}

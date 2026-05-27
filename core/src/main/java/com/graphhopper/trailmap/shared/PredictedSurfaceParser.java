@@ -146,7 +146,10 @@ public class PredictedSurfaceParser implements TagParser {
     // =====================================================================
 
     // --- ASPHALT rule ---
-    // anyOf: [ASPHALT, MOTORWAY, MAJOR_ROAD, SECONDARY_ROAD_NO_SURFACE]
+    // anyOf: [ASPHALT, MOTORWAY, MAJOR_ROAD]
+    // Secondary is intentionally NOT here: secondary with no surface is AMBIGUOUS (rule 2b),
+    // and secondary with explicit unpaved surface routes to COMPACTED (rule 3) per road-network
+    // business logic — only motorway/trunk/primary default to ASPHALT.
     private boolean matchesAsphaltRule(ReaderWay way) {
         String surface = way.getTag("surface");
         String highway = way.getTag("highway");
@@ -163,11 +166,6 @@ public class PredictedSurfaceParser implements TagParser {
 
         // MAJOR_ROAD: highway in [trunk, trunk_link, primary, primary_link]
         if (highway != null && MAJOR_ROAD_HIGHWAYS.contains(highway)) {
-            return true;
-        }
-
-        // SECONDARY_ROAD_NO_SURFACE: highway in [secondary, secondary_link] AND no surface
-        if (highway != null && SECONDARY_HIGHWAYS.contains(highway) && surface == null) {
             return true;
         }
 
@@ -416,20 +414,20 @@ public class PredictedSurfaceParser implements TagParser {
         Arrays.asList("trunk", "trunk_link", "primary", "primary_link")
     );
 
-    private static final Set<String> SECONDARY_HIGHWAYS = new HashSet<>(
-        Arrays.asList("secondary", "secondary_link")
-    );
-
     private static final Set<String> AMBIGUOUS_SURFACE_HIGHWAYS = new HashSet<>(
-        Arrays.asList("tertiary", "unclassified", "residential", "service", "cycleway", "footway")
+        Arrays.asList("secondary", "secondary_link", "tertiary", "tertiary_link",
+                      "unclassified", "residential", "service", "cycleway", "footway")
     );
 
     private static final Set<String> LIKELY_COMPACT_HIGHWAYS = new HashSet<>(
-        Arrays.asList("tertiary", "unclassified", "residential")
+        Arrays.asList("secondary", "secondary_link", "tertiary", "tertiary_link",
+                      "unclassified", "residential")
     );
 
     private static final Set<String> UNPAVED_COMPACT_SURFACES = new HashSet<>(
-        Arrays.asList("unpaved", "gravel", "sand", "mud", "fine_gravel")
+        // fine_gravel intentionally excluded — owned by rule 5 (FINE_GRAVEL) so it
+        // resolves to FINE_GRAVEL on road-network highways instead of being absorbed here.
+        Arrays.asList("unpaved", "gravel", "sand", "mud")
     );
 
     private static final Set<String> EXCELLENT_GOOD_SMOOTHNESS_VALUES = new HashSet<>(

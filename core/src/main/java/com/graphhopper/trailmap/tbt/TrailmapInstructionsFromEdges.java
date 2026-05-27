@@ -604,6 +604,15 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         // Only suppresses on named ways or road-like infrastructure — unnamed trails need fork guidance.
         // CYCLEWAY excluded from both: unpaved Finnish cycleways have informal names (route
         // names like "Pyynikin rantapolku") that don't help distinguish Y-junction branches.
+        // Competing-alt guard (road-infrastructure only): S5's "stay on the named road"
+        // premise breaks when the junction holds a same-RC alt the rider perceives as a
+        // competing branch — either an opposite-side Y-fork co-branch or a same-side
+        // inertia-trap alt that goes straighter than the route. Each helper uses a
+        // tiered forward cone: asymmetric surface attractor (alt continues prev surface
+        // while route diverges) opens the wider 75° cone; symmetric same-surface
+        // junctions stay at the 40° slight bucket. When a competing alt is detected
+        // S5 falls through and the downstream emit path (fork handler / F1 / leaving-
+        // current-street fallback) handles the instruction.
         if (Math.abs(sign) == 1
                 && InstructionsHelper.isSameName(name, prevName)
                 && currentRC == prevRC) {
@@ -611,11 +620,17 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             boolean isCycleway = currentPH == PredictedHighway.CYCLEWAY;
             boolean isRoadLike = currentPH != null && isRoadInfrastructure(currentPH);
             if ((hasName && !isCycleway) || isRoadLike) {
-                // Visual check: route bends while a visually similar alternative goes straighter.
-                if (hasVisualCandidateAlternative(outgoingEdges, edge, currentPH, currentSurface, delta)) {
-                    visualCandidateSign = sign;
+                boolean hasCompetingAlt = isRoadLike
+                        && (hasCompetingOppositeSideRoadAlt(outgoingEdges, currentRC, prevSurface, currentSurface, delta)
+                            || hasStraighterRoadAlt(outgoingEdges, currentRC, prevSurface, currentSurface, delta));
+                if (!hasCompetingAlt) {
+                    // Visual check: route bends while a visually similar alternative goes straighter.
+                    if (hasVisualCandidateAlternative(outgoingEdges, edge, currentPH, currentSurface, delta)) {
+                        visualCandidateSign = sign;
+                    }
+                    return Instruction.IGNORE;
                 }
-                return Instruction.IGNORE;
+                // Competing alt detected — fall through to the standard emit path.
             }
         }
 
@@ -623,7 +638,17 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         // Guard 1: rider must be staying on (or descending from) something at least as prominent
         // as the route ahead. When prevPH < currentPH the rider is *joining* a more prominent
         // way — that transition is itself the navigation event and needs an instruction.
-        // Guard 2 (non-road only): when the rider is on non-road infrastructure (trails,
+        // Guard 2 (road branch only): on road-infrastructure junctions the route's name must
+        // continue from prev to current. A name change across a road junction is a perceptual
+        // event the rider sees from street signs and intersection geometry (e.g.
+        // Kalliojärventie → Houkkalammintie, with the same-name continuation existing as
+        // a lower-prominence alt). Prominence alone can't distinguish "route stays on the
+        // named way while a side path joins" (silence-worthy) from "route leaves the named
+        // way while the same-named continuation goes to a side path" (emit-worthy) — both
+        // satisfy the prominence guards. Mirrors the same-name precondition that S1/S2/S5
+        // already enforce. Scoped to road infrastructure because cycleway / footway / path /
+        // track names are informal route designations not observable on the ground (W3).
+        // Guard 3 (non-road only): when the rider is on non-road infrastructure (trails,
         // cycleways, paths) prominence alone is not a reliable visual cue — an unpaved
         // cycleway and a same-surface footway can be visually identical despite different
         // PH. On non-road, S3 escapes (emits the angle-based sign) for two distinct
@@ -638,21 +663,33 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         //     helper docstring for the perceptual rationale and thresholds.
         // The two shapes can overlap mathematically (the escape fires either way); they
         // are kept named separately to describe the two distinct rider experiences.
-        // On road infrastructure (motorway/major/minor/service) the road environment
-        // carries its own visual cues (signs, kerbs, markings) and prominence remains
-        // a fine proxy — S3 keeps its original behaviour there.
         if (currentPH != null && prevPH != null
                 && phProminence(prevPH) >= phProminence(currentPH)
                 && allAlternativesLowerProminence(outgoingEdges, currentPH)) {
             boolean bothNonRoad = !isRoadInfrastructure(currentPH) && !isRoadInfrastructure(prevPH);
-            if (bothNonRoad
+            // Road-or-mixed branch: require name continuity (W8). A name change at a
+            // road-infrastructure junction is the perceptual signal of leaving the named
+            // way; defer to downstream emit path (fork handler / leaving-current-street).
+            if (!bothNonRoad && !InstructionsHelper.isSameName(name, prevName)) {
+                // Fall through — do not silence.
+            } else if (bothNonRoad
                     && (hasForwardConfusableAlt(outgoingEdges, edge, currentPH, delta,
                                 prevLat, prevLon, prevOrientation)
                         || hasYForkConfusableAlt(outgoingEdges, edge, currentPH, delta,
                                 prevLat, prevLon, prevOrientation))) {
                 return sign;
+            } else {
+                // Road-or-mixed silence: opt into the visual side-channel if a visually
+                // similar alt goes straighter than the route (W10 — parallel to S5's opt-in).
+                // Non-road silence stays without visual: name signals are unreliable on
+                // non-road infrastructure (W3), and the Shape A/B escapes are the
+                // perceptual gate there.
+                if (!bothNonRoad
+                        && hasVisualCandidateAlternative(outgoingEdges, edge, currentPH, currentSurface, delta)) {
+                    visualCandidateSign = sign;
+                }
+                return Instruction.IGNORE;
             }
-            return Instruction.IGNORE;
         }
 
         // S6: Forced trail bend — both prev and current are non-road-infrastructure AND
@@ -681,8 +718,16 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                 final boolean prevLink = prevEdge.get(roadClassLinkEnc);
                 final boolean otherLink = otherContinue.get(roadClassLinkEnc);
 
-                // Staying on same prominent road class (GH original, extended to all classes)
-                if ((currentRC == prevRC && link == prevLink)
+                // Staying on same prominent road class with route's name continuing
+                // (GH original, extended to all classes, gated by name continuity per W9).
+                // Name guard mirrors the S3 fix: the rule's premise — "route stays on the
+                // main way, alt diverges to a lower class" — assumes the rider IS staying
+                // on the named way. Without the guard, a name change with a same-RC route
+                // and a different-RC alt (e.g. Kalliojärventie → Houkkalammintie at a
+                // junction where the same-name continuation is a SERVICE_ROAD alt)
+                // silences a real "leaving the named way" event.
+                if (InstructionsHelper.isSameName(name, prevName)
+                        && (currentRC == prevRC && link == prevLink)
                         && (otherRoadClass != prevRC || otherLink != prevLink)) {
                     // On trails, only suppress if the alternative is visibly different type
                     if (currentPH != null) {
@@ -1155,6 +1200,123 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                 double spread = Math.abs(routeDelta - altDelta);
                 if (spread <= SLIGHT_SPREAD_MAX) return true;
             }
+        }
+        return false;
+    }
+
+    /**
+     * S5 competing-alt detector — opposite-side Y-fork shape on a road-infrastructure
+     * junction. Returns true iff the junction has an accessible alternative the rider
+     * perceives as a competing same-class road on the opposite side from the route,
+     * making S5's "slight bend on same named road = no decision" silence wrong.
+     * <p>
+     * Three AND gates per alt:
+     * <ol>
+     *   <li><b>Same RC</b> as the route. Mirrors S5's own {@code currentRC==prevRC}
+     *       discriminator — we ask whether a competing road of the same class exists,
+     *       not whether a side service driveway is incident.</li>
+     *   <li><b>Opposite side</b> from route: {@code sign(altΔ) != sign(routeΔ)}.</li>
+     *   <li><b>Tiered forward cone</b> by surface-attraction strength:
+     *       <ul>
+     *         <li><b>Tier A — asymmetric attractor</b>: alt continues the rider's prev
+     *             surface AND the route diverges to a different surface
+     *             ({@code alt matches prev} AND {@code surfacesClearlyDiffer(prev, route)}).
+     *             The alt visibly continues "the road I was on" while the route changes
+     *             character; strongest surface attractor. Cone: {@code |altΔ| ≤ 75°} —
+     *             surface continuity carries the rider's eye past the slight bucket.</li>
+     *         <li><b>Tier B — symmetric / no surface discontinuity</b>: alt matches at
+     *             least one surface anchor (prev or route) but Tier A's asymmetric
+     *             attractor doesn't apply. Without the surface signal only the angular
+     *             Y-shape is the cue; a wider opposite-side alt reads as a clear side
+     *             turn, not a co-branch. Cone: {@code |altΔ| ≤ 40°} (slight bucket).</li>
+     *         <li>Alt matching neither anchor: not competing (rider distinguishes by
+     *             eye — e.g. unpaved branch off an all-asphalt road).</li>
+     *       </ul>
+     *       {@code ASPHALT_OR_UNPAVED} is ambiguous and matches either anchor (per
+     *       {@link #surfacesClearlyDiffer}).</li>
+     * </ol>
+     * Dual-anchor surface logic mirrors {@link #hasConfusableFootwayAlternative} (E5):
+     * the rider perceives both surfaces at the junction, so an alt visually matching
+     * either is a real perceptual competitor. The tiered cone preserves the perceptual
+     * grading of surface attractors as a scoring signal (not a flat yes/no gate).
+     */
+    private boolean hasCompetingOppositeSideRoadAlt(InstructionsOutgoingEdges outgoing,
+                                                     RoadClass routeRC,
+                                                     PredictedSurface prevSurface,
+                                                     PredictedSurface routeSurface,
+                                                     double routeDelta) {
+        if (predictedSurfaceEnc == null || routeRC == null) return false;
+        final double CONE_TIER_A = Math.toRadians(75);
+        final double CONE_TIER_B = Math.toRadians(40);
+        boolean routeChangesSurface = surfacesClearlyDiffer(prevSurface, routeSurface);
+        for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
+            if (alt.get(roadClassEnc) != routeRC) continue;
+
+            GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(alt, nodeAccess);
+            double altDelta = InstructionsHelper.calculateOrientationDelta(
+                    prevLat, prevLon, altPoint.getLat(), altPoint.getLon(), prevOrientation);
+            if (Math.signum(altDelta) == Math.signum(routeDelta)) continue;
+
+            PredictedSurface altSurface = alt.get(predictedSurfaceEnc);
+            boolean matchesPrev = !surfacesClearlyDiffer(prevSurface, altSurface);
+            boolean matchesRoute = !surfacesClearlyDiffer(routeSurface, altSurface);
+            if (!matchesPrev && !matchesRoute) continue;
+
+            boolean tierA = routeChangesSurface && matchesPrev;
+            double coneMax = tierA ? CONE_TIER_A : CONE_TIER_B;
+            if (Math.abs(altDelta) <= coneMax) return true;
+        }
+        return false;
+    }
+
+    /**
+     * S5 competing-alt detector — inertia-trap shape on a road-infrastructure
+     * junction. Returns true iff there is a same-RC alt that goes meaningfully
+     * straighter than the route, such that the rider's go-straight default would
+     * land on the alt instead of following the route's slight bend.
+     * <p>
+     * Three AND gates per alt:
+     * <ol>
+     *   <li><b>Same RC</b> as the route.</li>
+     *   <li><b>Straighter than route by &gt;20°</b>:
+     *       {@code |routeΔ| − |altΔ| > 0.35 rad}. Same threshold as
+     *       {@link #hasForwardConfusableAlt} (S3 Shape A).</li>
+     *   <li><b>Tiered forward cone</b> on alt's absolute angle, by surface-attraction
+     *       strength — same tier definitions as
+     *       {@link #hasCompetingOppositeSideRoadAlt}.</li>
+     * </ol>
+     * Inside S5's {@code |sign|==1} scope the route is always in the slight bucket
+     * so "straighter than route" naturally bounds alt below route; the cone is
+     * largely redundant in practice but kept for symmetry with the Y-fork shape.
+     */
+    private boolean hasStraighterRoadAlt(InstructionsOutgoingEdges outgoing,
+                                          RoadClass routeRC,
+                                          PredictedSurface prevSurface,
+                                          PredictedSurface routeSurface,
+                                          double routeDelta) {
+        if (predictedSurfaceEnc == null || routeRC == null) return false;
+        final double CONE_TIER_A = Math.toRadians(75);
+        final double CONE_TIER_B = Math.toRadians(40);
+        final double STRAIGHTER_THRESHOLD = 0.35; // ~20°
+        boolean routeChangesSurface = surfacesClearlyDiffer(prevSurface, routeSurface);
+        double routeDeviation = Math.abs(routeDelta);
+        for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
+            if (alt.get(roadClassEnc) != routeRC) continue;
+
+            GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(alt, nodeAccess);
+            double altDelta = InstructionsHelper.calculateOrientationDelta(
+                    prevLat, prevLon, altPoint.getLat(), altPoint.getLon(), prevOrientation);
+            double altDeviation = Math.abs(altDelta);
+            if (routeDeviation - altDeviation <= STRAIGHTER_THRESHOLD) continue;
+
+            PredictedSurface altSurface = alt.get(predictedSurfaceEnc);
+            boolean matchesPrev = !surfacesClearlyDiffer(prevSurface, altSurface);
+            boolean matchesRoute = !surfacesClearlyDiffer(routeSurface, altSurface);
+            if (!matchesPrev && !matchesRoute) continue;
+
+            boolean tierA = routeChangesSurface && matchesPrev;
+            double coneMax = tierA ? CONE_TIER_A : CONE_TIER_B;
+            if (altDeviation <= coneMax) return true;
         }
         return false;
     }

@@ -278,7 +278,9 @@ public class MapMatching {
 
             if (filterResult.filteredOutIndices.contains(i)) {
                 // This observation was filtered out (too close to previous)
-                // Compute snap separately - this doesn't affect the route
+                // Compute snap separately - this doesn't affect the route.
+                // Filtered observations do not participate in Viterbi, so they have no
+                // matcher transition path from a previous tracepoint; distanceFromPrevious = null.
                 List<Snap> snaps = findCandidateSnaps(originalPoint.getLat(), originalPoint.getLon());
                 if (!snaps.isEmpty()) {
                     Snap snap = snaps.get(0); // closest snap
@@ -288,7 +290,7 @@ public class MapMatching {
                     );
                     double distance = snap.getQueryDistance();
                     int edgeId = snap.getClosestEdge().getEdge();
-                    tracepoints.add(new Tracepoint(i, originalPoint, true, snappedPoint, distance, edgeId));
+                    tracepoints.add(new Tracepoint(i, originalPoint, true, snappedPoint, distance, edgeId, null));
                 } else {
                     // No snap candidates found
                     tracepoints.add(new Tracepoint(i, originalPoint, true));
@@ -305,7 +307,13 @@ public class MapMatching {
                     );
                     double distance = snap.getQueryDistance();
                     int edgeId = snap.getClosestEdge().getEdge();
-                    tracepoints.add(new Tracepoint(i, originalPoint, false, snappedPoint, distance, edgeId));
+                    // Pull the matcher's HMM transition distance from the previous Viterbi
+                    // state. transitionDescriptor is null for the first Viterbi state
+                    // (no incoming transition); for subsequent states it is the routing
+                    // Path the HMM chose between the previous and current candidate.
+                    Double distanceFromPrevious = (seqState.transitionDescriptor != null)
+                            ? seqState.transitionDescriptor.getDistance() : null;
+                    tracepoints.add(new Tracepoint(i, originalPoint, false, snappedPoint, distance, edgeId, distanceFromPrevious));
                 } else {
                     // Shouldn't happen, but handle gracefully
                     tracepoints.add(new Tracepoint(i, originalPoint, false));

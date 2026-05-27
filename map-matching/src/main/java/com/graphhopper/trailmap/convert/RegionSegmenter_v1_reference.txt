@@ -1,0 +1,629 @@
+package com.graphhopper.trailmap.convert;
+
+import com.graphhopper.matching.EdgeMatch;
+import com.graphhopper.matching.MatchResult;
+import com.graphhopper.matching.Tracepoint;
+import com.graphhopper.util.DistanceCalcEarth;
+import com.graphhopper.util.FetchMode;
+import com.graphhopper.util.PointList;
+import com.graphhopper.util.shapes.GHPoint;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Stage 2 of the track-to-route conversion pipeline.
+ *
+ * <p>Walks the {@link MatchResult} alongside the original observations and partitions
+ * the input track into a sequence of {@link TrackRegion}s — alternating runs of
+ * matched (followable by road network) and unmatched (gap) observations.
+ *
+ * <p>Two gap signals drive the segmentation:
+ * <ol>
+ *   <li><b>Snap distance.</b> Per-observation: {@code matched && snap_distance < snap_threshold} → good.
+ *       Isolated singletons (one good between two bad, or vice versa) are flipped to avoid
+ *       tiny segments at noise boundaries.</li>
+ *   <li><b>Detour on matched path.</b> Per consecutive-good-pair: if the matched-edge path
+ *       length between observation i and i+1 is much longer than the straight-line
+ *       distance between their original GPS coordinates, the matcher had to go around
+ *       (typical case: river/railway crossing where no road bridges). An unmatched
+ *       region {@code [i, i+1]} is emitted between the surrounding matched regions so
+ *       the gap becomes a coordinates segment running straight from gpx[i] to gpx[i+1].</li>
+ * </ol>
+ */
+public class RegionSegmenter {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(RegionSegmenter.class);
+    private static final DistanceCalcEarth DIST = DistanceCalcEarth.DIST_EARTH;
+
+    /** Detour entries accepted by the most recent {@link #segment} call. Populated as a
+     *  side effect for debug/diagnostic consumers (the converter pulls these when the
+     *  request opted into debug output). Cleared at the start of each segment() call. */
+    private final List<DetourReport> lastDetours = new ArrayList<>();
+
+    public List<DetourReport> getLastDetours() { return lastDetours; }
+
+    /** Per-detour signal record for diagnostic consumers. */
+    public record DetourReport(int fromObs, int toObs,
+                               double matchedLengthM, double straightM, double ratio) {}
+
+    /** Minimum pairwise ratio for a single extension step (incremental gate) on top of
+     *  the cumulative ratio gate (≥ maxDetourRatio). Set well below the cumulative
+     *  threshold (~8.0) because off-network neighboring obs often have modest individual
+     *  ratios (~2–3) that we still want to include, while road-following extension steps
+     *  have ratio close to 1.0. */
+    private static final double DETOUR_EXTEND_STEP_RATIO = 2.0;
+
+    /** Max straight-line distance between two consecutive well-mapped obs for them to be
+     *  treated as a "co-located bridge" (the step contributes no new spatial information,
+     *  so the step gate is bypassed). Larger than typical GPS noise but smaller than a
+     *  meaningful step along a road. Above this distance, the step gate applies even when
+     *  both obs are on the same EdgeMatch — moving along a single edge is normal road
+     *  progress, not a no-info bridge. */
+    private static final double DETOUR_EXTEND_BRIDGE_STRAIGHT_M = 20.0;
+
+    public List<TrackRegion> segment(MatchResult matchResult,
+                                     double snapThresholdM,
+                                     double minDetourM,
+                                     double maxDetourRatio) {
+        lastDetours.clear();
+        List<Tracepoint> tracepoints = matchResult.getTracepoints();
+        if (tracepoints == null || tracepoints.isEmpty()) {
+            return List.of();
+        }
+        int n = tracepoints.size();
+
+        // 1. Classify each observation by snap distance.
+        boolean[] good = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            Tracepoint tp = tracepoints.get(i);
+            good[i] = tp.isMatched() && tp.getDistance() != null && tp.getDistance() < snapThresholdM;
+        }
+
+        // 2. De-isolate singletons (a single good between two bad, or vice versa, flips).
+        // Interior rule is symmetric — both directions valid: a lone BAD between two good
+        // is a snap-distance spike (flip to good); a lone good between two BAD is a
+        // momentary road crossing (flip to BAD).
+        if (n >= 3) {
+            boolean[] orig = good.clone();
+            for (int i = 1; i < n - 1; i++) {
+                if (orig[i - 1] == orig[i + 1] && orig[i] != orig[i - 1]) {
+                    good[i] = orig[i - 1];
+                }
+            }
+        }
+        // Boundary rule is ASYMMETRIC: only allow good→BAD demotion, never BAD→good
+        // promotion. If the very first or last observation has snap distance over the
+        // threshold, treating it as "matched" because its neighbor happens to be matched
+        // forces the routed segment to start/end at the neighbor's snap point — which can
+        // be tens of meters off the user's actual track start. The user's track really
+        // does start/end off-road; the right answer is to put that into a coordinates
+        // segment, not pretend the matcher's best-guess snap is correct.
+        if (n >= 2 && good[0] && !good[1]) good[0] = false;
+        if (n >= 2 && good[n - 1] && !good[n - 2]) good[n - 1] = false;
+
+        // 2b. Drift trim at matched-region boundaries. Snap distance is a lagging indicator
+        // of departure from the road network: a user starting to leave the road has their
+        // snap distance climb gradually. The last observation whose snap is still below the
+        // threshold may itself be ~25-30m off, while its predecessor was sub-meter. Demote
+        // such "drifting boundary" observations so the routed segment ends at the last
+        // tightly-snapped point, and the coordinates segment that follows captures the
+        // actual departure.
+        //
+        // Rule: at a matched-run boundary (next or previous obs is BAD), demote this obs
+        // if its snap is both absolutely large (> DRIFT_TRIM_ABS_M) and much larger than
+        // its interior-side neighbor's snap (> DRIFT_TRIM_RATIO ×). Iterate until stable —
+        // demoting one obs can expose its predecessor as the new boundary.
+        final double DRIFT_TRIM_ABS_M = 15.0;
+        final double DRIFT_TRIM_RATIO = 3.0;
+        boolean trimChanged = true;
+        while (trimChanged) {
+            trimChanged = false;
+            for (int i = 0; i < n; i++) {
+                if (!good[i]) continue;
+                Double snap_i = tracepoints.get(i).getDistance();
+                if (snap_i == null || snap_i < DRIFT_TRIM_ABS_M) continue;
+                // Boundary on END side: next obs is missing or BAD
+                if ((i == n - 1 || !good[i + 1]) && i > 0 && good[i - 1]) {
+                    Double snap_prev = tracepoints.get(i - 1).getDistance();
+                    if (snap_prev != null && snap_i > DRIFT_TRIM_RATIO * snap_prev) {
+                        good[i] = false;
+                        trimChanged = true;
+                        continue;
+                    }
+                }
+                // Boundary on START side: prev obs is missing or BAD
+                if ((i == 0 || !good[i - 1]) && i < n - 1 && good[i + 1]) {
+                    Double snap_next = tracepoints.get(i + 1).getDistance();
+                    if (snap_next != null && snap_i > DRIFT_TRIM_RATIO * snap_next) {
+                        good[i] = false;
+                        trimChanged = true;
+                    }
+                }
+            }
+        }
+
+        // 3. Map each matched observation to its EdgeMatch index (monotonic forward walk;
+        //    tolerant fallback to backward scan for filtered/out-of-order points).
+        List<EdgeMatch> edgeMatches = matchResult.getEdgeMatches();
+        int[] obsToEdgeMatch = new int[n];
+        for (int i = 0; i < n; i++) obsToEdgeMatch[i] = -1;
+
+        int searchFrom = 0;
+        for (int i = 0; i < n; i++) {
+            Tracepoint tp = tracepoints.get(i);
+            if (!tp.isMatched() || tp.getEdgeId() == null) continue;
+            int targetEdge = tp.getEdgeId();
+            int found = -1;
+            for (int j = searchFrom; j < edgeMatches.size(); j++) {
+                if (edgeMatches.get(j).getEdgeState().getEdge() == targetEdge) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found < 0) {
+                for (int j = searchFrom - 1; j >= 0; j--) {
+                    if (edgeMatches.get(j).getEdgeState().getEdge() == targetEdge) {
+                        found = j;
+                        break;
+                    }
+                }
+            }
+            if (found >= 0) {
+                obsToEdgeMatch[i] = found;
+                searchFrom = found;
+            }
+        }
+
+        // 4. Detect detour transitions between consecutive good observations.
+        // For each consecutive matched-obs pair, compute the actual matched-path length
+        // between them along the MergedPath polyline (not sum-of-full-edge-lengths, which
+        // over-estimates badly when consecutive observations are on adjacent edges). If
+        // the matched-path length massively exceeds the straight-line distance between the
+        // original GPS coords, the user didn't actually walk the matched route — they
+        // crossed directly (e.g. railway, river, footbridge).
+        // detourSplitTo[i] = j (j > i) means a forced detour split: end matched region at i,
+        // emit Unmatched[i, j], start next matched region at j. -1 means no detour after i.
+        int[] detourSplitTo = new int[n];
+        for (int x = 0; x < n; x++) detourSplitTo[x] = -1;
+        int detourCount = 0;
+
+        // Build per-edge polyline ranges so we can locate each obs's snap point in the
+        // correct portion of the matched path. Using `MergedPath.calcPoints()` directly
+        // and searching for the closest polyline point fails on loops (the matched path
+        // can pass near the same geographic location twice — out and back). We constrain
+        // each obs to the polyline indices that came from its own EdgeMatch.
+        PointList mergedPolyline = new PointList(64, false);
+        int[] edgeStartIdx = new int[edgeMatches.size()];
+        int[] edgeEndExclIdx = new int[edgeMatches.size()];
+        for (int e = 0; e < edgeMatches.size(); e++) {
+            PointList geom = edgeMatches.get(e).getEdgeState().fetchWayGeometry(
+                    e == 0 ? FetchMode.ALL : FetchMode.PILLAR_AND_ADJ);
+            edgeStartIdx[e] = mergedPolyline.size();
+            for (int j = 0; j < geom.size(); j++) {
+                mergedPolyline.add(geom.getLat(j), geom.getLon(j));
+            }
+            edgeEndExclIdx[e] = mergedPolyline.size();
+        }
+        double[] mergedCum = cumulativeDistances(mergedPolyline);
+
+        int[] obsToPolylineIdx = new int[n];
+        for (int k = 0; k < n; k++) obsToPolylineIdx[k] = -1;
+        for (int k = 0; k < n; k++) {
+            int em = obsToEdgeMatch[k];
+            if (em < 0) continue;
+            Tracepoint tp = tracepoints.get(k);
+            if (tp.getSnappedPoint() == null) continue;
+            double sLat = tp.getSnappedPoint().lat;
+            double sLon = tp.getSnappedPoint().lon;
+            int from = edgeStartIdx[em];
+            int to = edgeEndExclIdx[em];
+            int bestIdx = from;
+            double bestDist = Double.POSITIVE_INFINITY;
+            for (int j = from; j < to; j++) {
+                double d = DIST.calcDist(sLat, sLon,
+                        mergedPolyline.getLat(j), mergedPolyline.getLon(j));
+                if (d < bestDist) { bestDist = d; bestIdx = j; }
+            }
+            obsToPolylineIdx[k] = bestIdx;
+        }
+
+        if (LOGGER.isTraceEnabled()) {
+            LOGGER.trace("RegionSegmenter: merged polyline {} points, {} m total; obsToPolylineIdx={}",
+                    mergedPolyline.size(),
+                    String.format("%.1f", mergedCum[mergedCum.length - 1]),
+                    java.util.Arrays.toString(obsToPolylineIdx));
+        }
+
+        // Detour detection. For each pair (i, j) of well-mapped observations with j > i
+        // and j within DETOUR_LOOKAHEAD observations of i, compute the matched-polyline
+        // distance between their snap positions (absolute — backward jumps along the
+        // polyline count too, since MapMatching's HMM can produce locally-suboptimal
+        // paths that loop or backtrack) and compare to the straight-line distance between
+        // the original GPX coords. If matched is much longer than straight, the pair
+        // brackets a detour.
+        //
+        // Why look ahead beyond consecutive pairs:
+        //   The dominant signal can be cumulative across several obs. E.g. on junarata,
+        //   obs[1] sits on a parallel road (em[4]) while obs[2,3] are on the main road
+        //   (em[3]). Pairwise obs[1]→obs[2] is a backward jump; obs[1]→obs[4] is the
+        //   real off-network railway crossing (matched ~1000m vs straight 70m, ratio 14×).
+        //   Only the cumulative pair reveals the dominant detour.
+        //
+        // We collect ALL candidate detours, sort by ratio descending, and greedily pick
+        // non-overlapping ones — the strongest detour wins and any weaker detour that
+        // would have split inside it is subsumed.
+        record DetourCandidate(int from, int to, double matchedLen, double straight, double ratio) {}
+        List<DetourCandidate> candidates = new ArrayList<>();
+        final int DETOUR_LOOKAHEAD = 10;
+
+        // Collect well-mapped obs indices
+        List<Integer> wellMapped = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            if (good[i] && obsToPolylineIdx[i] >= 0) wellMapped.add(i);
+        }
+        for (int a = 0; a < wellMapped.size(); a++) {
+            int kEnd = Math.min(wellMapped.size(), a + 1 + DETOUR_LOOKAHEAD);
+            for (int b = a + 1; b < kEnd; b++) {
+                int i = wellMapped.get(a);
+                int j = wellMapped.get(b);
+                int piA = obsToPolylineIdx[i];
+                int piB = obsToPolylineIdx[j];
+                if (piA < 0 || piB < 0) continue;
+                double matchedLen = Math.abs(mergedCum[piB] - mergedCum[piA]);
+                GHPoint pa = tracepoints.get(i).getOriginalPoint();
+                GHPoint pb = tracepoints.get(j).getOriginalPoint();
+                double straight = DIST.calcDist(pa.lat, pa.lon, pb.lat, pb.lon);
+                if (straight <= 0) continue;
+                double ratio = matchedLen / straight;
+                if (matchedLen > minDetourM && ratio > maxDetourRatio) {
+                    candidates.add(new DetourCandidate(i, j, matchedLen, straight, ratio));
+                    LOGGER.trace("RegionSegmenter: detour candidate obs[{}]→obs[{}]: matched {}m, straight {}m, ratio {}",
+                            i, j, String.format("%.1f", matchedLen),
+                            String.format("%.1f", straight), String.format("%.2f", ratio));
+                }
+            }
+        }
+
+        // Seed-and-extend greedy. Sort by ratio descending: the SHARPEST detour seed wins.
+        // Then extend the seed outward (backward to lower obs, forward to higher) as long
+        // as the EXTENDED pair's ratio stays above threshold. This captures the full
+        // off-network span while excluding the surrounding road approach where ratio drops
+        // back to "normal curvature".
+        //
+        // Junarata example at sigma=5: seed obs[3]→obs[4] ratio 26. Extend backward:
+        // obs[2]→obs[4] ratio 22 (continue), obs[1]→obs[4] ratio 12 (continue),
+        // obs[0]→obs[4] ratio 6.8 (drops below 7 → stop). Final detour: obs[1]→obs[4].
+        candidates.sort((c1, c2) -> Double.compare(c2.ratio, c1.ratio));
+
+        // Need fast access to (i,j) → matched/straight given polyline indices. Precompute
+        // straight-line for ALL well-mapped obs pairs we might query while extending.
+        // We only extend through indices in `wellMapped`, so build a map by index.
+        java.util.Map<Long, Double> matchedLenCache = new java.util.HashMap<>();
+        java.util.Map<Long, Double> straightCache = new java.util.HashMap<>();
+
+        boolean[] covered = new boolean[n];
+        boolean[] usedAsFromObs = new boolean[n];
+        boolean[] usedAsToObs = new boolean[n];
+        for (DetourCandidate cand : candidates) {
+            // Skip if seed is already inside another selected detour, OR if the seed's
+            // start/end is already used in the same role by another detour. Adjacent
+            // chaining (one detour's to == another's from) is allowed.
+            if (covered[cand.from] || covered[cand.to]) continue;
+            if (usedAsFromObs[cand.from] || usedAsToObs[cand.to]) continue;
+            // Also reject if the candidate's range would enclose any boundary of an
+            // already-accepted detour (would create nested intervals).
+            boolean enclosesExisting = false;
+            for (int k = cand.from + 1; k < cand.to; k++) {
+                if (usedAsFromObs[k] || usedAsToObs[k]) { enclosesExisting = true; break; }
+            }
+            if (enclosesExisting) continue;
+            boolean overlap = false;
+            for (int k = cand.from + 1; k < cand.to; k++) {
+                if (covered[k]) { overlap = true; break; }
+            }
+            if (overlap) continue;
+
+            // Seed accepted. Try to extend outward through neighbors in wellMapped order.
+            int seedFromIdxInWell = -1, seedToIdxInWell = -1;
+            for (int w = 0; w < wellMapped.size(); w++) {
+                if (wellMapped.get(w) == cand.from) seedFromIdxInWell = w;
+                if (wellMapped.get(w) == cand.to) seedToIdxInWell = w;
+            }
+            if (seedFromIdxInWell < 0 || seedToIdxInWell < 0) continue;
+
+            int curFromW = seedFromIdxInWell;
+            int curToW = seedToIdxInWell;
+            int actualFrom = cand.from;
+            int actualTo = cand.to;
+            double curMatched = cand.matchedLen;
+            double curStraight = cand.straight;
+
+            // Extend backward. Two gates must both pass for an extension step:
+            //  (1) Cumulative gate: the extended pair still has ratio > maxDetourRatio.
+            //  (2) Step gate: the incremental step (new obs → current boundary obs) is
+            //      either a "no-info bridge" (the new obs is on the same EdgeMatch as the
+            //      current boundary obs — multiple consecutive obs sharing one edge) OR
+            //      its own pairwise ratio is above DETOUR_EXTEND_STEP_RATIO.
+            //  The step gate prevents extension from pulling in road-following obs whose
+            //  individual ratio is mild but whose cumulative-with-seed stays above
+            //  threshold by inertia from the seed's strong signal.
+            while (curFromW > 0) {
+                int candFrom = wellMapped.get(curFromW - 1);
+                if (covered[candFrom]) break;
+                double m = computeMatchedLen(obsToPolylineIdx, mergedCum, candFrom, actualTo);
+                double s = computeStraight(tracepoints, candFrom, actualTo);
+                if (s <= 0 || m <= minDetourM) break;
+                if (m / s <= maxDetourRatio) break; // cumulative gate
+                // Step gate: candFrom vs actualFrom
+                if (!extensionStepAcceptable(candFrom, actualFrom,
+                        obsToEdgeMatch, obsToPolylineIdx, mergedCum, tracepoints,
+                        DETOUR_EXTEND_STEP_RATIO)) {
+                    break;
+                }
+                curFromW--;
+                actualFrom = candFrom;
+                curMatched = m;
+                curStraight = s;
+            }
+            // Extend forward (mirror of backward).
+            while (curToW < wellMapped.size() - 1) {
+                int candTo = wellMapped.get(curToW + 1);
+                if (covered[candTo]) break;
+                double m = computeMatchedLen(obsToPolylineIdx, mergedCum, actualFrom, candTo);
+                double s = computeStraight(tracepoints, actualFrom, candTo);
+                if (s <= 0 || m <= minDetourM) break;
+                if (m / s <= maxDetourRatio) break; // cumulative gate
+                if (!extensionStepAcceptable(actualTo, candTo,
+                        obsToEdgeMatch, obsToPolylineIdx, mergedCum, tracepoints,
+                        DETOUR_EXTEND_STEP_RATIO)) {
+                    break;
+                }
+                curToW++;
+                actualTo = candTo;
+                curMatched = m;
+                curStraight = s;
+            }
+
+            detourSplitTo[actualFrom] = actualTo;
+            detourCount++;
+            for (int k = actualFrom + 1; k < actualTo; k++) covered[k] = true;
+            // Track from/to obs separately to forbid same-role reuse (two detours starting
+            // at the same obs, or ending at the same obs). Adjacent-chain detours where
+            // detour A's `to` equals detour B's `from` remain allowed — they merge into a
+            // single coords section at region-build time.
+            usedAsFromObs[actualFrom] = true;
+            usedAsToObs[actualTo] = true;
+            lastDetours.add(new DetourReport(actualFrom, actualTo, curMatched, curStraight,
+                    curStraight > 0 ? curMatched / curStraight : 0));
+            LOGGER.info("RegionSegmenter: detour transition obs[{}]→obs[{}]: "
+                            + "matched {}m, straight {}m, ratio {} (seeded from obs[{}]→obs[{}] r={})",
+                    actualFrom, actualTo,
+                    String.format("%.1f", curMatched),
+                    String.format("%.1f", curStraight),
+                    String.format("%.2f", curStraight > 0 ? curMatched / curStraight : 0),
+                    cand.from, cand.to, String.format("%.2f", cand.ratio));
+        }
+
+        // 5. Build regions, honoring both good-runs AND detour splits.
+        List<TrackRegion> regions = new ArrayList<>();
+        int i = 0;
+        while (i < n) {
+            int start = i;
+            boolean run = good[i];
+            int j = i;
+            // Extend the run while consecutive obs share `run` AND no detour split spans the next obs.
+            int splitTarget = -1;
+            while (j + 1 < n && good[j + 1] == run) {
+                if (run && detourSplitTo[j] > j) { splitTarget = detourSplitTo[j]; break; }
+                j++;
+            }
+            // Also catch a detour starting exactly at the run's last index (j == start in a singleton).
+            if (run && splitTarget < 0 && detourSplitTo[j] > j) {
+                splitTarget = detourSplitTo[j];
+            }
+            int end = j;
+
+            if (run) {
+                regions.add(buildMatched(tracepoints, edgeMatches, obsToEdgeMatch, start, end));
+                if (splitTarget > end) {
+                    // Detour bridge: unmatched region covers obs [end, splitTarget].
+                    // Both endpoints (end and splitTarget) are well-matched observations whose
+                    // straight-line GPX distance was much smaller than the matched detour. The
+                    // intermediate raw GPS points (which may include filtered observations) get
+                    // included in the coordinates segment's geometry by CoordinatesRegionBuilder.
+                    regions.add(new TrackRegion.Unmatched(end, splitTarget));
+                    i = splitTarget;
+                    continue;
+                }
+            } else {
+                regions.add(new TrackRegion.Unmatched(start, end));
+            }
+            i = j + 1;
+        }
+
+        // 6. Fold singleton-matched regions into the adjacent unmatched region.
+        // Detour splits can create matched regions that contain only a single observation
+        // (e.g. obs[0] alone between the start of the track and a detour split). These
+        // produce a routed segment with identical start/end coordinates and no real path,
+        // which the optimizer falls into its degenerate branch on. Merge them into the
+        // unmatched neighbor instead so the gap captures the observation's raw GPX.
+        regions = foldSingletonMatched(regions);
+
+        LOGGER.info("RegionSegmenter: {} observations → {} regions ({} matched, {} unmatched, {} detour-splits)",
+                n, regions.size(),
+                regions.stream().filter(r -> r instanceof TrackRegion.Matched).count(),
+                regions.stream().filter(r -> r instanceof TrackRegion.Unmatched).count(),
+                detourCount);
+        return regions;
+    }
+
+    /** Returns true if extending the detour by one step is acceptable. The step is between
+     *  two well-mapped observations {@code candidate} (the new boundary) and {@code boundary}
+     *  (the current boundary). Either:
+     *  <ul>
+     *    <li>{@code candidate} and {@code boundary} are on the same EdgeMatch AND their
+     *      straight-line distance is below {@link #DETOUR_EXTEND_BRIDGE_STRAIGHT_M} — they
+     *      are co-located on a single edge, contributing no new spatial information.
+     *    <li>The pairwise step ratio is above {@code stepThreshold} — the step contributes
+     *      its own detour signal.
+     *  </ul>
+     *  Otherwise the step would pull a road-following observation into the detour, widening
+     *  the boundary beyond the actual off-network span. Moving along a single edge (same
+     *  EdgeMatch but larger straight distance) is normal road progress, not a bridge.
+     */
+    private static boolean extensionStepAcceptable(int candidate, int boundary,
+                                                   int[] obsToEdgeMatch,
+                                                   int[] obsToPolylineIdx,
+                                                   double[] mergedCum,
+                                                   List<Tracepoint> tracepoints,
+                                                   double stepThreshold) {
+        double stepStraight = computeStraight(tracepoints, candidate, boundary);
+        if (obsToEdgeMatch[candidate] >= 0 && obsToEdgeMatch[boundary] >= 0
+                && obsToEdgeMatch[candidate] == obsToEdgeMatch[boundary]
+                && stepStraight <= DETOUR_EXTEND_BRIDGE_STRAIGHT_M) {
+            return true; // co-located same-edge bridge
+        }
+        double stepMatched = computeMatchedLen(obsToPolylineIdx, mergedCum, candidate, boundary);
+        if (stepStraight <= 0) return false;
+        return stepMatched / stepStraight > stepThreshold;
+    }
+
+    /** Matched-polyline distance between two well-mapped observations (absolute value;
+     *  backward jumps along the polyline count). */
+    private static double computeMatchedLen(int[] obsToPolylineIdx, double[] mergedCum,
+                                            int obsFrom, int obsTo) {
+        int piA = obsToPolylineIdx[obsFrom];
+        int piB = obsToPolylineIdx[obsTo];
+        if (piA < 0 || piB < 0) return 0;
+        return Math.abs(mergedCum[piB] - mergedCum[piA]);
+    }
+
+    /** Straight-line distance between original GPS coordinates of two observations. */
+    private static double computeStraight(List<Tracepoint> tracepoints, int obsFrom, int obsTo) {
+        GHPoint a = tracepoints.get(obsFrom).getOriginalPoint();
+        GHPoint b = tracepoints.get(obsTo).getOriginalPoint();
+        return DIST.calcDist(a.lat, a.lon, b.lat, b.lon);
+    }
+
+    /** Per-vertex cumulative geodesic distance along a polyline. */
+    private static double[] cumulativeDistances(PointList pl) {
+        double[] cum = new double[pl.size()];
+        cum[0] = 0;
+        for (int i = 1; i < pl.size(); i++) {
+            cum[i] = cum[i - 1] + DIST.calcDist(
+                    pl.getLat(i - 1), pl.getLon(i - 1),
+                    pl.getLat(i), pl.getLon(i));
+        }
+        return cum;
+    }
+
+    private static List<TrackRegion> foldSingletonMatched(List<TrackRegion> in) {
+        List<TrackRegion> out = new ArrayList<>(in.size());
+        for (int r = 0; r < in.size(); r++) {
+            TrackRegion cur = in.get(r);
+            boolean isSingletonMatched = cur instanceof TrackRegion.Matched m
+                    && m.firstObservation() == m.lastObservation();
+            if (!isSingletonMatched) {
+                out.add(cur);
+                continue;
+            }
+            int folded = ((TrackRegion.Matched) cur).firstObservation();
+
+            // Prefer folding into the previous unmatched region (already in `out`).
+            if (!out.isEmpty() && out.get(out.size() - 1) instanceof TrackRegion.Unmatched prev) {
+                out.set(out.size() - 1,
+                        new TrackRegion.Unmatched(prev.firstObservation(), folded));
+                continue;
+            }
+            // Otherwise fold into the next unmatched region (peek ahead).
+            if (r + 1 < in.size() && in.get(r + 1) instanceof TrackRegion.Unmatched next) {
+                in.set(r + 1, new TrackRegion.Unmatched(folded, next.lastObservation()));
+                continue;
+            }
+            // No adjacent unmatched region — emit as a degenerate 1-obs unmatched.
+            // (Better than a routed segment with zero-length path.)
+            out.add(new TrackRegion.Unmatched(folded, folded));
+        }
+        return out;
+    }
+
+    private TrackRegion.Matched buildMatched(List<Tracepoint> tracepoints,
+                                             List<EdgeMatch> edgeMatches,
+                                             int[] obsToEdgeMatch,
+                                             int startObs, int endObs) {
+        // Compute the EdgeMatch index range that *covers* all matched obs in this region.
+        // Use min/max rather than first/last because obsToEdgeMatch isn't guaranteed
+        // monotonic — MapMatching's path can include loops or back-and-forth segments,
+        // and the obs→EdgeMatch search falls back to a backward scan when the forward
+        // scan doesn't find the edge. The slice must encompass every obs's matched edge.
+        int firstEm = Integer.MAX_VALUE, lastEm = -1;
+        for (int i = startObs; i <= endObs; i++) {
+            if (obsToEdgeMatch[i] >= 0) {
+                if (obsToEdgeMatch[i] < firstEm) firstEm = obsToEdgeMatch[i];
+                if (obsToEdgeMatch[i] > lastEm) lastEm = obsToEdgeMatch[i];
+            }
+        }
+        if (lastEm < 0) {
+            Tracepoint tp = tracepoints.get(startObs);
+            GHPoint snap = tp.getSnappedPoint() != null ? tp.getSnappedPoint() : tp.getOriginalPoint();
+            return new TrackRegion.Matched(startObs, endObs,
+                    List.of(startObs), List.of(snap), new int[]{0},
+                    List.of(), snap, snap, 0.0);
+        }
+        // Raw slice from MapMatching. MapMatching emits a separate EdgeMatch entry for each
+        // observation that snapped to a given edge, so the SAME edge can appear multiple
+        // times consecutively in this list when several observations share an edge. This is
+        // an artifact of the matcher's per-state representation — it's not a path-traversal
+        // count. Deduplicate consecutive same-edge entries so the slice represents the
+        // *edge sequence* of the matched path (each edge traversed once).
+        List<EdgeMatch> rawSlice = edgeMatches.subList(firstEm, lastEm + 1);
+        List<EdgeMatch> slice = new ArrayList<>(rawSlice.size());
+        int[] rawToDedupIdx = new int[rawSlice.size()];
+        int dedupIdx = -1;
+        int prevEdgeId = Integer.MIN_VALUE;
+        for (int i = 0; i < rawSlice.size(); i++) {
+            int eid = rawSlice.get(i).getEdgeState().getEdge();
+            if (eid != prevEdgeId) {
+                slice.add(rawSlice.get(i));
+                dedupIdx++;
+                prevEdgeId = eid;
+            }
+            rawToDedupIdx[i] = dedupIdx;
+        }
+
+        List<Integer> matchedObsIndices = new ArrayList<>();
+        List<GHPoint> obsSnapPoints = new ArrayList<>();
+        List<Integer> obsEdgeIdxInSliceL = new ArrayList<>();
+        for (int i = startObs; i <= endObs; i++) {
+            int emIdx = obsToEdgeMatch[i];
+            if (emIdx < 0) continue;
+            Tracepoint tp = tracepoints.get(i);
+            GHPoint snap = tp.getSnappedPoint();
+            if (snap == null) continue;
+            matchedObsIndices.add(i);
+            obsSnapPoints.add(snap);
+            // Map raw position (emIdx - firstEm) to deduped slice position.
+            obsEdgeIdxInSliceL.add(rawToDedupIdx[emIdx - firstEm]);
+        }
+        int[] obsEdgeIdxInSlice = new int[obsEdgeIdxInSliceL.size()];
+        for (int k = 0; k < obsEdgeIdxInSlice.length; k++) obsEdgeIdxInSlice[k] = obsEdgeIdxInSliceL.get(k);
+
+        GHPoint startSnap = obsSnapPoints.isEmpty() ? tracepoints.get(startObs).getOriginalPoint()
+                : obsSnapPoints.get(0);
+        GHPoint endSnap = obsSnapPoints.isEmpty() ? tracepoints.get(endObs).getOriginalPoint()
+                : obsSnapPoints.get(obsSnapPoints.size() - 1);
+
+        // matched length from the DEDUPED slice — summing rawSlice over-counts because the
+        // same edge would otherwise contribute multiple times.
+        double lengthM = 0;
+        for (EdgeMatch em : slice) {
+            lengthM += em.getEdgeState().getDistance();
+        }
+        return new TrackRegion.Matched(startObs, endObs,
+                matchedObsIndices, obsSnapPoints, obsEdgeIdxInSlice,
+                slice, startSnap, endSnap, lengthM);
+    }
+}

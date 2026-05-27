@@ -38,6 +38,7 @@ public class Tracepoint {
     private final GHPoint snappedPoint;
     private final Double distance;
     private final Integer edgeId;
+    private final Double distanceFromPrevious;
 
     /**
      * Creates a tracepoint with snap data.
@@ -48,9 +49,15 @@ public class Tracepoint {
      * @param snappedPoint snapped coordinates on road
      * @param distance distance from original to snapped point in meters
      * @param edgeId edge ID of matched road segment
+     * @param distanceFromPrevious matched-path length (meters) of the matcher's transition
+     *                             from the previous non-filtered tracepoint to this one;
+     *                             null for the first non-filtered tracepoint and for filtered
+     *                             tracepoints (which did not participate in Viterbi).
+     *                             Mirrors OSRM's tracepoint distance_to_previous.
      */
     public Tracepoint(int originalIndex, GHPoint originalPoint, boolean filtered,
-                      GHPoint snappedPoint, double distance, int edgeId) {
+                      GHPoint snappedPoint, double distance, int edgeId,
+                      Double distanceFromPrevious) {
         this.originalIndex = originalIndex;
         this.originalPoint = originalPoint;
         this.matched = true;
@@ -58,6 +65,7 @@ public class Tracepoint {
         this.snappedPoint = snappedPoint;
         this.distance = distance;
         this.edgeId = edgeId;
+        this.distanceFromPrevious = distanceFromPrevious;
     }
 
     /**
@@ -75,6 +83,7 @@ public class Tracepoint {
         this.snappedPoint = null;
         this.distance = null;
         this.edgeId = null;
+        this.distanceFromPrevious = null;
     }
 
     /**
@@ -127,12 +136,24 @@ public class Tracepoint {
         return edgeId;
     }
 
+    /**
+     * @return matched-path length (meters) of the matcher's HMM transition from the
+     *         previous non-filtered tracepoint to this one; null for the first
+     *         non-filtered tracepoint and for filtered tracepoints. Mirrors OSRM's
+     *         tracepoint distance_to_previous and is the authoritative per-leg
+     *         matched-path distance computed by the Viterbi algorithm.
+     */
+    public Double getDistanceFromPrevious() {
+        return distanceFromPrevious;
+    }
+
     @Override
     public String toString() {
         if (matched) {
             return "Tracepoint{index=" + originalIndex +
                    ", matched=true, filtered=" + filtered +
                    ", distance=" + distance +
+                   ", distanceFromPrevious=" + distanceFromPrevious +
                    ", snapped=" + snappedPoint + "}";
         } else {
             return "Tracepoint{index=" + originalIndex +

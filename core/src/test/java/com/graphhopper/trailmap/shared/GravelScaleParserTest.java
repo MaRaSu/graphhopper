@@ -391,6 +391,93 @@ class GravelScaleParserTest {
     }
 
     // =================================================================
+    // ROAD NETWORK — secondary (boundary class: can be paved or unpaved)
+    //
+    // Secondary defaults to ZERO_PLUS (not ZERO_MINUS) when no surface is
+    // tagged — globally ~95% paved but in Nordic / rural regions genuinely
+    // mixed, so defaulting to paved is unsafe for routing. Explicit asphalt
+    // surface still produces ZERO_MINUS. Explicit unpaved-ish surfaces map
+    // to ZERO_PLUS (mappers overload `gravel`; on the road network it means
+    // compacted-quality).
+    // =================================================================
+
+    @Test
+    void testSecondaryRoadNetwork() {
+        List<String> failures = new ArrayList<>();
+
+        // Original triggering case
+        assertScaleCollect(failures, ZERO_PLUS, "secondary + gravel (original case)",
+                "highway", "secondary", "surface", "gravel");
+
+        // The "massive error" case
+        assertScaleCollect(failures, ZERO_PLUS, "secondary / no surface (boundary default)",
+                "highway", "secondary");
+        assertScaleCollect(failures, ZERO_PLUS, "secondary_link / no surface",
+                "highway", "secondary_link");
+
+        // Explicit paved surfaces — still ZERO_MINUS
+        assertScaleCollect(failures, ZERO_MINUS, "secondary + asphalt",
+                "highway", "secondary", "surface", "asphalt");
+        assertScaleCollect(failures, ZERO_MINUS, "secondary + paved",
+                "highway", "secondary", "surface", "paved");
+        assertScaleCollect(failures, ZERO_MINUS, "secondary + concrete",
+                "highway", "secondary", "surface", "concrete");
+        assertScaleCollect(failures, ZERO_MINUS, "secondary + paving_stones",
+                "highway", "secondary", "surface", "paving_stones");
+
+        // Explicit unpaved-ish — ZERO_PLUS
+        assertScaleCollect(failures, ZERO_PLUS, "secondary + compacted",
+                "highway", "secondary", "surface", "compacted");
+        assertScaleCollect(failures, ZERO_PLUS, "secondary + fine_gravel",
+                "highway", "secondary", "surface", "fine_gravel");
+        assertScaleCollect(failures, ZERO_PLUS, "secondary + unpaved",
+                "highway", "secondary", "surface", "unpaved");
+        assertScaleCollect(failures, ZERO_PLUS, "secondary_link + gravel",
+                "highway", "secondary_link", "surface", "gravel");
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
+    // ROAD NETWORK — regression guard for other classes
+    // (tertiary_link added to LIKELY_COMPACT_HIGHWAYS for parity; verify
+    //  the existing tertiary/unclassified/residential behaviors are intact)
+    // =================================================================
+
+    @Test
+    void testRoadNetworkOtherClassesUnchanged() {
+        List<String> failures = new ArrayList<>();
+
+        // Higher tier — still always ZERO_MINUS
+        assertScaleCollect(failures, ZERO_MINUS, "motorway",
+                "highway", "motorway");
+        assertScaleCollect(failures, ZERO_MINUS, "trunk",
+                "highway", "trunk");
+        assertScaleCollect(failures, ZERO_MINUS, "primary",
+                "highway", "primary");
+        assertScaleCollect(failures, ZERO_MINUS, "primary_link",
+                "highway", "primary_link");
+
+        // Tertiary + gravel — long-standing behavior, must still be ZERO_PLUS
+        assertScaleCollect(failures, ZERO_PLUS, "tertiary + gravel",
+                "highway", "tertiary", "surface", "gravel");
+        assertScaleCollect(failures, ZERO_PLUS, "unclassified + gravel",
+                "highway", "unclassified", "surface", "gravel");
+        assertScaleCollect(failures, ZERO_PLUS, "residential + gravel",
+                "highway", "residential", "surface", "gravel");
+
+        // tertiary_link — newly included, should behave like tertiary
+        assertScaleCollect(failures, ZERO_PLUS, "tertiary_link + gravel",
+                "highway", "tertiary_link", "surface", "gravel");
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
     // Encoded value pipeline integration
     // =================================================================
 

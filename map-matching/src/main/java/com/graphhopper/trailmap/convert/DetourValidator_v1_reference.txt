@@ -1,0 +1,168 @@
+package com.graphhopper.trailmap.convert;
+
+import com.graphhopper.GHRequest;
+import com.graphhopper.GHResponse;
+import com.graphhopper.GraphHopper;
+import com.graphhopper.matching.Observation;
+import com.graphhopper.util.CustomModel;
+import com.graphhopper.util.DistanceCalcEarth;
+import com.graphhopper.util.shapes.GHPoint;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+
+/**
+ * Plug-in validator for detour-split coords regions.
+ *
+ * <p>The {@link RegionSegmenter} emits {@link TrackRegion.Unmatched} regions whenever the
+ * matched-edge path has a strong loop signal (matched length ≫ straight-line between two
+ * well-mapped observations). This is the right call when the matcher's loop reflects a
+ * real off-network span (railway crossing, river, missing bridge — direct route between
+ * the boundary observations would also have to go way around). It is the wrong call when
+ * the matcher's loop is a quirk of the HMM (e.g. picking a parallel road over the user's
+ * actual route) and a direct route between the boundary observations is in fact short.
+ *
+ * <p>This validator distinguishes the two by asking GraphHopper's {@code /route} between
+ * the detour's boundary snap points. If the routed distance is close to the straight-line
+ * distance, no real obstacle exists — the detour is a false positive and should not become
+ * a coordinates segment.
+ *
+ * <p>Design notes:
+ * <ul>
+ *   <li>Pure additive plug-in. Caller (typically {@link TrackToRouteConverter}) decides
+ *     whether to run the validator. If unused, the detection pipeline behaves exactly as
+ *     before.
+ *   <li>Only detour-split Unmatched regions are valid inputs. Snap-distance Unmatched
+ *     regions (where the obs themselves are far from the road network) are not detour-
+ *     splits and must not be passed in.
+ *   <li>The validator emits a recommendation; the caller decides how to act on it.
+ * </ul>
+ */
+public class DetourValidator {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(DetourValidator.class);
+    private static final DistanceCalcEarth DIST = DistanceCalcEarth.DIST_EARTH;
+
+    /** Multiplier on straight-line distance below which the detour is treated as spurious.
+     *  When routed distance &lt; α × straight, a direct route exists that's barely longer
+     *  than crow-flies, so no real obstacle is between the boundary obs. The matcher's
+     *  long matched path was an HMM artifact. */
+    static final double ROUTE_VS_STRAIGHT_MULTIPLIER = 2.0;
+
+    /** Minimum straight-line distance between the detour's boundary obs for the drop rule
+     *  to apply. Below this threshold the obs are essentially the same point (duplicate
+     *  GPX samples are common in real tracks), and {@code /route(A,A)} returns 0 — which
+     *  would incorrectly trip the drop rule. A long matched loop between two near-identical
+     *  positions is itself the signal that the route must go around, so we always KEEP
+     *  detours with very small straight-line boundaries. */
+    static final double MIN_STRAIGHT_FOR_DROP_M = 5.0;
+
+    private final GraphHopper graphHopper;
+
+    public DetourValidator(GraphHopper graphHopper) {
+        this.graphHopper = graphHopper;
+    }
+
+    /**
+     * Locates a contiguous detour-split block starting at {@code regions[startIdx]}.
+     *
+     * <p>A detour-split block is one or more consecutive Unmatched regions bookended by
+     * Matched regions whose boundary obs coincide with the Unmatched chain's outer obs.
+     * Adjacent-chained detours (where two detours share a boundary obs, e.g.
+     * obs[12]→[14] and obs[14]→[15]) get emitted by the segmenter as two consecutive
+     * Unmatched regions and a singleton Matched in between gets folded into one of them
+     * — net result: a run of Unmatched regions. This method walks the run and returns the
+     * outer boundary indices.
+     *
+     * <p>Returns {@code null} when {@code regions[startIdx]} is not a detour-split block:
+     * either it isn't Unmatched, or the surrounding Matched regions don't share boundary
+     * obs with the Unmatched chain (i.e. it's a snap-distance gap, not a detour-split).
+     */
+    public DetourBlock findDetourBlock(List<TrackRegion> regions, int startIdx) {
+        if (startIdx == 0 || startIdx >= regions.size() - 1) return null;
+        if (!(regions.get(startIdx) instanceof TrackRegion.Unmatched first)) return null;
+        if (!(regions.get(startIdx - 1) instanceof TrackRegion.Matched prevMatched)) return null;
+        if (prevMatched.lastObservation() != first.firstObservation()) return null;
+
+        // Walk forward across consecutive Unmatched whose obs ranges chain (next.first == prev.last).
+        int lastUnmIdx = startIdx;
+        int chainLastObs = first.lastObservation();
+        for (int k = startIdx + 1; k < regions.size(); k++) {
+            if (!(regions.get(k) instanceof TrackRegion.Unmatched cont)) break;
+            if (cont.firstObservation() != chainLastObs) break;
+            chainLastObs = cont.lastObservation();
+            lastUnmIdx = k;
+        }
+        // After the chain there must be a Matched whose firstObservation matches chainLastObs.
+        if (lastUnmIdx + 1 >= regions.size()) return null;
+        if (!(regions.get(lastUnmIdx + 1) instanceof TrackRegion.Matched nextMatched)) return null;
+        if (nextMatched.firstObservation() != chainLastObs) return null;
+
+        return new DetourBlock(
+                startIdx, lastUnmIdx,
+                first.firstObservation(), chainLastObs,
+                prevMatched.endSnap(), nextMatched.startSnap());
+    }
+
+    /**
+     * Asks /route between the detour block's boundary snap points and decides whether the
+     * block should be dropped (replaced by a single short routed bypass) or kept as coords.
+     */
+    public Verdict validate(DetourBlock block,
+                            String profile,
+                            CustomModel customModel,
+                            List<Observation> observations) {
+        GHPoint obsA = observations.get(block.firstObs).getPoint();
+        GHPoint obsB = observations.get(block.lastObs).getPoint();
+        double straight = DIST.calcDist(obsA.lat, obsA.lon, obsB.lat, obsB.lon);
+
+        GHRequest req = new GHRequest(block.snapA, block.snapB);
+        req.setProfile(profile);
+        if (customModel != null) req.setCustomModel(customModel);
+        req.putHint("instructions", false);
+        req.putHint("calc_points", true);
+
+        GHResponse rsp;
+        try {
+            rsp = graphHopper.route(req);
+        } catch (Exception e) {
+            LOGGER.debug("DetourValidator: routing threw for obs[{}..{}]: {}",
+                    block.firstObs, block.lastObs, e.getMessage());
+            return Verdict.keep(0, straight, "routing threw");
+        }
+        if (rsp.hasErrors() || rsp.getBest() == null) {
+            return Verdict.keep(0, straight, "route has errors / no best");
+        }
+        double routeDist = rsp.getBest().getDistance();
+
+        if (straight <= MIN_STRAIGHT_FOR_DROP_M) {
+            return Verdict.keep(routeDist, straight, "straight below MIN_STRAIGHT_FOR_DROP_M");
+        }
+        if (routeDist < ROUTE_VS_STRAIGHT_MULTIPLIER * straight) {
+            return Verdict.drop(routeDist, straight,
+                    "route " + Math.round(routeDist) + "m < "
+                            + ROUTE_VS_STRAIGHT_MULTIPLIER + "× straight " + Math.round(straight) + "m");
+        }
+        return Verdict.keep(routeDist, straight,
+                "route " + Math.round(routeDist) + "m ≥ "
+                        + ROUTE_VS_STRAIGHT_MULTIPLIER + "× straight " + Math.round(straight) + "m");
+    }
+
+    /** Detour-split block found by {@link #findDetourBlock(List, int)}. Spans regions
+     *  [firstRegionIdx..lastRegionIdx] (both inclusive); obs [firstObs..lastObs]; with the
+     *  routing endpoints {@code snapA} (from the preceding Matched) and {@code snapB}
+     *  (from the following Matched). */
+    public record DetourBlock(int firstRegionIdx,
+                              int lastRegionIdx,
+                              int firstObs,
+                              int lastObs,
+                              GHPoint snapA,
+                              GHPoint snapB) {}
+
+    /** Validator's recommendation for a detour block, plus the measurements it used. */
+    public record Verdict(boolean dropDetour, double routeDistM, double straightM, String reason) {
+        static Verdict drop(double r, double s, String reason) { return new Verdict(true, r, s, reason); }
+        static Verdict keep(double r, double s, String reason) { return new Verdict(false, r, s, reason); }
+    }
+}

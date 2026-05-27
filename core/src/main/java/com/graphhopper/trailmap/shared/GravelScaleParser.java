@@ -54,8 +54,10 @@ public class GravelScaleParser implements TagParser {
 
         // =================================================================
         // RULE 2: Asphalt surfaces -> ZERO_MINUS (paved)
-        // anyOf: [ASPHALT, MOTORWAY, MAJOR_ROAD, SECONDARY_ROAD_NO_SURFACE, CYCLEWAY_PAVED]
+        // anyOf: [ASPHALT, MOTORWAY, MAJOR_ROAD, CYCLEWAY_PAVED]
         // noneOf: [UNPAVED_SURFACE]
+        // Note: secondary intentionally NOT treated as default-paved — it is a boundary
+        // class (can be paved or unpaved); handled by rule 4 LIKELY_HIGHWAY_COMPACT.
         // =================================================================
         if (matchesAsphaltRule(way) && !matchesUnpavedSurface(way)) {
             return GravelScale.ZERO_MINUS;
@@ -314,7 +316,7 @@ public class GravelScaleParser implements TagParser {
         return "ferry".equals(way.getTag("route"));
     }
 
-    // --- ASPHALT pattern (includes motorway, major road, secondary no surface, cycleway paved) ---
+    // --- ASPHALT pattern (includes motorway, major road, cycleway paved) ---
     private boolean matchesAsphaltRule(ReaderWay way) {
         String surface = way.getTag("surface");
         String highway = way.getTag("highway");
@@ -334,10 +336,9 @@ public class GravelScaleParser implements TagParser {
             return true;
         }
 
-        // SECONDARY_ROAD_NO_SURFACE: highway in [secondary, secondary_link] AND no surface tag
-        if (highway != null && isSecondaryRoad(highway) && surface == null) {
-            return true;
-        }
+        // Secondary is intentionally NOT here: secondary with no surface is treated as
+        // boundary-class (default ZERO_PLUS via LIKELY_HIGHWAY_COMPACT in rule 4), not
+        // assumed paved. Secondary roads can be either paved or unpaved (esp. Nordic).
 
         // CYCLEWAY_PAVED: highway in [cycleway, footway] AND surface in [paved, asphalt]
         if (highway != null && isCyclewayOrFootway(highway) && surface != null && isPavedSurface(surface)) {
@@ -735,7 +736,8 @@ public class GravelScaleParser implements TagParser {
     );
 
     private static final Set<String> LIKELY_COMPACT_HIGHWAYS = new HashSet<>(
-        Arrays.asList("tertiary", "unclassified", "residential")
+        Arrays.asList("secondary", "secondary_link", "tertiary", "tertiary_link",
+                      "unclassified", "residential")
     );
 
     private static final Set<String> UNPAVED_COMPACT_SURFACES = new HashSet<>(
@@ -765,10 +767,6 @@ public class GravelScaleParser implements TagParser {
     private boolean isMajorRoad(String highway) {
         return "trunk".equals(highway) || "trunk_link".equals(highway) ||
                "primary".equals(highway) || "primary_link".equals(highway);
-    }
-
-    private boolean isSecondaryRoad(String highway) {
-        return "secondary".equals(highway) || "secondary_link".equals(highway);
     }
 
     private boolean isCyclewayOrFootway(String highway) {
