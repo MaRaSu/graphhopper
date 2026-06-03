@@ -478,6 +478,130 @@ class GravelScaleParserTest {
     }
 
     // =================================================================
+    // ROAD NETWORK — dirt / ground / sand / mud clamp (rule 1b)
+    // Per agreed business logic, lower-tier road-network highways with
+    // these surfaces must clamp to ZERO_PLUS instead of falling through
+    // to rule 11 FOUR. Implemented as an early clamp rule (rule 1b)
+    // before the FOUR rule's catch-all and before exclusion logic in
+    // rules 4-9 can prevent classification.
+    // =================================================================
+
+    @Test
+    void testRoadNetworkDifficultSurfaceClamp() {
+        List<String> failures = new ArrayList<>();
+
+        for (String hw : new String[]{
+                "secondary", "secondary_link", "tertiary", "tertiary_link",
+                "unclassified", "residential"}) {
+            assertScaleCollect(failures, ZERO_PLUS, hw + " + dirt",
+                    "highway", hw, "surface", "dirt");
+            assertScaleCollect(failures, ZERO_PLUS, hw + " + ground",
+                    "highway", hw, "surface", "ground");
+            assertScaleCollect(failures, ZERO_PLUS, hw + " + sand",
+                    "highway", hw, "surface", "sand");
+            assertScaleCollect(failures, ZERO_PLUS, hw + " + mud",
+                    "highway", hw, "surface", "mud");
+        }
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
+    // REGRESSION GUARD — non-road-network classes must keep prior behavior
+    // The new early clamp only fires for LIKELY_COMPACT_HIGHWAYS. All other
+    // highway classes must reach the same rule they did before.
+    // =================================================================
+
+    @Test
+    void testNonRoadNetworkDifficultSurfaceUnchanged() {
+        List<String> failures = new ArrayList<>();
+
+        // Paths — rule 11 FOUR catches via "path" branch
+        assertScaleCollect(failures, FOUR, "path + dirt",
+                "highway", "path", "surface", "dirt");
+        assertScaleCollect(failures, FOUR, "path + ground",
+                "highway", "path", "surface", "ground");
+        assertScaleCollect(failures, FOUR, "path + sand",
+                "highway", "path", "surface", "sand");
+        assertScaleCollect(failures, FOUR, "path + mud",
+                "highway", "path", "surface", "mud");
+
+        // Tracks — rule 10 (THREE) catches dirt/ground/gravel; rule 11 catches mud/sand
+        assertScaleCollect(failures, THREE, "track + dirt",
+                "highway", "track", "surface", "dirt");
+        assertScaleCollect(failures, THREE, "track + ground",
+                "highway", "track", "surface", "ground");
+        assertScaleCollect(failures, FOUR, "track + mud",
+                "highway", "track", "surface", "mud");
+        assertScaleCollect(failures, FOUR, "track + sand",
+                "highway", "track", "surface", "sand");
+
+        // Service — currently rule 7 "service" branch fires for dirt/ground (ONE),
+        // rule 11 catches mud/sand (FOUR). Service is NOT in LIKELY_COMPACT_HIGHWAYS.
+        assertScaleCollect(failures, ONE, "service + dirt",
+                "highway", "service", "surface", "dirt");
+        assertScaleCollect(failures, ONE, "service + ground",
+                "highway", "service", "surface", "ground");
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
+    // ITEM #2 — primary + compacted (no code change needed in this parser)
+    //
+    // gravel_scale's rule 2 already has an outer guard `&& !matchesUnpavedSurface`
+    // where UNPAVED_SURFACES = {unpaved, compacted, gravel, fine_gravel}. So any
+    // motorway/trunk/primary tagged with any of those four surfaces already skips
+    // rule 2 and falls through to later rules. compacted → ZERO_PLUS via rule 4's
+    // dedicated check. gravel/unpaved → UNKNOWN (conservative fall-through).
+    //
+    // These tests pin the behavior so future edits don't regress it.
+    // =================================================================
+
+    @Test
+    void testPrimaryCompactedException() {
+        List<String> failures = new ArrayList<>();
+
+        // primary/primary_link + compacted → ZERO_PLUS (already correct via existing guard)
+        assertScaleCollect(failures, ZERO_PLUS, "primary + compacted",
+                "highway", "primary", "surface", "compacted");
+        assertScaleCollect(failures, ZERO_PLUS, "primary_link + compacted",
+                "highway", "primary_link", "surface", "compacted");
+
+        // trunk/motorway + compacted also fall through to ZERO_PLUS (same guard)
+        assertScaleCollect(failures, ZERO_PLUS, "trunk + compacted",
+                "highway", "trunk", "surface", "compacted");
+        assertScaleCollect(failures, ZERO_PLUS, "motorway + compacted",
+                "highway", "motorway", "surface", "compacted");
+
+        // Generic unpaved tags on primary → UNKNOWN (conservative — pre-existing
+        // gravel_scale behavior; asymmetric with predicted_surface where these
+        // remain ASPHALT. Not addressed in this scope.)
+        assertScaleCollect(failures, UNKNOWN, "primary + gravel (asymmetry: PS returns ASPHALT)",
+                "highway", "primary", "surface", "gravel");
+        assertScaleCollect(failures, UNKNOWN, "primary + unpaved (same asymmetry)",
+                "highway", "primary", "surface", "unpaved");
+
+        // Asphalt-family surfaces on primary: ZERO_MINUS (unchanged)
+        assertScaleCollect(failures, ZERO_MINUS, "primary + asphalt",
+                "highway", "primary", "surface", "asphalt");
+        assertScaleCollect(failures, ZERO_MINUS, "primary + paved",
+                "highway", "primary", "surface", "paved");
+
+        // Primary with no surface: ZERO_MINUS (default unchanged)
+        assertScaleCollect(failures, ZERO_MINUS, "primary / no surface",
+                "highway", "primary");
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
     // Encoded value pipeline integration
     // =================================================================
 

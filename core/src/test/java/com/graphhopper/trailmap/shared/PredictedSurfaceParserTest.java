@@ -212,6 +212,126 @@ class PredictedSurfaceParserTest {
     }
 
     // =================================================================
+    // ROAD NETWORK — dirt / ground / sand / mud clamp
+    // Per agreed business logic, road-network highways must only produce
+    // ASPHALT / AMBIGUOUS / COMPACTED / FINE_GRAVEL. The GROUND / SAND / MUD
+    // rules don't filter on highway class, so without the fix a road tagged
+    // with these surfaces leaks into a trail-grade category. The clamp:
+    // road-network + {dirt, ground, sand, mud} → COMPACTED.
+    // =================================================================
+
+    @Test
+    void testRoadNetworkDifficultSurfaceClamp() {
+        List<String> failures = new ArrayList<>();
+
+        for (String hw : new String[]{
+                "secondary", "secondary_link", "tertiary", "tertiary_link",
+                "unclassified", "residential"}) {
+            assertSurfaceCollect(failures, COMPACTED, hw + " + dirt",
+                    "highway", hw, "surface", "dirt");
+            assertSurfaceCollect(failures, COMPACTED, hw + " + ground",
+                    "highway", hw, "surface", "ground");
+            assertSurfaceCollect(failures, COMPACTED, hw + " + sand",
+                    "highway", hw, "surface", "sand");
+            assertSurfaceCollect(failures, COMPACTED, hw + " + mud",
+                    "highway", hw, "surface", "mud");
+        }
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
+    // REGRESSION GUARD — non-road-network classes with same surfaces
+    // The clamp only applies to LIKELY_COMPACT_HIGHWAYS (lower-tier road
+    // network). Paths, tracks, service, cycleway, footway must still reach
+    // the GROUND / SAND / MUD rules unchanged.
+    // =================================================================
+
+    @Test
+    void testNonRoadNetworkDifficultSurfaceUnchanged() {
+        List<String> failures = new ArrayList<>();
+
+        // Paths and tracks — go to GROUND (rule 4) for dirt/ground
+        assertSurfaceCollect(failures, GROUND, "path + dirt",
+                "highway", "path", "surface", "dirt");
+        assertSurfaceCollect(failures, GROUND, "path + ground",
+                "highway", "path", "surface", "ground");
+        assertSurfaceCollect(failures, GROUND, "track + dirt",
+                "highway", "track", "surface", "dirt");
+        assertSurfaceCollect(failures, GROUND, "track + ground",
+                "highway", "track", "surface", "ground");
+
+        // SAND / MUD rules require highway in {path, track}
+        assertSurfaceCollect(failures, SAND, "path + sand",
+                "highway", "path", "surface", "sand");
+        assertSurfaceCollect(failures, SAND, "track + sand",
+                "highway", "track", "surface", "sand");
+        assertSurfaceCollect(failures, MUD, "path + mud",
+                "highway", "path", "surface", "mud");
+        assertSurfaceCollect(failures, MUD, "track + mud",
+                "highway", "track", "surface", "mud");
+
+        // Service / cycleway / footway — NOT in LIKELY_COMPACT_HIGHWAYS,
+        // dirt/ground still go to GROUND, sand/mud unmatched → UNKNOWN
+        assertSurfaceCollect(failures, GROUND, "service + dirt",
+                "highway", "service", "surface", "dirt");
+        assertSurfaceCollect(failures, GROUND, "cycleway + dirt",
+                "highway", "cycleway", "surface", "dirt");
+        assertSurfaceCollect(failures, GROUND, "footway + ground",
+                "highway", "footway", "surface", "ground");
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
+    // ITEM #2 — primary + surface=compacted trusts the mapper's positive
+    // declaration. All other surfaces on primary still default to ASPHALT.
+    // =================================================================
+
+    @Test
+    void testPrimaryCompactedException() {
+        List<String> failures = new ArrayList<>();
+
+        // The exception: primary + compacted → COMPACTED (was ASPHALT)
+        assertSurfaceCollect(failures, COMPACTED, "primary + compacted",
+                "highway", "primary", "surface", "compacted");
+        assertSurfaceCollect(failures, COMPACTED, "primary_link + compacted",
+                "highway", "primary_link", "surface", "compacted");
+
+        // Generic unpaved tags on primary: still ASPHALT (don't trust generic)
+        assertSurfaceCollect(failures, ASPHALT, "primary + gravel (don't trust generic)",
+                "highway", "primary", "surface", "gravel");
+        assertSurfaceCollect(failures, ASPHALT, "primary + unpaved (don't trust generic)",
+                "highway", "primary", "surface", "unpaved");
+        assertSurfaceCollect(failures, ASPHALT, "primary + dirt (don't trust generic)",
+                "highway", "primary", "surface", "dirt");
+
+        // Trunk and motorway: still always ASPHALT, even with compacted (out of scope)
+        assertSurfaceCollect(failures, ASPHALT, "trunk + compacted (still ASPHALT, out of scope)",
+                "highway", "trunk", "surface", "compacted");
+        assertSurfaceCollect(failures, ASPHALT, "motorway + compacted (still ASPHALT)",
+                "highway", "motorway", "surface", "compacted");
+
+        // Asphalt-family surfaces on primary: ASPHALT (unchanged)
+        assertSurfaceCollect(failures, ASPHALT, "primary + asphalt",
+                "highway", "primary", "surface", "asphalt");
+        assertSurfaceCollect(failures, ASPHALT, "primary + paved",
+                "highway", "primary", "surface", "paved");
+
+        // Primary with no surface: still ASPHALT (default unchanged)
+        assertSurfaceCollect(failures, ASPHALT, "primary / no surface",
+                "highway", "primary");
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
     // FERRY (rule 1)
     // =================================================================
 

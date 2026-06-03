@@ -74,6 +74,110 @@ public class ConvertTrackRequest {
     @JsonProperty("debug")
     private Boolean debug;
 
+    // ---------------------------------------------------------------------
+    // Trailmap custom matcher (experimental). All fields below are inert unless
+    // custom_matcher == true, in which case the request is matched by
+    // com.graphhopper.trailmap.matching.TrailmapMapMatching instead of stock GH.
+    // See docs/gh_map_matcher_learnings.md and MatcherConfig.
+    // ---------------------------------------------------------------------
+
+    /** Master switch. When false (default), the existing (lightly-modified GH) matcher is
+     *  used. When true, the forked Trailmap matcher is used with the cm_* parameters below
+     *  (each defaulting to canonical/off, so {@code custom_matcher=true} alone reproduces
+     *  stock GH behaviour — Phase 0). */
+    @JsonProperty("custom_matcher")
+    private Boolean customMatcher;
+
+    /** Phase 1 (M1): candidate search radius = mult × sigma. Null = canonical expand-by-sigma. */
+    @JsonProperty("cm_candidate_radius_sigma_mult")
+    private Double cmCandidateRadiusSigmaMult;
+
+    /** Phase 1 (M1): lower floor [m] for the decoupled candidate radius. */
+    @JsonProperty("cm_candidate_radius_min_m")
+    private Double cmCandidateRadiusMinM;
+
+    /** Phase 1 (M1): upper cap [m] for the decoupled candidate radius. */
+    @JsonProperty("cm_candidate_radius_max_m")
+    private Double cmCandidateRadiusMaxM;
+
+    /** Phase 6 (P3): enable two-pass sigma auto-estimation. */
+    @JsonProperty("cm_auto_sigma")
+    private Boolean cmAutoSigma;
+
+    /** Phase 6 (P3): sigma [m] for the probe pass. */
+    @JsonProperty("cm_auto_sigma_seed_m")
+    private Double cmAutoSigmaSeedM;
+
+    /** Phase 6 (P3): probe snaps above this [m] are off-grid and excluded from the estimate. */
+    @JsonProperty("cm_auto_sigma_outlier_m")
+    private Double cmAutoSigmaOutlierM;
+
+    /** Phase 6 (P3): lower clamp [m] for the estimated sigma. */
+    @JsonProperty("cm_auto_sigma_min_m")
+    private Double cmAutoSigmaMinM;
+
+    /** Phase 6 (P3): upper clamp [m] for the estimated sigma. */
+    @JsonProperty("cm_auto_sigma_max_m")
+    private Double cmAutoSigmaMaxM;
+
+    /** Phase 6 (P3): estimatedSigma = scale × robustUpperEstimate(snaps). */
+    @JsonProperty("cm_auto_sigma_scale")
+    private Double cmAutoSigmaScale;
+
+    /** Phase 6 (P3): percentile (0..1) of snap distances used as the robust upper sigma
+     *  estimate. Higher = looser threshold (passes corner cuts on hard-simplified routes but
+     *  risks letting shortcuts back in). Default 0.9. */
+    @JsonProperty("cm_auto_sigma_percentile")
+    private Double cmAutoSigmaPercentile;
+
+    /** Phase 5 (P1): max gap [m] between consecutive observations; densify above it. Null = off. */
+    @JsonProperty("cm_densify_max_gap_m")
+    private Double cmDensifyMaxGapM;
+
+    /** Optional transition beta override for the custom matcher. Null = config default (2.0). */
+    @JsonProperty("cm_beta")
+    private Double cmBeta;
+
+    /** Phase 2 (M2a): profile-aware emission penalty strength. Null/&le;0 = off (profile-blind). */
+    @JsonProperty("cm_emission_desirability_lambda")
+    private Double cmEmissionDesirabilityLambda;
+
+    /** Phase 2 (M2a): deadband ratio — ways within this multiple of the best nearby weight/m
+     *  pay no penalty. Default 1.5. */
+    @JsonProperty("cm_emission_desirability_deadband")
+    private Double cmEmissionDesirabilityDeadband;
+
+    /** Segmentation v2 (§8): joint emission+transition coords classification with aggressive
+     *  outward expansion. When true, {@link RegionSegmenter} uses the parallel v2 classifier
+     *  instead of the original Stage A–D path. Independent of {@code custom_matcher} — it only
+     *  affects the segmentation stage (works on either matcher's result). Off by default. */
+    @JsonProperty("cm_segmentation_v2")
+    private Boolean cmSegmentationV2;
+
+    /** Optimizer waypoint candidates restricted to kept (Viterbi) observations (those on the
+     *  matched path), dropping interior filtered obs. Default ON (null = on). Send false to
+     *  restore the old behaviour (all observations as candidates). Affects the optimizer stage. */
+    @JsonProperty("cm_optimizer_kept_obs_only")
+    private Boolean cmOptimizerKeptObsOnly;
+
+    /** Adaptive per-observation σ (V2). When true, the matcher derives a per-obs σ from a cheap
+     *  snap-only pre-pass and uses it for candidate radius + emission (filter/segmenter use a
+     *  representative capped σ). Replaces the auto-sigma probe-pass Viterbi. Default off. */
+    @JsonProperty("cm_adaptive_sigma")
+    private Boolean cmAdaptiveSigma;
+
+    /** Outlier-condition the per-obs adaptive σ window (drop off-grid snaps so σ tracks on-network
+     *  noise, not off-road distance). Only relevant when {@code cm_adaptive_sigma} is on.
+     *  Default ON (null = on). Send false to restore the un-filtered windowed σ. */
+    @JsonProperty("cm_adaptive_sigma_outlier_filter")
+    private Boolean cmAdaptiveSigmaOutlierFilter;
+
+    /** Optimizer twin-edge tolerance: rescue a leg from coords demotion when the only
+     *  matcher-vs-/route difference is a coincident parallel edge over the same node pair
+     *  (e.g. cycleway + footway over the same stripe). Default ON (null = on). Send false to A/B. */
+    @JsonProperty("cm_optimizer_twin_edge_tolerance")
+    private Boolean cmOptimizerTwinEdgeTolerance;
+
     public List<double[]> getTrack() { return track; }
     public void setTrack(List<double[]> track) { this.track = track; }
 
@@ -106,4 +210,64 @@ public class ConvertTrackRequest {
 
     public Boolean getDebug() { return debug; }
     public void setDebug(Boolean debug) { this.debug = debug; }
+
+    public Boolean getCustomMatcher() { return customMatcher; }
+    public void setCustomMatcher(Boolean customMatcher) { this.customMatcher = customMatcher; }
+
+    public Double getCmCandidateRadiusSigmaMult() { return cmCandidateRadiusSigmaMult; }
+    public void setCmCandidateRadiusSigmaMult(Double v) { this.cmCandidateRadiusSigmaMult = v; }
+
+    public Double getCmCandidateRadiusMinM() { return cmCandidateRadiusMinM; }
+    public void setCmCandidateRadiusMinM(Double v) { this.cmCandidateRadiusMinM = v; }
+
+    public Double getCmCandidateRadiusMaxM() { return cmCandidateRadiusMaxM; }
+    public void setCmCandidateRadiusMaxM(Double v) { this.cmCandidateRadiusMaxM = v; }
+
+    public Boolean getCmAutoSigma() { return cmAutoSigma; }
+    public void setCmAutoSigma(Boolean v) { this.cmAutoSigma = v; }
+
+    public Double getCmAutoSigmaSeedM() { return cmAutoSigmaSeedM; }
+    public void setCmAutoSigmaSeedM(Double v) { this.cmAutoSigmaSeedM = v; }
+
+    public Double getCmAutoSigmaOutlierM() { return cmAutoSigmaOutlierM; }
+    public void setCmAutoSigmaOutlierM(Double v) { this.cmAutoSigmaOutlierM = v; }
+
+    public Double getCmAutoSigmaMinM() { return cmAutoSigmaMinM; }
+    public void setCmAutoSigmaMinM(Double v) { this.cmAutoSigmaMinM = v; }
+
+    public Double getCmAutoSigmaMaxM() { return cmAutoSigmaMaxM; }
+    public void setCmAutoSigmaMaxM(Double v) { this.cmAutoSigmaMaxM = v; }
+
+    public Double getCmAutoSigmaScale() { return cmAutoSigmaScale; }
+    public void setCmAutoSigmaScale(Double v) { this.cmAutoSigmaScale = v; }
+
+    public Double getCmAutoSigmaPercentile() { return cmAutoSigmaPercentile; }
+    public void setCmAutoSigmaPercentile(Double v) { this.cmAutoSigmaPercentile = v; }
+
+    public Double getCmDensifyMaxGapM() { return cmDensifyMaxGapM; }
+    public void setCmDensifyMaxGapM(Double v) { this.cmDensifyMaxGapM = v; }
+
+    public Double getCmBeta() { return cmBeta; }
+    public void setCmBeta(Double v) { this.cmBeta = v; }
+
+    public Double getCmEmissionDesirabilityLambda() { return cmEmissionDesirabilityLambda; }
+    public void setCmEmissionDesirabilityLambda(Double v) { this.cmEmissionDesirabilityLambda = v; }
+
+    public Double getCmEmissionDesirabilityDeadband() { return cmEmissionDesirabilityDeadband; }
+    public void setCmEmissionDesirabilityDeadband(Double v) { this.cmEmissionDesirabilityDeadband = v; }
+
+    public Boolean getCmSegmentationV2() { return cmSegmentationV2; }
+    public void setCmSegmentationV2(Boolean v) { this.cmSegmentationV2 = v; }
+
+    public Boolean getCmOptimizerKeptObsOnly() { return cmOptimizerKeptObsOnly; }
+    public void setCmOptimizerKeptObsOnly(Boolean v) { this.cmOptimizerKeptObsOnly = v; }
+
+    public Boolean getCmAdaptiveSigma() { return cmAdaptiveSigma; }
+    public void setCmAdaptiveSigma(Boolean v) { this.cmAdaptiveSigma = v; }
+
+    public Boolean getCmAdaptiveSigmaOutlierFilter() { return cmAdaptiveSigmaOutlierFilter; }
+    public void setCmAdaptiveSigmaOutlierFilter(Boolean v) { this.cmAdaptiveSigmaOutlierFilter = v; }
+
+    public Boolean getCmOptimizerTwinEdgeTolerance() { return cmOptimizerTwinEdgeTolerance; }
+    public void setCmOptimizerTwinEdgeTolerance(Boolean v) { this.cmOptimizerTwinEdgeTolerance = v; }
 }

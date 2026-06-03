@@ -101,6 +101,17 @@ public class ConvertTrackResponse {
         @JsonProperty("distance_m")
         private double distanceM;
 
+        /** Start-of-segment travel-direction heading (degrees, 0–360, 0=north, clockwise) the
+         *  client must pass as {@code headings=[initialHeading, null]} when rendering this
+         *  {@code followRoads} segment, so its {@code /route} reproduces the path the server
+         *  validated. Emitted ONLY when the segment is not the route's first and its previous
+         *  segment is also {@code followRoads}; omitted otherwise (a missing field is the
+         *  explicit "no heading constraint" signal the client relies on). Class-level
+         *  {@code NON_NULL} keeps it out of the JSON when null. The client applies its own
+         *  global heading_penalty (60); the server does not send a penalty. */
+        @JsonProperty("initialHeading")
+        private Double initialHeading;
+
         public Segment() {}
 
         public static Segment routed(String start, String end, double distanceM) {
@@ -109,6 +120,12 @@ public class ConvertTrackResponse {
             s.start = start;
             s.end = end;
             s.distanceM = distanceM;
+            return s;
+        }
+
+        public static Segment routed(String start, String end, double distanceM, Double initialHeading) {
+            Segment s = routed(start, end, distanceM);
+            s.initialHeading = initialHeading;
             return s;
         }
 
@@ -136,6 +153,9 @@ public class ConvertTrackResponse {
 
         public double getDistanceM() { return distanceM; }
         public void setDistanceM(double distanceM) { this.distanceM = distanceM; }
+
+        public Double getInitialHeading() { return initialHeading; }
+        public void setInitialHeading(Double initialHeading) { this.initialHeading = initialHeading; }
     }
 
     /** Diagnostic block. Present only when the request opted into debug mode. Shape is

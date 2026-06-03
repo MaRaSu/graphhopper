@@ -7,8 +7,11 @@ import com.graphhopper.ResponsePath;
 import com.graphhopper.matching.EdgeMatch;
 import com.graphhopper.matching.Observation;
 import com.graphhopper.storage.Graph;
+import com.graphhopper.util.AngleCalc;
 import com.graphhopper.util.CustomModel;
 import com.graphhopper.util.DistanceCalcEarth;
+import com.graphhopper.util.EdgeExplorer;
+import com.graphhopper.util.EdgeIterator;
 import com.graphhopper.util.EdgeIteratorState;
 import com.graphhopper.util.PointList;
 import com.graphhopper.util.details.PathDetail;
@@ -18,7 +21,9 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Stage 3 of the conversion pipeline. Given one {@link TrackRegion.Matched}, choose the
@@ -73,8 +78,18 @@ public class RoutedRegionOptimizer {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RoutedRegionOptimizer.class);
 
-    /** Hard cap on probe calls per region to prevent runaway. */
-    private static final int MAX_PROBES_PER_REGION = 400;
+    /** Per-cursor probe guard — the real anti-thrash limit. A single cursor's exponential+binary
+     *  search needs only O(log span) probes (~28 even for a ~9.5k-candidate region). This caps a
+     *  pathological cursor; on hit the search commits best-so-far (or escalates one coords step) and
+     *  CONTINUES, so the region always runs to its end. The OUTER loop is progress-bounded (cursor
+     *  strictly increases), so this cannot run away — replacing the old per-region total cap that
+     *  aborted legitimately-large matched regions mid-way (tail-drop → 44 km chord). */
+    private static final int MAX_PROBES_PER_CURSOR = 64;
+
+    /** Generous whole-region backstop (paranoia only — the progress-bounded outer loop cannot run
+     *  away). On hit, the remaining tail is emitted as a faithful coordinates leg, NEVER dropped, so
+     *  a budget hit degrades to "raw track drawn", never a straight chord across the map. */
+    private static final int MAX_PROBES_PER_REGION = 50_000;
 
     /**
      * For a U-turn apex pair to be treated as a real user turn (and force a waypoint),
@@ -100,6 +115,23 @@ public class RoutedRegionOptimizer {
      * road 30–50 m away).
      */
     public static final double DEFAULT_MAX_LEG_DEVIATION_M = 20.0;
+
+    /**
+     * Soft start-heading penalty (seconds) applied to each probe {@code /route} call that
+     * carries an inherited heading. Mirrors the client's heading-chain rendering: each
+     * rendered leg's exit bearing becomes the next leg's start heading, so a probe must
+     * validate the heading-constrained path the client will actually draw — not a plain
+     * point-to-point path that may differ at the start junction.
+     *
+     * <p>The value MUST match whatever the client passes as {@code heading_penalty} when
+     * it renders {@code /route} legs (cross-team dependency). Confirmed from the client's
+     * actual request (2026-06-01): the client uses {@code heading_penalty=60} with
+     * {@code headings=[exitBearing, null]}. A mismatch reintroduces the very divergence this
+     * feature fixes (optimizer validates one path, client renders another).
+     */
+    public static final int CLIENT_HEADING_PENALTY_S = 60;
+
+    private static final AngleCalc ANGLE_CALC = AngleCalc.ANGLE_CALC;
 
     /**
      * Which reference the probe rule compares {@code /route}'s output against. See
@@ -137,6 +169,23 @@ public class RoutedRegionOptimizer {
     private final ReferenceMode referenceMode;
     private final double maxLegDeviationM;
 
+    /** Twin-edge tolerance (fallback only): when a leg would otherwise be demoted to coords,
+     *  treat coincident parallel edges over the same node pair (e.g. a cycleway + footway mapped
+     *  as separate ways over the same stripe) as equivalent before deciding. Default on. */
+    private boolean twinEdgeTolerance = true;
+    /** Two edges sharing a node pair are twins only if the longer is ≤ {@link #TWIN_RATIO_MAX}×
+     *  the shorter — guards against a genuine alternate path (a longer "route" between the same
+     *  two junctions) being mistaken for a coincident twin. */
+    static final double TWIN_RATIO_MAX = 1.5;
+    /** Below this length the ratio test is skipped (very short edges can't deviate enough to
+     *  matter, and the ratio is noisy on them) — they count as twins on node-pair alone. */
+    static final double TWIN_MIN_LEN_M = 20.0;
+    /** Cache: graph edge id → canonical (min) edge id of its geometry-guarded twin group. */
+    private final Map<Integer, Integer> twinCanonCache = new HashMap<>();
+
+    /** Toggle the twin-edge tolerance fallback (default on). */
+    public void setTwinEdgeTolerance(boolean enabled) { this.twinEdgeTolerance = enabled; }
+
     public RoutedRegionOptimizer(GraphHopper graphHopper) {
         this(graphHopper, DEFAULT_REFERENCE_MODE, DEFAULT_MAX_LEG_DEVIATION_M);
     }
@@ -165,7 +214,12 @@ public class RoutedRegionOptimizer {
             List<GHPoint> waypoints,
             List<Integer> waypointObsIndices,
             List<Double> legDistancesM,
-            List<Boolean> legIsCoords
+            List<Boolean> legIsCoords,
+            /** Per-leg start heading the optimizer VALIDATED the leg with (the /route exit
+             *  bearing inherited from the previous accepted leg), or null for the first leg
+             *  of the region and the first leg after a coords escalation. This is exactly the
+             *  heading the client must pass so its /route reproduces the validated path. */
+            List<Double> legInitialHeadings
     ) {
         public double totalDistanceM() {
             return legDistancesM.stream().mapToDouble(Double::doubleValue).sum();
@@ -183,7 +237,8 @@ public class RoutedRegionOptimizer {
                     List.of(region.startSnap(), region.endSnap()),
                     List.of(region.firstObservation(), region.lastObservation()),
                     List.of(region.matchedLengthM()),
-                    List.of(false));
+                    List.of(false),
+                    Arrays.asList((Double) null)); // single leg, no inherited heading
         }
 
         RegionReference ref = buildReference(region, observations, profile, customModel);
@@ -218,6 +273,7 @@ public class RoutedRegionOptimizer {
         List<Integer> chosenObs = new ArrayList<>();
         List<Double> legDists = new ArrayList<>();
         List<Boolean> legCoords = new ArrayList<>();
+        List<Double> legHeadings = new ArrayList<>();
         chosenSnaps.add(candidates.get(0));
         chosenObs.add(candObs.get(0));
 
@@ -225,11 +281,21 @@ public class RoutedRegionOptimizer {
         final int lastCand = candidates.size() - 1;
         int probes = 0;
 
+        // Heading chain. At region start there is no inherited heading (matches today's
+        // headingless first probe exactly). After each accepted routed leg, currentHeading
+        // becomes that leg's /route exit bearing — the same bearing the client carries
+        // into the next leg's /route call. Reset to null across any coords escalation:
+        // a fresh routed segment after a raw-coords stretch has no inherited heading
+        // (mirrors RouteInstructionGenerator resetting heading at non-routable gaps).
+        Double currentHeading = null;
+
         while (cursor < lastCand) {
             int step = 1;
             int lastOk = -1;
             double lastOkDist = 0;
+            double lastOkExitHeading = Double.NaN;
             int lastTried = cursor;
+            int probesThisCursor = 0; // per-cursor thrash guard (resets each advance)
 
             // Cap target at the next forced waypoint (if any) so the search can't
             // probe past it.
@@ -240,18 +306,21 @@ public class RoutedRegionOptimizer {
                 int probeIdx = Math.min(cursor + step, searchLimit);
                 if (probeIdx == lastTried && probeIdx != cursor + step) break;
                 lastTried = probeIdx;
-                ProbeOutcome po = probe(candidates, ref, tolerances, cursor, probeIdx, profile, customModel);
+                ProbeOutcome po = probe(candidates, ref, tolerances, cursor, probeIdx,
+                        profile, customModel, currentHeading);
                 probes++;
+                probesThisCursor++;
                 if (po.pass) {
                     lastOk = probeIdx;
                     lastOkDist = po.distanceM;
+                    lastOkExitHeading = po.exitHeading;
                     if (probeIdx == searchLimit) break;
                     if (cursor + step >= searchLimit) break;
                     step *= 2;
                 } else {
                     break;
                 }
-                if (probes >= MAX_PROBES_PER_REGION) break;
+                if (probesThisCursor >= MAX_PROBES_PER_CURSOR) break;
             }
 
             if (lastOk < 0) {
@@ -260,30 +329,36 @@ public class RoutedRegionOptimizer {
                 chosenObs.add(candObs.get(next));
                 legDists.add(0.0);
                 legCoords.add(true);
+                legHeadings.add(null); // coords leg carries no heading
                 LOGGER.debug("optimize: escalate to COORDS at cand[{}]→cand[{}] (obs[{}]→obs[{}])",
                         cursor, next, candObs.get(cursor), candObs.get(next));
                 cursor = next;
-                if (probes >= MAX_PROBES_PER_REGION) break;
+                // Coords gap breaks the heading chain — the next routed leg starts fresh.
+                currentHeading = null;
                 continue;
             }
 
             int best = lastOk;
             double bestDist = lastOkDist;
+            double bestExitHeading = lastOkExitHeading;
             if (lastTried > lastOk) {
                 int lo = lastOk + 1;
                 int hi = lastTried;
                 while (lo <= hi) {
                     int mid = (lo + hi) / 2;
-                    ProbeOutcome po = probe(candidates, ref, tolerances, cursor, mid, profile, customModel);
+                    ProbeOutcome po = probe(candidates, ref, tolerances, cursor, mid,
+                            profile, customModel, currentHeading);
                     probes++;
+                    probesThisCursor++;
                     if (po.pass) {
                         best = mid;
                         bestDist = po.distanceM;
+                        bestExitHeading = po.exitHeading;
                         lo = mid + 1;
                     } else {
                         hi = mid - 1;
                     }
-                    if (probes >= MAX_PROBES_PER_REGION) break;
+                    if (probesThisCursor >= MAX_PROBES_PER_CURSOR) break;
                 }
             }
 
@@ -291,11 +366,29 @@ public class RoutedRegionOptimizer {
             chosenObs.add(candObs.get(best));
             legDists.add(bestDist);
             legCoords.add(false);
+            // The heading this leg was VALIDATED with is the current inherited heading
+            // (null for the region's first leg / first after a coords gap) — record it
+            // BEFORE updating currentHeading to this leg's exit bearing.
+            legHeadings.add(currentHeading);
             cursor = best;
+            // Chain the accepted leg's exit bearing into the next probe's start heading,
+            // exactly as the client does between rendered legs.
+            currentHeading = Double.isNaN(bestExitHeading) ? null : bestExitHeading;
 
             if (probes >= MAX_PROBES_PER_REGION) {
-                LOGGER.warn("optimize: hit probe cap {} for region [{}..{}]; stopping early",
-                        MAX_PROBES_PER_REGION, region.firstObservation(), region.lastObservation());
+                // Paranoia backstop. Emit the UNoptimized remainder as a faithful coordinates leg
+                // (raw GPX to the region end) rather than dropping it — degrade to "raw track
+                // drawn", never a straight chord. Should not trigger given the per-cursor guard.
+                LOGGER.warn("optimize: hit region probe backstop {} for region [{}..{}]; emitting "
+                        + "remaining tail obs[{}..{}] as coordinates (faithful, no chord)",
+                        MAX_PROBES_PER_REGION, region.firstObservation(), region.lastObservation(),
+                        candObs.get(cursor), candObs.get(lastCand));
+                chosenSnaps.add(candidates.get(lastCand));
+                chosenObs.add(candObs.get(lastCand));
+                legDists.add(0.0);
+                legCoords.add(true);
+                legHeadings.add(null);
+                cursor = lastCand;
                 break;
             }
         }
@@ -306,7 +399,7 @@ public class RoutedRegionOptimizer {
                 (int) legCoords.stream().filter(b -> !b).count(),
                 (int) legCoords.stream().filter(b -> b).count(),
                 probes);
-        return new Result(chosenSnaps, chosenObs, legDists, legCoords);
+        return new Result(chosenSnaps, chosenObs, legDists, legCoords, legHeadings);
     }
 
     private RegionReference buildReference(TrackRegion.Matched region,
@@ -330,17 +423,27 @@ public class RoutedRegionOptimizer {
         }
     }
 
-    private record ProbeOutcome(boolean pass, double distanceM) {}
+    private record ProbeOutcome(boolean pass, double distanceM, double exitHeading) {}
 
+    /**
+     * Probe a {@code /route} from {@code candidates[start]} to {@code candidates[end]}.
+     *
+     * @param inHeading inherited start heading (exit bearing of the already-accepted route
+     *                  up to {@code start}), or {@code null} for the first leg of a region /
+     *                  the first leg after a coords gap. When non-null, it is applied as a
+     *                  soft start heading + {@link #CLIENT_HEADING_PENALTY_S} penalty so the
+     *                  verdict reflects the heading-constrained path the client will render.
+     */
     private ProbeOutcome probe(List<GHPoint> candidates,
                                RegionReference ref,
                                List<TolerancePair> tolerances,
                                int start, int end,
-                               String profile, CustomModel customModel) {
+                               String profile, CustomModel customModel,
+                               Double inHeading) {
         // Geographic-disagreement check FIRST: if any leg in the probe's range is
         // marked bad, force fail so the optimizer narrows down and escalates that leg.
         if (ref.isBadLeg(start, end)) {
-            return new ProbeOutcome(false, 0);
+            return new ProbeOutcome(false, 0, Double.NaN);
         }
 
         GHPoint pStart = candidates.get(start);
@@ -355,23 +458,33 @@ public class RoutedRegionOptimizer {
         req.putHint("instructions", false);
         req.putHint("calc_points", true);
 
+        // Soft start-heading lever (same as the client's per-leg rendering and the TbT
+        // RouteInstructionGenerator): heading on the start point, NaN on the end point,
+        // plus the heading penalty. Omitted entirely when there is no inherited heading,
+        // so the first-leg path is byte-for-byte identical to today's behaviour.
+        if (inHeading != null && !inHeading.isNaN()) {
+            req.setHeadings(Arrays.asList(inHeading, Double.NaN));
+            req.putHint("heading_penalty", CLIENT_HEADING_PENALTY_S);
+        }
+
         GHResponse rsp;
         try {
             rsp = graphHopper.route(req);
         } catch (Exception e) {
-            return new ProbeOutcome(false, 0);
+            return new ProbeOutcome(false, 0, Double.NaN);
         }
-        if (rsp.hasErrors()) return new ProbeOutcome(false, 0);
+        if (rsp.hasErrors()) return new ProbeOutcome(false, 0, Double.NaN);
 
         ResponsePath path = rsp.getBest();
         List<PathDetail> ekDetails = path.getPathDetails().get("edge_key");
-        if (ekDetails == null) return new ProbeOutcome(false, 0);
+        if (ekDetails == null) return new ProbeOutcome(false, 0, Double.NaN);
 
         int[] A = dedupConsecutive(pdValuesInt(ekDetails));
+        double exitHeading = exitHeadingOf(path.getPoints());
 
         // Try the basic rule first.
         if (applyEdgeKeyRule(E, A)) {
-            return new ProbeOutcome(true, path.getDistance());
+            return new ProbeOutcome(true, path.getDistance(), exitHeading);
         }
 
         // If basic rule fails, try with node-pair tolerance substitutions applied to E.
@@ -382,11 +495,103 @@ public class RoutedRegionOptimizer {
         if (!tolerances.isEmpty()) {
             int[] E_substituted = applyTolerances(E, tolerances);
             if (!Arrays.equals(E, E_substituted) && applyEdgeKeyRule(E_substituted, A)) {
-                return new ProbeOutcome(true, path.getDistance());
+                return new ProbeOutcome(true, path.getDistance(), exitHeading);
             }
         }
 
-        return new ProbeOutcome(false, 0);
+        // Twin-edge tolerance — LAST-RESORT fallback, only reached when the basic rule and the
+        // node-pair tolerance have already failed (i.e. this leg is otherwise about to be demoted
+        // to coords). Coincident parallel edges over the same node pair (cycleway + footway over
+        // the same stripe) make /route pick the sibling twin of a matcher edge, so the edge_key
+        // sequences differ even though the physical path is identical. Canonicalize BOTH sequences
+        // to a per-node-pair (unordered, geometry-guarded) twin representative and re-test. This
+        // can only flip a would-be-coords leg to routed; it never changes a passing leg or the
+        // chosen edges.
+        if (twinEdgeTolerance) {
+            int[] Ec = twinCanonicalize(E);
+            int[] Ac = twinCanonicalize(A);
+            if (applyEdgeKeyRule(Ec, Ac)) {
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("optimize: TWIN-RESCUE leg cand[{}..{}] E={} A={} → Ec={} Ac={}",
+                            start, end, Arrays.toString(E), Arrays.toString(A),
+                            Arrays.toString(Ec), Arrays.toString(Ac));
+                }
+                return new ProbeOutcome(true, path.getDistance(), exitHeading);
+            }
+        }
+
+        return new ProbeOutcome(false, 0, Double.NaN);
+    }
+
+    /**
+     * Map an edge_key sequence to DIRECTION-PRESERVING twin-group symbols, then collapse consecutive
+     * duplicates. Two edges belong to the same group when they share a node pair AND pass the length
+     * guard ({@link #TWIN_MIN_LEN_M} / {@link #TWIN_RATIO_MAX}); the symbol is the group's min edge id
+     * times two plus a direction bit. So a cycleway and its footway twin traversed the SAME way map to
+     * one symbol (the parallel-twin fix), while a same-edge reversal (a genuine U-turn / out-and-back
+     * in the matcher path) keeps two distinct symbols and is NOT flattened.
+     */
+    private int[] twinCanonicalize(int[] edgeKeys) {
+        int[] out = new int[edgeKeys.length];
+        for (int i = 0; i < edgeKeys.length; i++) {
+            out[i] = twinCanonical(edgeKeys[i]);
+        }
+        return dedupConsecutive(out);
+    }
+
+    /** Direction-preserving twin symbol for {@code edgeKey}: {@code groupRep*2 + directionBit}, where
+     *  {@code groupRep} is the geometry-guarded twin group's min edge id and the bit records traversal
+     *  toward the higher- vs lower-numbered node. Same-direction twins collapse; reversals do not. */
+    private int twinCanonical(int edgeKey) {
+        Graph graph = graphHopper.getBaseGraph();
+        EdgeIteratorState st;
+        try {
+            st = graph.getEdgeIteratorStateForKey(edgeKey);
+        } catch (Exception e) {
+            return edgeKey; // unresolvable — keep distinct
+        }
+        int rep = twinGroupRep(st.getEdge(), st.getBaseNode(), st.getAdjNode(), st.getDistance());
+        int dirBit = st.getBaseNode() < st.getAdjNode() ? 0 : 1;
+        return rep * 2 + dirBit;
+    }
+
+    /** Min edge id of the geometry-guarded twin group (edges between the same node pair as the given
+     *  edge that pass {@link #isTwin}). Direction-independent → cached by edge id. */
+    private int twinGroupRep(int edgeId, int base, int adj, double len) {
+        Integer cached = twinCanonCache.get(edgeId);
+        if (cached != null) return cached;
+        int rep = edgeId;
+        EdgeExplorer explorer = graphHopper.getBaseGraph().createEdgeExplorer();
+        EdgeIterator it = explorer.setBaseNode(base);
+        while (it.next()) {
+            if (it.getAdjNode() != adj) continue;          // only parallels between base↔adj
+            if (it.getEdge() == edgeId) continue;          // skip self
+            if (!isTwin(len, it.getDistance())) continue;  // geometry guard
+            if (it.getEdge() < rep) rep = it.getEdge();
+        }
+        twinCanonCache.put(edgeId, rep);
+        return rep;
+    }
+
+    /** Length guard for twin equivalence: very short edges (≤ {@link #TWIN_MIN_LEN_M}) are twins on
+     *  node-pair alone; otherwise the longer must be ≤ {@link #TWIN_RATIO_MAX}× the shorter. */
+    static boolean isTwin(double lenA, double lenB) {
+        double hi = Math.max(lenA, lenB), lo = Math.min(lenA, lenB);
+        if (hi <= TWIN_MIN_LEN_M) return true;
+        return lo > 0 && hi <= TWIN_RATIO_MAX * lo;
+    }
+
+    /**
+     * Exit bearing of a route polyline — the azimuth of its final segment, mirroring how
+     * the client (and {@code RouteInstructionGenerator}) derive the next leg's start
+     * heading. Returns {@code NaN} when the polyline has fewer than two points.
+     */
+    private static double exitHeadingOf(PointList pts) {
+        int n = pts.size();
+        if (n < 2) return Double.NaN;
+        return ANGLE_CALC.calcAzimuth(
+                pts.getLat(n - 2), pts.getLon(n - 2),
+                pts.getLat(n - 1), pts.getLon(n - 1));
     }
 
     static boolean applyEdgeKeyRule(int[] E, int[] A) {

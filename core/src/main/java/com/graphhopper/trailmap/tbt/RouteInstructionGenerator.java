@@ -295,11 +295,18 @@ public class RouteInstructionGenerator {
                 section.initialHeading = seg.getInitialHeading();
                 section.headingPenalty = seg.getHeadingPenalty();
                 section.points = new ArrayList<>();
-                section.points.add(waypointMap.get(seg.getStart()));
+                TrailmapInstructionRequest.Coordinates start = waypointMap.get(seg.getStart());
+                TrailmapInstructionRequest.Coordinates end = waypointMap.get(seg.getEnd());
+                if (start == null || end == null) {
+                    throw new IllegalArgumentException("FollowRoads segment references unknown waypoint id(s): start='"
+                            + seg.getStart() + "'" + (start == null ? " (unresolved)" : "")
+                            + ", end='" + seg.getEnd() + "'" + (end == null ? " (unresolved)" : ""));
+                }
+                section.points.add(start);
                 if (seg.getViaPoints() != null) {
                     section.points.addAll(seg.getViaPoints());
                 }
-                section.points.add(waypointMap.get(seg.getEnd()));
+                section.points.add(end);
 
                 Chunk c = new Chunk();
                 c.routableSection = section;

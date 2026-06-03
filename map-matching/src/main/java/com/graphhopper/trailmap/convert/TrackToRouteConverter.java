@@ -1,5 +1,7 @@
 package com.graphhopper.trailmap.convert;
 
+import com.graphhopper.GHRequest;
+import com.graphhopper.GHResponse;
 import com.graphhopper.GraphHopper;
 import com.graphhopper.jackson.ResponsePathSerializer;
 import com.graphhopper.matching.EdgeMatch;
@@ -57,12 +59,46 @@ public class TrackToRouteConverter {
      *  we convert to a meter value with similar geographic effect. */
     public static final double DEFAULT_COORDINATES_SIMPLIFY_EPS_M = 3.0;
 
+    /** Default drift-trim tight-snap floor [m] when not derived from sigma. Mirrors the
+     *  segmenter's own default. */
+    public static final double DEFAULT_DRIFT_FLOOR_M = RegionSegmenter.DEFAULT_DRIFT_TRIM_TIGHT_FLOOR_M;
+
+    /** Auto-sigma mode: snap-distance threshold = this × estimated sigma. ≈2.5 reproduces the
+     *  stricter ("tarkka") client preset (25 m / 10 m sigma) and honours the conservative
+     *  "better too-long coords than wrong-routed" bias. Used only when the request did not set
+     *  an explicit snap_threshold_m. */
+    public static final double AUTO_SIGMA_SNAP_THRESHOLD_MULT = 2.5;
+
+    /** Auto-sigma mode: drift-trim floor = this × estimated sigma. ≈1.25 keeps the floor at the
+     *  same fraction of sigma the legacy 5 m floor implied at the historical sigma=4 estimate. */
+    public static final double AUTO_SIGMA_DRIFT_FLOOR_MULT = 1.25;
+
     private final RegionSegmenter segmenter = new RegionSegmenter();
     private final CoordinatesRegionBuilder coordsBuilder = new CoordinatesRegionBuilder();
     private final RoutedRegionOptimizer optimizer;
+    private final GraphHopper graphHopper;
 
     public TrackToRouteConverter(GraphHopper graphHopper) {
+        this.graphHopper = graphHopper;
         this.optimizer = new RoutedRegionOptimizer(graphHopper);
+    }
+
+    /** Enable the segmenter's v2 joint emission+transition classification (§8). Off by default;
+     *  flips the {@link RegionSegmenter} to its parallel v2 path for this request only. */
+    public void setSegmentationV2Enabled(boolean enabled) {
+        segmenter.setSegmentationV2Enabled(enabled);
+    }
+
+    /** Restrict optimizer waypoint candidates to kept (Viterbi) observations (default on). */
+    public void setOptimizerKeptObsOnly(boolean enabled) {
+        segmenter.setOptimizerKeptObsOnly(enabled);
+    }
+
+    /** Toggle the optimizer's twin-edge tolerance (coincident cycleway/footway parallels;
+     *  default on) — a last-resort fallback that rescues a leg from coords demotion when the
+     *  only matcher-vs-/route difference is a coincident parallel edge over the same node pair. */
+    public void setOptimizerTwinEdgeTolerance(boolean enabled) {
+        optimizer.setTwinEdgeTolerance(enabled);
     }
 
     /**
@@ -95,7 +131,7 @@ public class TrackToRouteConverter {
                                         double maxDetourRatio) {
         return convert(matchResult, observations, profile, customModel,
                 snapThresholdM, minRoutedSegmentM, simplifyEpsM,
-                minDetourM, maxDetourRatio, false);
+                minDetourM, maxDetourRatio, DEFAULT_DRIFT_FLOOR_M, false);
     }
 
     /**
@@ -115,6 +151,7 @@ public class TrackToRouteConverter {
                                         double simplifyEpsM,
                                         double minDetourM,
                                         double maxDetourRatio,
+                                        double driftFloorM,
                                         boolean includeDebug) {
         long t0 = System.currentTimeMillis();
 
@@ -123,6 +160,12 @@ public class TrackToRouteConverter {
         // so each region returned here is ready to be processed downstream as-is.
         // observations is passed through so the segmenter's obs→EdgeMatch mapping can
         // use the matcher's direction-aware State.getEntry() attribution.
+        segmenter.setDriftTrimFloorM(driftFloorM);
+        // Inject the on-network route-distance function used by the segmenter's phantom-detour
+        // guard (distinguishes a directed-routing artifact at a corner — short real /route —
+        // from a genuine obstacle detour — long /route). Bound to the rendering profile +
+        // customModel so it asks the same question the client's /route will answer.
+        segmenter.setDirectRouteFn((a, b) -> directRouteDistanceM(a, b, profile, customModel));
         List<TrackRegion> regions = segmenter.segment(matchResult, observations,
                 snapThresholdM, minDetourM, maxDetourRatio, minRoutedSegmentM);
 
@@ -292,11 +335,16 @@ public class TrackToRouteConverter {
                         ids.add(id);
                     }
                 }
-                // Emit one segment per consecutive waypoint pair with its leg distance
+                // Emit one segment per consecutive waypoint pair with its leg distance and
+                // (when the optimizer validated one) its start heading. A null heading is
+                // omitted from the JSON — the client's "no heading constraint" signal.
                 for (int wi = 0; wi < ids.size() - 1; wi++) {
                     double legDist = (p.legDistancesM != null && wi < p.legDistancesM.size())
                             ? p.legDistancesM.get(wi) : 0;
-                    segments.add(ConvertTrackResponse.Segment.routed(ids.get(wi), ids.get(wi + 1), legDist));
+                    Double legHeading = (p.legHeadingsDeg != null && wi < p.legHeadingsDeg.size())
+                            ? p.legHeadingsDeg.get(wi) : null;
+                    segments.add(ConvertTrackResponse.Segment.routed(
+                            ids.get(wi), ids.get(wi + 1), legDist, legHeading));
                 }
                 lastEndpoint = p.waypoints.get(p.waypoints.size() - 1);
                 lastEndpointId = ids.get(ids.size() - 1);
@@ -357,6 +405,7 @@ public class TrackToRouteConverter {
         List<Integer> wpObs = opt.waypointObsIndices();
         List<Double> legDists = opt.legDistancesM();
         List<Boolean> legCoords = opt.legIsCoords();
+        List<Double> legHeadings = opt.legInitialHeadings();
 
         if (wps.size() < 2) {
             // Degenerate: optimizer returned a single waypoint. Nothing to emit.
@@ -365,14 +414,16 @@ public class TrackToRouteConverter {
 
         int runStart = 0;
         List<Double> runLegs = new ArrayList<>();
+        List<Double> runHeadings = new ArrayList<>();
 
         for (int i = 0; i < wps.size() - 1; i++) {
             if (legCoords.get(i)) {
                 // Close the routed run accumulated so far (if any).
                 if (i > runStart) {
                     List<GHPoint> sub = new ArrayList<>(wps.subList(runStart, i + 1));
-                    protos.add(ProtoSegment.routed(sub, new ArrayList<>(runLegs)));
+                    protos.add(ProtoSegment.routed(sub, new ArrayList<>(runLegs), new ArrayList<>(runHeadings)));
                     runLegs.clear();
+                    runHeadings.clear();
                 }
                 // Emit the coords leg from raw GPX observations.
                 int fromObs = wpObs.get(i);
@@ -383,12 +434,13 @@ public class TrackToRouteConverter {
                 runStart = i + 1;
             } else {
                 runLegs.add(legDists.get(i));
+                runHeadings.add(legHeadings != null && i < legHeadings.size() ? legHeadings.get(i) : null);
             }
         }
         // Trailing routed run.
         if (runStart < wps.size() - 1) {
             List<GHPoint> sub = new ArrayList<>(wps.subList(runStart, wps.size()));
-            protos.add(ProtoSegment.routed(sub, new ArrayList<>(runLegs)));
+            protos.add(ProtoSegment.routed(sub, new ArrayList<>(runLegs), new ArrayList<>(runHeadings)));
         }
     }
 
@@ -464,6 +516,24 @@ public class TrackToRouteConverter {
         return out;
     }
 
+    /** On-network shortest-route distance [m] between two points under the given profile,
+     *  or null if no route. Used by the segmenter's phantom-detour guard. Plain point-to-point
+     *  (no headings) — it answers "does a short real road path exist between these snaps?". */
+    private Double directRouteDistanceM(GHPoint a, GHPoint b, String profile, CustomModel customModel) {
+        try {
+            GHRequest req = new GHRequest(a, b);
+            req.setProfile(profile);
+            if (customModel != null) req.setCustomModel(customModel);
+            req.putHint("instructions", false);
+            req.putHint("calc_points", false);
+            GHResponse rsp = graphHopper.route(req);
+            if (rsp.hasErrors() || rsp.getBest() == null) return null;
+            return rsp.getBest().getDistance();
+        } catch (Exception e) {
+            return null; // no route / engine error → guard stays conservative (keeps the detour)
+        }
+    }
+
     private static double geoLength(List<ConvertTrackResponse.Coordinates> coords) {
         if (coords.size() < 2) return 0;
         double total = 0;
@@ -492,14 +562,18 @@ public class TrackToRouteConverter {
         ProtoType type;
         List<GHPoint> waypoints;
         List<Double> legDistancesM;
+        /** Per-leg start heading (deg) validated by the optimizer; null where none. Parallel
+         *  to legDistancesM. Surfaced as Segment.initialHeading. */
+        List<Double> legHeadingsDeg;
         List<ConvertTrackResponse.Coordinates> coords;
         double distanceM;
 
-        static ProtoSegment routed(List<GHPoint> wps, List<Double> legs) {
+        static ProtoSegment routed(List<GHPoint> wps, List<Double> legs, List<Double> headings) {
             ProtoSegment p = new ProtoSegment();
             p.type = ProtoType.ROUTED;
             p.waypoints = new ArrayList<>(wps);
             p.legDistancesM = new ArrayList<>(legs);
+            p.legHeadingsDeg = new ArrayList<>(headings);
             p.distanceM = legs.stream().mapToDouble(Double::doubleValue).sum();
             return p;
         }

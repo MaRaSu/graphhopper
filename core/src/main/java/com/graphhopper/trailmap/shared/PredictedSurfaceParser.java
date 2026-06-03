@@ -165,11 +165,20 @@ public class PredictedSurfaceParser implements TagParser {
         }
 
         // MAJOR_ROAD: highway in [trunk, trunk_link, primary, primary_link]
-        if (highway != null && MAJOR_ROAD_HIGHWAYS.contains(highway)) {
+        // Exception: primary/primary_link with explicit surface=compacted — the mapper made
+        // a positive declaration (not the generic "this isn't asphalt" gravel/unpaved tag),
+        // so trust it. Falls through to rule 3 which maps surface=compacted to COMPACTED.
+        if (highway != null && MAJOR_ROAD_HIGHWAYS.contains(highway)
+            && !isPrimaryWithCompactedSurface(highway, surface)) {
             return true;
         }
 
         return false;
+    }
+
+    private boolean isPrimaryWithCompactedSurface(String highway, String surface) {
+        return "compacted".equals(surface)
+            && ("primary".equals(highway) || "primary_link".equals(highway));
     }
 
     // --- ASPHALT_OR_UNPAVED rule ---
@@ -427,7 +436,12 @@ public class PredictedSurfaceParser implements TagParser {
     private static final Set<String> UNPAVED_COMPACT_SURFACES = new HashSet<>(
         // fine_gravel intentionally excluded — owned by rule 5 (FINE_GRAVEL) so it
         // resolves to FINE_GRAVEL on road-network highways instead of being absorbed here.
-        Arrays.asList("unpaved", "gravel", "sand", "mud")
+        // dirt and ground included so road-network highways (LIKELY_COMPACT_HIGHWAYS) with
+        // these surfaces clamp to COMPACTED instead of falling through to rule 4 GROUND.
+        // Non-road-network classes (path/track/service/cycleway/footway) are unaffected:
+        // they aren't in LIKELY_COMPACT_HIGHWAYS, so rule 3 doesn't fire and they still
+        // reach rule 4 → GROUND as before.
+        Arrays.asList("unpaved", "gravel", "sand", "mud", "dirt", "ground")
     );
 
     private static final Set<String> EXCELLENT_GOOD_SMOOTHNESS_VALUES = new HashSet<>(

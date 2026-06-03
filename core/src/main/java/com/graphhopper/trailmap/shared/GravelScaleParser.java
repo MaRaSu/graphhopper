@@ -53,6 +53,24 @@ public class GravelScaleParser implements TagParser {
         }
 
         // =================================================================
+        // RULE 1b: Road-network clamp for "difficult" surfaces -> ZERO_PLUS
+        // Lower-tier road-network highways (secondary/tertiary/unclassified/residential
+        // and their _link variants) tagged with dirt/ground/sand/mud are almost always
+        // mapper anomalies. The road class is authoritative — if it were truly track-
+        // quality the OSM tag would be highway=track. Clamp to ZERO_PLUS (good gravel)
+        // rather than letting them fall through to rule 11 FOUR (not rideable).
+        //
+        // Implemented as an early clamp rather than weakening the many hasMud / FOUR
+        // exclusions scattered through rules 4-9, which would risk subtle regressions
+        // on tracks/paths/service roads (those rules' exclusions are still needed there).
+        // Sand on this set is already handled correctly by rule 4 (sand is in
+        // UNPAVED_COMPACT_SURFACES), so its inclusion here is redundant but harmless.
+        // =================================================================
+        if (matchesRoadNetworkDifficultSurface(way)) {
+            return GravelScale.ZERO_PLUS;
+        }
+
+        // =================================================================
         // RULE 2: Asphalt surfaces -> ZERO_MINUS (paved)
         // anyOf: [ASPHALT, MOTORWAY, MAJOR_ROAD, CYCLEWAY_PAVED]
         // noneOf: [UNPAVED_SURFACE]
@@ -316,6 +334,16 @@ public class GravelScaleParser implements TagParser {
         return "ferry".equals(way.getTag("route"));
     }
 
+    // --- Road-network clamp for difficult surfaces ---
+    private boolean matchesRoadNetworkDifficultSurface(ReaderWay way) {
+        String highway = way.getTag("highway");
+        String surface = way.getTag("surface");
+        return highway != null
+            && LIKELY_COMPACT_HIGHWAYS.contains(highway)
+            && surface != null
+            && isDifficultSurface(surface);
+    }
+
     // --- ASPHALT pattern (includes motorway, major road, cycleway paved) ---
     private boolean matchesAsphaltRule(ReaderWay way) {
         String surface = way.getTag("surface");
@@ -332,6 +360,12 @@ public class GravelScaleParser implements TagParser {
         }
 
         // MAJOR_ROAD: highway in [trunk, trunk_link, primary, primary_link]
+        // Note on item #2 (trust compacted on primary): no special-case needed here.
+        // The outer rule 2 guard already requires !matchesUnpavedSurface(way), and
+        // UNPAVED_SURFACES includes "compacted" — so primary/trunk/motorway + compacted
+        // skips rule 2 regardless, falling through to rule 4 → ZERO_PLUS. Same applies
+        // to fine_gravel/gravel/unpaved on these classes (skipped from rule 2, then
+        // either matched elsewhere or → UNKNOWN, which is the conservative default).
         if (highway != null && isMajorRoad(highway)) {
             return true;
         }

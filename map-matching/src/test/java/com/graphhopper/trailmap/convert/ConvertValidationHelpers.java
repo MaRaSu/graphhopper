@@ -5,12 +5,14 @@ import com.graphhopper.GHResponse;
 import com.graphhopper.GraphHopper;
 import com.graphhopper.ResponsePath;
 import com.graphhopper.matching.Observation;
+import com.graphhopper.util.AngleCalc;
 import com.graphhopper.util.CustomModel;
 import com.graphhopper.util.DistanceCalcEarth;
 import com.graphhopper.util.PointList;
 import com.graphhopper.util.shapes.GHPoint;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -61,6 +63,12 @@ public final class ConvertValidationHelpers {
 
         PointList out = new PointList(256, false);
 
+        // Heading chain — mirror the client receiving the server's initialHeading: each
+        // followRoads leg after a previous followRoads leg is rendered with a start heading =
+        // the previous leg's exit bearing + heading_penalty=60; reset to null across a
+        // coordinates segment (and at the very start). This makes the faithfulness check
+        // measure the path the client actually draws when initialHeading is honoured.
+        Double currentHeading = null;
         for (ConvertTrackResponse.Segment seg : rsp.getSegments()) {
             PointList segPts;
             if (ConvertTrackResponse.Segment.TYPE_FOLLOW_ROADS.equals(seg.getType())) {
@@ -71,6 +79,10 @@ public final class ConvertValidationHelpers {
                 if (customModel != null) req.setCustomModel(customModel);
                 req.putHint("instructions", false);
                 req.putHint("calc_points", true);
+                if (currentHeading != null && !currentHeading.isNaN()) {
+                    req.setHeadings(Arrays.asList(currentHeading, Double.NaN));
+                    req.putHint("heading_penalty", 60);
+                }
                 GHResponse rr = gh.route(req);
                 if (rr.hasErrors()) {
                     throw new IllegalStateException("Re-routing followRoads segment failed: "
@@ -78,6 +90,13 @@ public final class ConvertValidationHelpers {
                 }
                 ResponsePath path = rr.getBest();
                 segPts = path.getPoints();
+                // Chain this leg's exit bearing into the next followRoads leg.
+                int np = segPts.size();
+                currentHeading = (np >= 2)
+                        ? AngleCalc.ANGLE_CALC.calcAzimuth(
+                                segPts.getLat(np - 2), segPts.getLon(np - 2),
+                                segPts.getLat(np - 1), segPts.getLon(np - 1))
+                        : null;
             } else {
                 // coordinates segment
                 List<ConvertTrackResponse.Coordinates> coords = seg.getTrackCoordinates();
@@ -85,6 +104,7 @@ public final class ConvertValidationHelpers {
                 for (ConvertTrackResponse.Coordinates c : coords) {
                     segPts.add(c.getLat(), c.getLng());
                 }
+                currentHeading = null; // chain breaks across a coordinates segment
             }
             appendDedupingBoundary(out, segPts);
         }
@@ -121,6 +141,25 @@ public final class ConvertValidationHelpers {
         for (int i = 0; i < gpx.size(); i++) {
             GHPoint p = gpx.get(i).getPoint();
             out[i] = pointToPolylineDistance(p.lat, p.lon, realized);
+        }
+        return out;
+    }
+
+    /**
+     * REVERSE deviation: for each realized-route point, the minimum distance to the GPX
+     * polyline (consecutive GPX points joined as segments). Catches the case the forward
+     * metric is blind to — the realized route ADDING an excursion/loop the GPX never took
+     * (a straight GPX routed onto a looping OSM way). The forward {@link #perPointDeviations}
+     * stays small there because every GPX point still has a nearby realized point; this
+     * reverse metric spikes at the far side of the added loop. Returns an array parallel to
+     * {@code realized}.
+     */
+    public static double[] realizedToGpxDeviations(PointList realized, List<Observation> gpx) {
+        PointList gpxLine = new PointList(gpx.size(), false);
+        for (Observation o : gpx) gpxLine.add(o.getPoint().lat, o.getPoint().lon);
+        double[] out = new double[realized.size()];
+        for (int i = 0; i < realized.size(); i++) {
+            out[i] = pointToPolylineDistance(realized.getLat(i), realized.getLon(i), gpxLine);
         }
         return out;
     }
