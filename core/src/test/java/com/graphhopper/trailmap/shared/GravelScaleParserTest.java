@@ -551,50 +551,92 @@ class GravelScaleParserTest {
     }
 
     // =================================================================
-    // ITEM #2 — primary + compacted (no code change needed in this parser)
+    // HIGHER-TIER ROAD NETWORK — motorway / trunk / primary asphalt-by-class
     //
-    // gravel_scale's rule 2 already has an outer guard `&& !matchesUnpavedSurface`
-    // where UNPAVED_SURFACES = {unpaved, compacted, gravel, fine_gravel}. So any
-    // motorway/trunk/primary tagged with any of those four surfaces already skips
-    // rule 2 and falls through to later rules. compacted → ZERO_PLUS via rule 4's
-    // dedicated check. gravel/unpaved → UNKNOWN (conservative fall-through).
-    //
-    // These tests pin the behavior so future edits don't regress it.
+    // Rule 1c: these classes are authoritatively paved → ZERO_MINUS for any
+    // surface, EXCEPT explicit positive declarations (compacted, fine_gravel)
+    // which fall through to rule 4 → ZERO_PLUS. Trust the mapper's specific
+    // tag, but not the generic/wrong unpaved/gravel/pebblestone ones.
     // =================================================================
 
     @Test
-    void testPrimaryCompactedException() {
+    void testHigherTierAsphaltByClass() {
         List<String> failures = new ArrayList<>();
 
-        // primary/primary_link + compacted → ZERO_PLUS (already correct via existing guard)
-        assertScaleCollect(failures, ZERO_PLUS, "primary + compacted",
+        // Carve-outs: compacted and fine_gravel preserved → ZERO_PLUS
+        assertScaleCollect(failures, ZERO_PLUS, "primary + compacted (item #2 exception)",
                 "highway", "primary", "surface", "compacted");
         assertScaleCollect(failures, ZERO_PLUS, "primary_link + compacted",
                 "highway", "primary_link", "surface", "compacted");
-
-        // trunk/motorway + compacted also fall through to ZERO_PLUS (same guard)
         assertScaleCollect(failures, ZERO_PLUS, "trunk + compacted",
                 "highway", "trunk", "surface", "compacted");
         assertScaleCollect(failures, ZERO_PLUS, "motorway + compacted",
                 "highway", "motorway", "surface", "compacted");
+        assertScaleCollect(failures, ZERO_PLUS, "primary + fine_gravel",
+                "highway", "primary", "surface", "fine_gravel");
+        assertScaleCollect(failures, ZERO_PLUS, "trunk + fine_gravel",
+                "highway", "trunk", "surface", "fine_gravel");
 
-        // Generic unpaved tags on primary → UNKNOWN (conservative — pre-existing
-        // gravel_scale behavior; asymmetric with predicted_surface where these
-        // remain ASPHALT. Not addressed in this scope.)
-        assertScaleCollect(failures, UNKNOWN, "primary + gravel (asymmetry: PS returns ASPHALT)",
+        // Generic / mis-tagged unpaved surfaces → ZERO_MINUS (the fix)
+        assertScaleCollect(failures, ZERO_MINUS, "primary + gravel (mis-tag → clamp to paved)",
                 "highway", "primary", "surface", "gravel");
-        assertScaleCollect(failures, UNKNOWN, "primary + unpaved (same asymmetry)",
+        assertScaleCollect(failures, ZERO_MINUS, "primary + unpaved",
                 "highway", "primary", "surface", "unpaved");
+        assertScaleCollect(failures, ZERO_MINUS, "trunk + gravel",
+                "highway", "trunk", "surface", "gravel");
+        assertScaleCollect(failures, ZERO_MINUS, "trunk + unpaved",
+                "highway", "trunk", "surface", "unpaved");
+        assertScaleCollect(failures, ZERO_MINUS, "motorway + gravel",
+                "highway", "motorway", "surface", "gravel");
+        assertScaleCollect(failures, ZERO_MINUS, "motorway + unpaved",
+                "highway", "motorway", "surface", "unpaved");
 
-        // Asphalt-family surfaces on primary: ZERO_MINUS (unchanged)
+        // Asphalt-family surfaces: ZERO_MINUS unchanged
         assertScaleCollect(failures, ZERO_MINUS, "primary + asphalt",
                 "highway", "primary", "surface", "asphalt");
         assertScaleCollect(failures, ZERO_MINUS, "primary + paved",
                 "highway", "primary", "surface", "paved");
+        assertScaleCollect(failures, ZERO_MINUS, "trunk + asphalt",
+                "highway", "trunk", "surface", "asphalt");
+        assertScaleCollect(failures, ZERO_MINUS, "motorway + asphalt",
+                "highway", "motorway", "surface", "asphalt");
 
-        // Primary with no surface: ZERO_MINUS (default unchanged)
+        // No surface tag: ZERO_MINUS (default unchanged)
         assertScaleCollect(failures, ZERO_MINUS, "primary / no surface",
                 "highway", "primary");
+        assertScaleCollect(failures, ZERO_MINUS, "trunk / no surface",
+                "highway", "trunk");
+        assertScaleCollect(failures, ZERO_MINUS, "motorway / no surface",
+                "highway", "motorway");
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
+    // PEBBLESTONE — follows gravel's path on the road network
+    // =================================================================
+
+    @Test
+    void testPebblestone() {
+        List<String> failures = new ArrayList<>();
+
+        // Lower-tier road network: same as + gravel → ZERO_PLUS
+        for (String hw : new String[]{
+                "secondary", "secondary_link", "tertiary", "tertiary_link",
+                "unclassified", "residential"}) {
+            assertScaleCollect(failures, ZERO_PLUS, hw + " + pebblestone",
+                    "highway", hw, "surface", "pebblestone");
+        }
+
+        // Higher-tier road network: same as + gravel → ZERO_MINUS
+        assertScaleCollect(failures, ZERO_MINUS, "primary + pebblestone",
+                "highway", "primary", "surface", "pebblestone");
+        assertScaleCollect(failures, ZERO_MINUS, "trunk + pebblestone",
+                "highway", "trunk", "surface", "pebblestone");
+        assertScaleCollect(failures, ZERO_MINUS, "motorway + pebblestone",
+                "highway", "motorway", "surface", "pebblestone");
 
         if (!failures.isEmpty()) {
             fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));

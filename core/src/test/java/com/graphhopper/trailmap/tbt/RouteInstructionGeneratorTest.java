@@ -7025,6 +7025,46 @@ public class RouteInstructionGeneratorTest {
     }
 
     /**
+     * Case: gravel detours off a trunk road even when the user pushes a
+     * +1.45× priority multiplier on MAJOR_ROAD via per-request custom model.
+     * To diagnose, we route the same waypoints under several setups and
+     * compare edge weights:
+     *   1) gravel TC with the user's custom model (the actual reported case)
+     *   2) gravel TC baseline (no custom model)
+     *   3) gravel_no_tc with the user's custom model (isolates turn-cost role)
+     *   4) roadbike (reference for the direct trunk-road path)
+     */
+    @Test
+    void analyzeTurnCost_trunkRoadDetour() {
+        final double aLat = 60.168683,           aLng = 23.959564;
+        final double bLat = 60.166419286195634,  bLng = 23.95178806807928;
+
+        String userRules = """
+                {
+                  "priority": [
+                    { "if": "predicted_highway == MAJOR_ROAD", "multiply_by": "1.45" }
+                  ],
+                  "speed": []
+                }
+                """;
+        CustomModel userCm = customModelFromJson(userRules);
+
+        System.out.println("\n========== CASE: trunkRoadDetour ==========");
+
+        System.out.println("\n##### (1) gravel TC + user custom_model (the reported case) #####");
+        analyzeRoute("Forward A→B", aLat, aLng, bLat, bLng, "gravel", userCm);
+
+        System.out.println("\n##### (2) gravel TC, no custom_model (baseline) #####");
+        analyzeRoute("Forward A→B", aLat, aLng, bLat, bLng, "gravel", null);
+
+        System.out.println("\n##### (3) gravel_no_tc + user custom_model (isolates TC role) #####");
+        analyzeRoute("Forward A→B", aLat, aLng, bLat, bLng, "gravel_no_tc", userCm);
+
+        System.out.println("\n##### (4) roadbike (reference — direct trunk-road route) #####");
+        analyzeRoute("Forward A→B", aLat, aLng, bLat, bLng, "roadbike", null);
+    }
+
+    /**
      * Same waypoints as analyzeTurnCost_majorDetourBothWays, but routed via a
      * forced via-point on Lieksantie (the major road) — splitting into two
      * shorter legs whose individual lengths make the Jakokoskentie detour

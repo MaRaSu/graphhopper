@@ -15,9 +15,11 @@
     { "if": "gravel_scale == FOUR", "multiply_by": "0.1" },
     { "if": "gravel_scale == UNKNOWN", "multiply_by": "0.3" },
 
-    { "if": "predicted_highway == CYCLEWAY", "multiply_by": "1.3" },
-    { "if": "predicted_highway == MINOR_ROAD", "multiply_by": "1.1" },
-    { "if": "predicted_highway == MAJOR_ROAD", "multiply_by": "0.8" },
+    { "if": "predicted_highway == CYCLEWAY", "multiply_by": "1.2" },
+    { "if": "predicted_highway == MINOR_ROAD", "multiply_by": "1.0" },
+    { "if": "predicted_highway == MAJOR_ROAD", "multiply_by": "0.9" },
+    { "if": "road_class == TRUNK", "multiply_by": "0.85" },
+    { "if": "road_class == STEPS", "multiply_by": "0.2" },
     { "if": "predicted_highway == SERVICE_ROAD", "multiply_by": "0.8" },
 
     { "if": "predicted_highway == GOOD_TRACK", "multiply_by": "0.3" },

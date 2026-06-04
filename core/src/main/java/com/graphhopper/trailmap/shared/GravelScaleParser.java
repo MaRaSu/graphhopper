@@ -71,6 +71,24 @@ public class GravelScaleParser implements TagParser {
         }
 
         // =================================================================
+        // RULE 1c: Asphalt by class — motorway/trunk/primary -> ZERO_MINUS.
+        // These high-tier road-network classes are authoritatively paved; surface tags
+        // like gravel/unpaved/pebblestone on them are almost always mapper anomalies
+        // (the road is really asphalt). Without this clamp those cases fall through
+        // to UNKNOWN because the outer rule-2 guard `!matchesUnpavedSurface` skips
+        // rule 2 for any UNPAVED_SURFACES tag.
+        //
+        // Carve-outs (fall through to rule 4 → ZERO_PLUS):
+        //   - compacted   : trusted positive declaration; item #2 work for primary,
+        //                   pre-existing behavior for trunk/motorway preserved
+        //   - fine_gravel : same "specific positive declaration" principle; preserves
+        //                   pre-existing ZERO_PLUS behavior for these classes
+        // =================================================================
+        if (matchesAsphaltByClass(way)) {
+            return GravelScale.ZERO_MINUS;
+        }
+
+        // =================================================================
         // RULE 2: Asphalt surfaces -> ZERO_MINUS (paved)
         // anyOf: [ASPHALT, MOTORWAY, MAJOR_ROAD, CYCLEWAY_PAVED]
         // noneOf: [UNPAVED_SURFACE]
@@ -342,6 +360,16 @@ public class GravelScaleParser implements TagParser {
             && LIKELY_COMPACT_HIGHWAYS.contains(highway)
             && surface != null
             && isDifficultSurface(surface);
+    }
+
+    // --- Asphalt by class — motorway/trunk/primary always paved, with carve-outs ---
+    private boolean matchesAsphaltByClass(ReaderWay way) {
+        String highway = way.getTag("highway");
+        if (highway == null) return false;
+        if (!isMotorway(highway) && !isMajorRoad(highway)) return false;
+        // Carve-outs: trust explicit positive surface declarations
+        String surface = way.getTag("surface");
+        return !"compacted".equals(surface) && !"fine_gravel".equals(surface);
     }
 
     // --- ASPHALT pattern (includes motorway, major road, cycleway paved) ---
@@ -762,7 +790,9 @@ public class GravelScaleParser implements TagParser {
     );
 
     private static final Set<String> UNPAVED_SURFACES = new HashSet<>(
-        Arrays.asList("unpaved", "compacted", "gravel", "fine_gravel")
+        // pebblestone: per OSM wiki it is a gravel-family surface, commonly mis-tagged
+        // for compacted roads. Treat it identically to gravel here.
+        Arrays.asList("unpaved", "compacted", "gravel", "fine_gravel", "pebblestone")
     );
 
     private static final Set<String> DIFFICULT_SURFACES = new HashSet<>(
@@ -775,7 +805,8 @@ public class GravelScaleParser implements TagParser {
     );
 
     private static final Set<String> UNPAVED_COMPACT_SURFACES = new HashSet<>(
-        Arrays.asList("unpaved", "gravel", "sand", "mud", "fine_gravel")
+        // pebblestone follows gravel's path on the road network (compacted-quality clamp).
+        Arrays.asList("unpaved", "gravel", "sand", "mud", "fine_gravel", "pebblestone")
     );
 
     private boolean isAsphaltSurface(String surface) {

@@ -438,10 +438,12 @@ public class PredictedSurfaceParser implements TagParser {
         // resolves to FINE_GRAVEL on road-network highways instead of being absorbed here.
         // dirt and ground included so road-network highways (LIKELY_COMPACT_HIGHWAYS) with
         // these surfaces clamp to COMPACTED instead of falling through to rule 4 GROUND.
+        // pebblestone follows gravel's path: per OSM wiki it is a gravel-family surface,
+        // commonly mis-tagged for compacted roads — same clamp applies.
         // Non-road-network classes (path/track/service/cycleway/footway) are unaffected:
         // they aren't in LIKELY_COMPACT_HIGHWAYS, so rule 3 doesn't fire and they still
         // reach rule 4 → GROUND as before.
-        Arrays.asList("unpaved", "gravel", "sand", "mud", "dirt", "ground")
+        Arrays.asList("unpaved", "gravel", "sand", "mud", "dirt", "ground", "pebblestone")
     );
 
     private static final Set<String> EXCELLENT_GOOD_SMOOTHNESS_VALUES = new HashSet<>(

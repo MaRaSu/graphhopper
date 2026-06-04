@@ -332,6 +332,36 @@ class PredictedSurfaceParserTest {
     }
 
     // =================================================================
+    // PEBBLESTONE — gravel-family surface per OSM wiki, commonly mis-tagged
+    // for compacted roads. Follows gravel's path here.
+    // =================================================================
+
+    @Test
+    void testPebblestone() {
+        List<String> failures = new ArrayList<>();
+
+        // Lower-tier road network: same as + gravel → COMPACTED
+        for (String hw : new String[]{
+                "secondary", "secondary_link", "tertiary", "tertiary_link",
+                "unclassified", "residential"}) {
+            assertSurfaceCollect(failures, COMPACTED, hw + " + pebblestone",
+                    "highway", hw, "surface", "pebblestone");
+        }
+
+        // Higher-tier road network: same as + gravel → ASPHALT (rule 2 fires first)
+        assertSurfaceCollect(failures, ASPHALT, "primary + pebblestone",
+                "highway", "primary", "surface", "pebblestone");
+        assertSurfaceCollect(failures, ASPHALT, "trunk + pebblestone",
+                "highway", "trunk", "surface", "pebblestone");
+        assertSurfaceCollect(failures, ASPHALT, "motorway + pebblestone",
+                "highway", "motorway", "surface", "pebblestone");
+
+        if (!failures.isEmpty()) {
+            fail(failures.size() + " failures:\n  " + String.join("\n  ", failures));
+        }
+    }
+
+    // =================================================================
     // FERRY (rule 1)
     // =================================================================
 
