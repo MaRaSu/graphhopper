@@ -61,7 +61,7 @@ public class TrackConvertValidationTest {
 
     // Paths relative to map-matching/ (Maven working directory)
     private static final String GRAPH_LOCATION = "../../data/graph-cache";
-    private static final String OSM_FILE = "../../data/finland_3.osm.pbf";
+    private static final String OSM_FILE = "../../data/finland_4.osm.pbf";
     private static final String CONFIG_FILE = "../trailmap-config.yml";
     private static final String FIXTURE_FILE = "../../data/gpx-for-testing/test_cases.json";
 

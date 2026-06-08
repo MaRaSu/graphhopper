@@ -30,6 +30,11 @@ public class LegScore {
     private int forkEdgeIndex = -1;      // Edge index where backtrack starts (-1 if none)
     private GHPoint forkPoint;           // Coordinate for dead-end fixer
 
+    // Geospatial corridor overlap (different-edge parallel/antiparallel reuse)
+    private double corridorOverlapDistance;      // Meters this leg runs alongside another part of the route
+    private GHPoint corridorAnchor;              // Point on this (return) corridor for the fixer to divert
+    private GHPoint corridorPartner;             // Nearby point on the other (outbound) corridor; fixer pushes away from it
+
     public LegScore() {
         this.mainIssue = IssueType.NONE;
     }
@@ -137,6 +142,30 @@ public class LegScore {
         this.forkPoint = forkPoint;
     }
 
+    public double getCorridorOverlapDistance() {
+        return corridorOverlapDistance;
+    }
+
+    public void setCorridorOverlapDistance(double corridorOverlapDistance) {
+        this.corridorOverlapDistance = corridorOverlapDistance;
+    }
+
+    public GHPoint getCorridorAnchor() {
+        return corridorAnchor;
+    }
+
+    public void setCorridorAnchor(GHPoint corridorAnchor) {
+        this.corridorAnchor = corridorAnchor;
+    }
+
+    public GHPoint getCorridorPartner() {
+        return corridorPartner;
+    }
+
+    public void setCorridorPartner(GHPoint corridorPartner) {
+        this.corridorPartner = corridorPartner;
+    }
+
     /**
      * Convert to map for JSON serialization.
      */
@@ -160,6 +189,12 @@ public class LegScore {
         }
         if (forkPoint != null) {
             map.put("forkPoint", forkPoint.lat + "," + forkPoint.lon);
+        }
+        if (corridorOverlapDistance > 0) {
+            map.put("corridorOverlapDistance", Math.round(corridorOverlapDistance));
+        }
+        if (corridorAnchor != null) {
+            map.put("corridorAnchor", corridorAnchor.lat + "," + corridorAnchor.lon);
         }
         return map;
     }

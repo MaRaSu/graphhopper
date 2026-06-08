@@ -7,8 +7,10 @@ package com.graphhopper.trailmap.roundtrip.exploration;
 
 import com.carrotsearch.hppc.IntSet;
 import com.graphhopper.GHRequest;
+import com.graphhopper.GHResponse;
 import com.graphhopper.ResponsePath;
 import com.graphhopper.coll.GHIntHashSet;
+import com.graphhopper.util.CustomModel;
 import com.graphhopper.config.Profile;
 import com.graphhopper.routing.EdgeRestrictions;
 import com.graphhopper.routing.FlexiblePathCalculator;
@@ -24,6 +26,7 @@ import com.graphhopper.util.details.PathDetail;
 import com.graphhopper.util.details.PathDetailsBuilderFactory;
 import com.graphhopper.util.details.PathDetailsFromEdges;
 import com.graphhopper.trailmap.roundtrip.config.RoundTripProfile;
+import com.graphhopper.trailmap.roundtrip.fixing.CorridorOverlapFixer;
 import com.graphhopper.trailmap.roundtrip.fixing.DeadEndFixer;
 import com.graphhopper.trailmap.roundtrip.fixing.FixResult;
 import com.graphhopper.trailmap.roundtrip.geometry.*;
@@ -68,6 +71,7 @@ public class ExplorationRoundTripRouting {
 
     // Dead-end fix configuration
     private static final double MIN_DEAD_END_TO_FIX = 50.0;
+    private static final double MIN_CORRIDOR_TO_FIX = 250.0;
 
     // GH dependencies
     private final BaseGraph graph;
@@ -87,6 +91,7 @@ public class ExplorationRoundTripRouting {
 
     // Dead-end fixer
     private final DeadEndFixer deadEndFixer;
+    private final CorridorOverlapFixer corridorOverlapFixer;
 
     // Path details factory
     private final PathDetailsBuilderFactory pathDetailsBuilderFactory;
@@ -117,6 +122,7 @@ public class ExplorationRoundTripRouting {
         this.snapper = new ProfileAwareSnapper(graph);
         this.scorer = new EncodedValueScorer();
         this.deadEndFixer = new DeadEndFixer();
+        this.corridorOverlapFixer = new CorridorOverlapFixer();
     }
 
     private Map<String, TourGeometryStrategy> initGeometryStrategies() {
@@ -136,17 +142,15 @@ public class ExplorationRoundTripRouting {
      * Generate an exploration round-trip route.
      *
      * @param request                           GH request with round-trip parameters
-     * @param explorationPathCalculatorFactory  Factory for exploration profile routing
-     * @param standardPathCalculatorFactory     Factory for standard profile routing (normalization)
-     * @param exploreWeighting                  Weighting for exploration profile (used for path details)
-     * @param standardWeighting                 Weighting for standard profile (used for path details)
+     * @param explorationPathCalculatorFactory  Factory for exploration profile routing (Stage A)
+     * @param exploreWeighting                  Weighting for exploration profile (non-finalized path details)
+     * @param router                            Public routing entry point for normalization + final route
      * @return Exploration result with normalized waypoints
      */
     public ExplorationRoundTripResult route(GHRequest request,
                                              Function<List<Snap>, FlexiblePathCalculator> explorationPathCalculatorFactory,
-                                             Function<List<Snap>, FlexiblePathCalculator> standardPathCalculatorFactory,
                                              Weighting exploreWeighting,
-                                             Weighting standardWeighting) {
+                                             Function<GHRequest, GHResponse> router) {
         StopWatch sw = new StopWatch().start();
 
         // Parse parameters
@@ -186,9 +190,10 @@ public class ExplorationRoundTripRouting {
                 ExplorationRoundTripResult result = attemptExplorationRoute(
                     start, distance, heading, attemptSeed,
                     geometry, roundTripProfile, maxFixes, finalize,
-                    explorationPathCalculatorFactory, standardPathCalculatorFactory,
+                    explorationPathCalculatorFactory,
                     returnMetrics, snappingPreference,
-                    request.getPathDetails(), exploreWeighting, standardWeighting);
+                    request.getPathDetails(), exploreWeighting,
+                    standardProfileName, request.getCustomModel(), router);
 
                 if (result.isSuccess() || result.getNormalizedWaypoints().size() > 0) {
                     logger.info("Exploration round-trip completed in {}s on attempt {}, {} waypoints, {:.1f}% match",
@@ -227,9 +232,10 @@ public class ExplorationRoundTripRouting {
             TourGeometryStrategy geometry, RoundTripProfile profile,
             int maxFixes, boolean finalize,
             Function<List<Snap>, FlexiblePathCalculator> explorationPathCalculatorFactory,
-            Function<List<Snap>, FlexiblePathCalculator> standardPathCalculatorFactory,
             boolean returnMetrics, SnappingPreference snappingPreference,
-            List<String> requestedPathDetails, Weighting exploreWeighting, Weighting standardWeighting) {
+            List<String> requestedPathDetails, Weighting exploreWeighting,
+            String standardProfileName, CustomModel customModel,
+            Function<GHRequest, GHResponse> router) {
 
         // ================================================================
         // Phase 1: Generate exploration route with quality control
@@ -344,49 +350,65 @@ public class ExplorationRoundTripRouting {
         }
 
         // ================================================================
-        // Phase 2: Normalize to minimal waypoints
+        // Phase 2: Normalize to minimal waypoints (Stage B)
         // ================================================================
 
-        WaypointNormalizer normalizer = new WaypointNormalizer(
-            graph, locationIndex, edgeFilter);
-
-        // Pass original waypoints and per-leg exploration paths to normalizer
-        // This enables the correct binary search approach: INSERT via-points where needed
+        // Directed edge_key normalization, validated via the public routing API. Reproduces the
+        // AvoidEdgesWeighting-shaped exploration path; INSERTs via-points where a plain standard
+        // route would diverge.
+        WaypointNormalizer normalizer = new WaypointNormalizer(graph);
         NormalizationResult normResult = normalizer.normalize(
-            currentWaypoints, exploreResult.paths, standardPathCalculatorFactory);
+            currentWaypoints, exploreResult.paths, standardProfileName, customModel, router);
 
         if (!normResult.hasWaypoints()) {
             return ExplorationRoundTripResult.failure(normResult.getFailureReason());
         }
 
-        logger.info("Normalization: {} original waypoints -> {} final waypoints, {:.1f}% match",
-            currentWaypoints.size(), normResult.getWaypoints().size(), normResult.getMatchPercentage());
+        logger.info("Normalization: {} original waypoints -> {} final waypoints, {}% match",
+            currentWaypoints.size(), normResult.getWaypoints().size(),
+            String.format("%.1f", normResult.getMatchPercentage()));
 
         // ================================================================
-        // Build final response
+        // Build final response (Stage C): route the normalized waypoints via the public API
         // ================================================================
 
-        // Route the normalized waypoints for the final path
-        List<Snap> finalSnaps = snapWaypointsSimple(normResult.getWaypoints());
-        if (finalSnaps == null) {
-            return ExplorationRoundTripResult.failure("Failed to snap normalized waypoints");
+        GHRequest finalReq = new GHRequest(new ArrayList<>(normResult.getWaypoints()));
+        finalReq.setProfile(standardProfileName);
+        if (customModel != null) finalReq.setCustomModel(customModel);
+        finalReq.putHint("instructions", false);
+        // Geometry is mandatory output for this endpoint; set explicitly so it can't fall back to
+        // a server-wide routing.calc_points=false (the old path always called path.calcPoints()).
+        finalReq.putHint("calc_points", true);
+        if (requestedPathDetails != null && !requestedPathDetails.isEmpty()) {
+            finalReq.setPathDetails(requestedPathDetails);
         }
 
-        Path finalPath = calculatePath(finalSnaps, standardPathCalculatorFactory);
-        if (finalPath == null) {
+        GHResponse finalRsp;
+        try {
+            finalRsp = router.apply(finalReq);
+        } catch (Exception e) {
+            logger.warn("Error calculating final route: {}", e.getMessage());
+            return ExplorationRoundTripResult.failure("Failed to calculate final route");
+        }
+        if (finalRsp.hasErrors() || finalRsp.getBest() == null) {
             return ExplorationRoundTripResult.failure("Failed to calculate final route");
         }
 
-        // Build response path with exploration waypoints
-        ResponsePath responsePath = buildResponsePath(finalPath, finalSnaps, finalExplorationWaypoints,
-            requestedPathDetails, standardWeighting);
+        ResponsePath responsePath = finalRsp.getBest();
 
-        // Score for quality reporting
-        RouteScore score = null;
-        if (returnMetrics) {
-            List<Path> paths = Collections.singletonList(finalPath);
-            score = scorer.score(paths, normResult.getWaypoints(), profile, encodedValueLookup, distance);
+        // Attach the exploration (geometric) waypoints alongside the normalized waypoints that
+        // route() already set on the response.
+        if (finalExplorationWaypoints != null && !finalExplorationWaypoints.isEmpty()) {
+            PointList exploreWps = new PointList(finalExplorationWaypoints.size(), false);
+            for (GHPoint p : finalExplorationWaypoints) {
+                exploreWps.add(p.getLat(), p.getLon());
+            }
+            responsePath.setExplorationWaypoints(exploreWps);
         }
+
+        // Quality reporting reuses the exploration route's score (which the normalized waypoints
+        // reproduce); the final route is geometry-equivalent to it.
+        RouteScore score = returnMetrics ? currentScore : null;
 
         return ExplorationRoundTripResult.fromNormalization(responsePath, normResult,
             finalExplorationWaypoints, score, returnMetrics);
@@ -414,7 +436,17 @@ public class ExplorationRoundTripRouting {
             }
         }
 
-        return FixResult.failure("No dead-ends found", "dead-end");
+        // Then corridor overlap (geospatial parallel/antiparallel reuse on different edges)
+        for (LegScore leg : score.getLegScores()) {
+            if (leg.getCorridorOverlapDistance() >= MIN_CORRIDOR_TO_FIX
+                    && leg.getCorridorAnchor() != null && leg.getCorridorPartner() != null) {
+                logger.debug("Found corridor overlap in leg {}: {}m",
+                    leg.getLegIndex(), leg.getCorridorOverlapDistance());
+                return corridorOverlapFixer.attemptFix(waypoints, score, leg.getLegIndex(), profile);
+            }
+        }
+
+        return FixResult.failure("No dead-ends or corridor overlap found", "corridor-overlap");
     }
 
     /**
@@ -555,119 +587,6 @@ public class ExplorationRoundTripRouting {
         }
 
         return snaps;
-    }
-
-    /**
-     * Simple snapping without profile awareness.
-     */
-    private List<Snap> snapWaypointsSimple(List<GHPoint> waypoints) {
-        List<Snap> snaps = new ArrayList<>();
-
-        for (GHPoint point : waypoints) {
-            Snap snap = locationIndex.findClosest(point.getLat(), point.getLon(), edgeFilter);
-            if (snap == null || !snap.isValid()) {
-                logger.warn("Failed to snap waypoint at {}", point);
-                return null;
-            }
-            snaps.add(snap);
-        }
-
-        return snaps;
-    }
-
-    /**
-     * Calculate path through waypoints.
-     */
-    private Path calculatePath(List<Snap> snaps,
-                                Function<List<Snap>, FlexiblePathCalculator> pathCalculatorFactory) {
-        if (snaps.size() < 2) {
-            return null;
-        }
-
-        try {
-            FlexiblePathCalculator pathCalculator = pathCalculatorFactory.apply(snaps);
-            Path combinedPath = null;
-
-            for (int i = 0; i < snaps.size() - 1; i++) {
-                int fromNode = snaps.get(i).getClosestNode();
-                int toNode = snaps.get(i + 1).getClosestNode();
-
-                List<Path> paths = pathCalculator.calcPaths(fromNode, toNode, new EdgeRestrictions());
-
-                if (paths.isEmpty() || !paths.get(0).isFound()) {
-                    logger.warn("No path found between snaps {} and {}", i, i + 1);
-                    return null;
-                }
-
-                Path legPath = paths.get(0);
-                if (combinedPath == null) {
-                    combinedPath = legPath;
-                } else {
-                    // Merge paths by adding edges
-                    for (int j = 0; j < legPath.getEdgeCount(); j++) {
-                        combinedPath.addEdge(legPath.getEdges().get(j));
-                    }
-                    combinedPath.addDistance(legPath.getDistance());
-                    combinedPath.addTime(legPath.getTime());
-                }
-            }
-
-            return combinedPath;
-        } catch (Exception e) {
-            logger.warn("Error calculating path: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Build ResponsePath from Path, snaps, and exploration waypoints.
-     *
-     * @param path                  The calculated path
-     * @param snaps                 Snapped normalized waypoints
-     * @param explorationWaypoints  Final exploration waypoints (after fix loop)
-     * @param requestedPathDetails  Path details to extract (e.g., surface, road_class)
-     * @param weighting             Weighting for detail extraction
-     * @return ResponsePath with all waypoint information and path details
-     */
-    private ResponsePath buildResponsePath(Path path, List<Snap> snaps,
-                                            List<GHPoint> explorationWaypoints,
-                                            List<String> requestedPathDetails,
-                                            Weighting weighting) {
-        ResponsePath responsePath = new ResponsePath();
-
-        // Set basic path info
-        responsePath.setDistance(path.getDistance());
-        responsePath.setTime(path.getTime());
-
-        // Set points
-        PointList points = path.calcPoints();
-        responsePath.setPoints(points);
-
-        // Set waypoints (snapped normalized positions)
-        PointList waypoints = new PointList(snaps.size(), false);
-        for (Snap snap : snaps) {
-            waypoints.add(snap.getSnappedPoint().getLat(), snap.getSnappedPoint().getLon());
-        }
-        responsePath.setWaypoints(waypoints);
-
-        // Set exploration waypoints (geometric shape vertices after fix loop)
-        if (explorationWaypoints != null && !explorationWaypoints.isEmpty()) {
-            PointList exploreWps = new PointList(explorationWaypoints.size(), false);
-            for (GHPoint p : explorationWaypoints) {
-                exploreWps.add(p.getLat(), p.getLon());
-            }
-            responsePath.setExplorationWaypoints(exploreWps);
-        }
-
-        // Extract and add path details if requested
-        if (requestedPathDetails != null && !requestedPathDetails.isEmpty()) {
-            Map<String, List<PathDetail>> details = PathDetailsFromEdges.calcDetails(
-                path, encodedValueLookup, weighting, requestedPathDetails,
-                pathDetailsBuilderFactory, 0, graph);
-            responsePath.addPathDetails(details);
-        }
-
-        return responsePath;
     }
 
     /**

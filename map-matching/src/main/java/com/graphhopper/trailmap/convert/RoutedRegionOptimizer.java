@@ -7,11 +7,9 @@ import com.graphhopper.ResponsePath;
 import com.graphhopper.matching.EdgeMatch;
 import com.graphhopper.matching.Observation;
 import com.graphhopper.storage.Graph;
-import com.graphhopper.util.AngleCalc;
+import com.graphhopper.trailmap.shared.EdgeKeyMatching;
 import com.graphhopper.util.CustomModel;
 import com.graphhopper.util.DistanceCalcEarth;
-import com.graphhopper.util.EdgeExplorer;
-import com.graphhopper.util.EdgeIterator;
 import com.graphhopper.util.EdgeIteratorState;
 import com.graphhopper.util.PointList;
 import com.graphhopper.util.details.PathDetail;
@@ -21,9 +19,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Stage 3 of the conversion pipeline. Given one {@link TrackRegion.Matched}, choose the
@@ -131,8 +127,6 @@ public class RoutedRegionOptimizer {
      */
     public static final int CLIENT_HEADING_PENALTY_S = 60;
 
-    private static final AngleCalc ANGLE_CALC = AngleCalc.ANGLE_CALC;
-
     /**
      * Which reference the probe rule compares {@code /route}'s output against. See
      * class-level javadoc.
@@ -173,15 +167,9 @@ public class RoutedRegionOptimizer {
      *  treat coincident parallel edges over the same node pair (e.g. a cycleway + footway mapped
      *  as separate ways over the same stripe) as equivalent before deciding. Default on. */
     private boolean twinEdgeTolerance = true;
-    /** Two edges sharing a node pair are twins only if the longer is ≤ {@link #TWIN_RATIO_MAX}×
-     *  the shorter — guards against a genuine alternate path (a longer "route" between the same
-     *  two junctions) being mistaken for a coincident twin. */
-    static final double TWIN_RATIO_MAX = 1.5;
-    /** Below this length the ratio test is skipped (very short edges can't deviate enough to
-     *  matter, and the ratio is noisy on them) — they count as twins on node-pair alone. */
-    static final double TWIN_MIN_LEN_M = 20.0;
-    /** Cache: graph edge id → canonical (min) edge id of its geometry-guarded twin group. */
-    private final Map<Integer, Integer> twinCanonCache = new HashMap<>();
+
+    /** Shared directed-edge_key matching primitive (dedup, basic rule, twin canonicalization). */
+    private final EdgeKeyMatching ekm;
 
     /** Toggle the twin-edge tolerance fallback (default on). */
     public void setTwinEdgeTolerance(boolean enabled) { this.twinEdgeTolerance = enabled; }
@@ -200,6 +188,7 @@ public class RoutedRegionOptimizer {
         this.graphHopper = graphHopper;
         this.referenceMode = referenceMode;
         this.maxLegDeviationM = maxLegDeviationM;
+        this.ekm = new EdgeKeyMatching(graphHopper.getBaseGraph());
     }
 
     public ReferenceMode getReferenceMode() { return referenceMode; }
@@ -479,8 +468,8 @@ public class RoutedRegionOptimizer {
         List<PathDetail> ekDetails = path.getPathDetails().get("edge_key");
         if (ekDetails == null) return new ProbeOutcome(false, 0, Double.NaN);
 
-        int[] A = dedupConsecutive(pdValuesInt(ekDetails));
-        double exitHeading = exitHeadingOf(path.getPoints());
+        int[] A = EdgeKeyMatching.edgeKeysFromDetails(ekDetails);
+        double exitHeading = EdgeKeyMatching.exitHeadingOf(path.getPoints());
 
         // Try the basic rule first.
         if (applyEdgeKeyRule(E, A)) {
@@ -508,8 +497,8 @@ public class RoutedRegionOptimizer {
         // can only flip a would-be-coords leg to routed; it never changes a passing leg or the
         // chosen edges.
         if (twinEdgeTolerance) {
-            int[] Ec = twinCanonicalize(E);
-            int[] Ac = twinCanonicalize(A);
+            int[] Ec = ekm.twinCanonicalize(E);
+            int[] Ac = ekm.twinCanonicalize(A);
             if (applyEdgeKeyRule(Ec, Ac)) {
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug("optimize: TWIN-RESCUE leg cand[{}..{}] E={} A={} → Ec={} Ac={}",
@@ -524,92 +513,11 @@ public class RoutedRegionOptimizer {
     }
 
     /**
-     * Map an edge_key sequence to DIRECTION-PRESERVING twin-group symbols, then collapse consecutive
-     * duplicates. Two edges belong to the same group when they share a node pair AND pass the length
-     * guard ({@link #TWIN_MIN_LEN_M} / {@link #TWIN_RATIO_MAX}); the symbol is the group's min edge id
-     * times two plus a direction bit. So a cycleway and its footway twin traversed the SAME way map to
-     * one symbol (the parallel-twin fix), while a same-edge reversal (a genuine U-turn / out-and-back
-     * in the matcher path) keeps two distinct symbols and is NOT flattened.
+     * The boundary-tolerant edge_key probe rule. Retained as a thin delegator to
+     * {@link EdgeKeyMatching#basicRule} so existing callers/tests keep working.
      */
-    private int[] twinCanonicalize(int[] edgeKeys) {
-        int[] out = new int[edgeKeys.length];
-        for (int i = 0; i < edgeKeys.length; i++) {
-            out[i] = twinCanonical(edgeKeys[i]);
-        }
-        return dedupConsecutive(out);
-    }
-
-    /** Direction-preserving twin symbol for {@code edgeKey}: {@code groupRep*2 + directionBit}, where
-     *  {@code groupRep} is the geometry-guarded twin group's min edge id and the bit records traversal
-     *  toward the higher- vs lower-numbered node. Same-direction twins collapse; reversals do not. */
-    private int twinCanonical(int edgeKey) {
-        Graph graph = graphHopper.getBaseGraph();
-        EdgeIteratorState st;
-        try {
-            st = graph.getEdgeIteratorStateForKey(edgeKey);
-        } catch (Exception e) {
-            return edgeKey; // unresolvable — keep distinct
-        }
-        int rep = twinGroupRep(st.getEdge(), st.getBaseNode(), st.getAdjNode(), st.getDistance());
-        int dirBit = st.getBaseNode() < st.getAdjNode() ? 0 : 1;
-        return rep * 2 + dirBit;
-    }
-
-    /** Min edge id of the geometry-guarded twin group (edges between the same node pair as the given
-     *  edge that pass {@link #isTwin}). Direction-independent → cached by edge id. */
-    private int twinGroupRep(int edgeId, int base, int adj, double len) {
-        Integer cached = twinCanonCache.get(edgeId);
-        if (cached != null) return cached;
-        int rep = edgeId;
-        EdgeExplorer explorer = graphHopper.getBaseGraph().createEdgeExplorer();
-        EdgeIterator it = explorer.setBaseNode(base);
-        while (it.next()) {
-            if (it.getAdjNode() != adj) continue;          // only parallels between base↔adj
-            if (it.getEdge() == edgeId) continue;          // skip self
-            if (!isTwin(len, it.getDistance())) continue;  // geometry guard
-            if (it.getEdge() < rep) rep = it.getEdge();
-        }
-        twinCanonCache.put(edgeId, rep);
-        return rep;
-    }
-
-    /** Length guard for twin equivalence: very short edges (≤ {@link #TWIN_MIN_LEN_M}) are twins on
-     *  node-pair alone; otherwise the longer must be ≤ {@link #TWIN_RATIO_MAX}× the shorter. */
-    static boolean isTwin(double lenA, double lenB) {
-        double hi = Math.max(lenA, lenB), lo = Math.min(lenA, lenB);
-        if (hi <= TWIN_MIN_LEN_M) return true;
-        return lo > 0 && hi <= TWIN_RATIO_MAX * lo;
-    }
-
-    /**
-     * Exit bearing of a route polyline — the azimuth of its final segment, mirroring how
-     * the client (and {@code RouteInstructionGenerator}) derive the next leg's start
-     * heading. Returns {@code NaN} when the polyline has fewer than two points.
-     */
-    private static double exitHeadingOf(PointList pts) {
-        int n = pts.size();
-        if (n < 2) return Double.NaN;
-        return ANGLE_CALC.calcAzimuth(
-                pts.getLat(n - 2), pts.getLon(n - 2),
-                pts.getLat(n - 1), pts.getLon(n - 1));
-    }
-
     static boolean applyEdgeKeyRule(int[] E, int[] A) {
-        if (Arrays.equals(E, A)) return true;
-        for (int x = 0; x <= 1; x++) {
-            for (int y = 0; y <= 1; y++) {
-                if (x == 0 && y == 0) continue;
-                int remaining = E.length - x - y;
-                if (remaining < 0) continue;
-                if (remaining == 0) {
-                    if (A.length == 0) return true;
-                    continue;
-                }
-                int[] sub = Arrays.copyOfRange(E, x, E.length - y);
-                if (Arrays.equals(sub, A)) return true;
-            }
-        }
-        return false;
+        return EdgeKeyMatching.basicRule(E, A);
     }
 
     // ------------------------------------------------------------------------
@@ -642,7 +550,7 @@ public class RoutedRegionOptimizer {
         for (int i = 0; i < slice.size(); i++) {
             E_full[i] = slice.get(i).getEdgeState().getEdgeKey();
         }
-        int[] E_dedup = dedupConsecutive(E_full); // typically no-op given segmenter dedup
+        int[] E_dedup = EdgeKeyMatching.dedupConsecutive(E_full); // typically no-op given segmenter dedup
 
         // /route(all_snaps_in_region).
         List<GHPoint> snaps = region.obsSnapPoints();
@@ -663,7 +571,7 @@ public class RoutedRegionOptimizer {
         ResponsePath path = rsp.getBest();
         List<PathDetail> ek = path.getPathDetails().get("edge_key");
         if (ek == null) return List.of();
-        int[] A_dedup = dedupConsecutive(pdValuesInt(ek));
+        int[] A_dedup = EdgeKeyMatching.edgeKeysFromDetails(ek);
 
         // Try boundary stripping (x, y ∈ {0,1}) before finding the divergent middle.
         // Snap-at-region-boundary cases (matcher's leading or trailing edge absent from
@@ -739,7 +647,7 @@ public class RoutedRegionOptimizer {
         }
         int[] out = new int[result.size()];
         for (int j = 0; j < out.length; j++) out[j] = result.get(j);
-        return dedupConsecutive(out);
+        return EdgeKeyMatching.dedupConsecutive(out);
     }
 
     private static boolean matchesAt(int[] arr, int start, int[] pattern) {
@@ -870,7 +778,7 @@ public class RoutedRegionOptimizer {
             for (int i = eFrom; i <= eTo; i++) {
                 keys[i - eFrom] = slice.get(i).getEdgeState().getEdgeKey();
             }
-            return dedupConsecutive(keys);
+            return EdgeKeyMatching.dedupConsecutive(keys);
         }
     }
 
@@ -929,7 +837,7 @@ public class RoutedRegionOptimizer {
                 }
                 int[] arr = new int[keys.size()];
                 for (int k = 0; k < keys.size(); k++) arr[k] = keys.get(k);
-                legKeys[leg] = dedupConsecutive(arr);
+                legKeys[leg] = EdgeKeyMatching.dedupConsecutive(arr);
             }
 
             // Per-leg geographic check (only when threshold > 0).
@@ -964,7 +872,7 @@ public class RoutedRegionOptimizer {
             }
             int[] arr = new int[all.size()];
             for (int i = 0; i < arr.length; i++) arr[i] = all.get(i);
-            return dedupConsecutive(arr);
+            return EdgeKeyMatching.dedupConsecutive(arr);
         }
 
         @Override
@@ -1035,27 +943,5 @@ public class RoutedRegionOptimizer {
         double cy = ay + t * dy;
         double ex = px - cx, ey = py - cy;
         return Math.sqrt(ex * ex + ey * ey);
-    }
-
-    private static int[] dedupConsecutive(int[] xs) {
-        if (xs.length == 0) return xs;
-        int[] out = new int[xs.length];
-        int n = 0;
-        int prev = Integer.MIN_VALUE;
-        for (int x : xs) {
-            if (x != prev) {
-                out[n++] = x;
-                prev = x;
-            }
-        }
-        return Arrays.copyOf(out, n);
-    }
-
-    private static int[] pdValuesInt(List<PathDetail> details) {
-        int[] out = new int[details.size()];
-        for (int i = 0; i < details.size(); i++) {
-            out[i] = ((Number) details.get(i).getValue()).intValue();
-        }
-        return out;
     }
 }

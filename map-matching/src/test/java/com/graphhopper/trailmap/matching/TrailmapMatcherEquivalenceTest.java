@@ -55,7 +55,7 @@ import static org.junit.jupiter.api.Assertions.*;
 public class TrailmapMatcherEquivalenceTest {
 
     private static final String GRAPH_LOCATION = "../../data/graph-cache";
-    private static final String OSM_FILE = "../../data/finland_3.osm.pbf";
+    private static final String OSM_FILE = "../../data/finland_4.osm.pbf";
     private static final String CONFIG_FILE = "../trailmap-config.yml";
     private static final String GPX_DIR = "../../data/gpx-for-testing/";
 

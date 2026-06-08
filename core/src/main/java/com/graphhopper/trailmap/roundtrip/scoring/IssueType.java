@@ -38,6 +38,13 @@ public enum IssueType {
     /** Distant repetition: edges repeated from non-adjacent segments (out-and-back pattern) */
     DISTANT_REPETITION,
 
+    /**
+     * Corridor overlap: the route runs physically close and parallel/antiparallel to another
+     * part of itself on DIFFERENT edges (e.g. out on a separate cycleway, back on the adjacent
+     * road ~10m away). Geometry-based; complements the edge-ID repetition checks above.
+     */
+    CORRIDOR_OVERLAP,
+
     /** Route stuck on main roads when profile prefers smaller roads */
     MAIN_ROAD_TRAP,
 
@@ -92,6 +99,8 @@ public enum IssueType {
                 return "Route backtracks on a dead-end road";
             case DISTANT_REPETITION:
                 return "Route has out-and-back sections from non-adjacent segments";
+            case CORRIDOR_OVERLAP:
+                return "Route runs alongside itself on a nearby parallel path";
             case MAIN_ROAD_TRAP:
                 return "Route stuck on main roads";
             case LOW_QUALITY_LEG:

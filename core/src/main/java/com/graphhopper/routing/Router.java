@@ -349,9 +349,11 @@ public class Router {
         exploreHints.putObject(CustomModel.KEY, request.getCustomModel());
         Weighting exploreWeighting = weightingFactory.createWeighting(exploreProfile, exploreHints, false);
 
-        // Generate route with two path calculator factories and weightings for detail extraction
+        // Stage A uses the exploration factory; normalization (Stage B) and the final route
+        // (Stage C) go through the public routing API (this::route), which sets the correct
+        // per-profile traversal mode (essential for turn-cost profiles).
         ExplorationRoundTripResult result = explorationRouting.route(request,
-            // Exploration profile factory
+            // Exploration profile factory (Stage A, with AvoidEdgesWeighting applied downstream)
             snaps -> {
                 QueryGraph queryGraph = QueryGraph.create(graph, snaps);
                 return new FlexiblePathCalculator(queryGraph,
@@ -359,13 +361,8 @@ public class Router {
                     exploreWeighting,
                     solver.getAlgoOpts());
             },
-            // Standard profile factory (for normalization)
-            snaps -> {
-                QueryGraph queryGraph = QueryGraph.create(graph, snaps);
-                return solver.createPathCalculator(queryGraph);
-            },
             exploreWeighting,
-            solver.weighting
+            this::route
         );
 
         ghRsp.addDebugInfo("explorationRoundTrip:" + sw.stop().getSeconds() + "s");
@@ -434,33 +431,33 @@ public class Router {
         RouteConversionService conversionService = new RouteConversionService(
             graph, locationIndex, edgeFilter);
 
-        // Create exploration weighting
+        // Create exploration weighting (Stage A)
         PMap exploreHints = new PMap();
         exploreHints.putObject(CustomModel.KEY, request.getCustomModel());
         Weighting exploreWeighting = weightingFactory.createWeighting(exploreProfile, exploreHints, false);
 
-        // Create algorithm options
-        AlgorithmOptions algoOpts = new AlgorithmOptions().setAlgorithm(Parameters.Algorithms.DIJKSTRA_BI);
+        // Exploration algorithm options with per-profile traversal mode. Defensive: exploration
+        // profiles have no turn costs today, but this guarantees a turn-cost weighting is never
+        // paired with node-based traversal (which throws). Stages B/C route via the public API
+        // (this::route) and inherit the correct mode automatically.
+        AlgorithmOptions exploreAlgoOpts = new AlgorithmOptions()
+            .setAlgorithm(Parameters.Algorithms.DIJKSTRA_BI)
+            .setTraversalMode(exploreProfile.hasTurnCosts() ? TraversalMode.EDGE_BASED : TraversalMode.NODE_BASED);
 
         // Perform conversion
         return conversionService.convert(
             request.getWaypoints(),
-            // Exploration profile factory
+            // Exploration profile factory (Stage A)
             snaps -> {
                 QueryGraph queryGraph = QueryGraph.create(graph, snaps);
                 return new FlexiblePathCalculator(queryGraph,
                     new RoutingAlgorithmFactorySimple(),
                     exploreWeighting,
-                    algoOpts);
+                    exploreAlgoOpts);
             },
-            // Standard profile factory
-            snaps -> {
-                QueryGraph queryGraph = QueryGraph.create(graph, snaps);
-                return new FlexiblePathCalculator(queryGraph,
-                    new RoutingAlgorithmFactorySimple(),
-                    standardWeighting,
-                    algoOpts);
-            }
+            standardProfileName,
+            request.getCustomModel(),
+            this::route
         );
     }
 

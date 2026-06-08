@@ -7,6 +7,9 @@ package com.graphhopper.trailmap.roundtrip.exploration;
 
 import com.carrotsearch.hppc.IntSet;
 import com.graphhopper.ConvertResponse;
+import com.graphhopper.GHRequest;
+import com.graphhopper.GHResponse;
+import com.graphhopper.ResponsePath;
 import com.graphhopper.coll.GHIntHashSet;
 import com.graphhopper.routing.EdgeRestrictions;
 import com.graphhopper.routing.FlexiblePathCalculator;
@@ -18,7 +21,7 @@ import com.graphhopper.storage.index.LocationIndex;
 import com.graphhopper.storage.index.Snap;
 import com.graphhopper.trailmap.roundtrip.normalization.NormalizationResult;
 import com.graphhopper.trailmap.roundtrip.normalization.WaypointNormalizer;
-import com.graphhopper.util.PointList;
+import com.graphhopper.util.CustomModel;
 import com.graphhopper.util.StopWatch;
 import com.graphhopper.util.shapes.GHPoint;
 import org.slf4j.Logger;
@@ -31,15 +34,16 @@ import java.util.function.Function;
 /**
  * Service for converting exploration waypoints to normalized waypoints.
  *
- * <p>This service recreates the exploration route from snapped waypoints,
- * then runs normalization to produce minimal waypoints for client editing.
- *
  * <p>The conversion process:
  * <ol>
- *   <li>Snap the input waypoints (should be trivial as they're already on network)</li>
- *   <li>Route with exploration profile + AvoidEdgesWeighting to recreate exploration paths</li>
- *   <li>Run WaypointNormalizer to find minimal waypoints for standard profile</li>
- *   <li>Calculate final route through normalized waypoints</li>
+ *   <li><b>Stage A</b> — recreate the exploration paths from the snapped waypoints using the
+ *       exploration profile + {@link AvoidEdgesWeighting} (the anti-backtracking penalty that is
+ *       essential to route quality). This stays on the low-level routing path.</li>
+ *   <li><b>Stage B</b> — {@link WaypointNormalizer} finds the minimal waypoints that reproduce
+ *       those exploration paths under the standard profile, validated by directed edge_key
+ *       comparison via the public routing API.</li>
+ *   <li><b>Stage C</b> — route the standard profile through the normalized waypoints (public API)
+ *       to produce the final geometry returned to the client.</li>
  * </ol>
  */
 public class RouteConversionService {
@@ -59,14 +63,18 @@ public class RouteConversionService {
     /**
      * Convert exploration waypoints to normalized waypoints.
      *
-     * @param explorationWaypoints Snapped exploration waypoints from non-finalized response
-     * @param explorationPathCalculatorFactory Factory for exploration profile routing
-     * @param standardPathCalculatorFactory Factory for standard profile routing
-     * @return Conversion result with normalized waypoints
+     * @param explorationWaypoints              Snapped exploration waypoints from a non-finalized response
+     * @param explorationPathCalculatorFactory  Factory for exploration profile routing (Stage A)
+     * @param profile                           Standard (rendering) profile name (Stages B/C)
+     * @param customModel                       Optional custom model passed to the router (may be null)
+     * @param router                            Public routing entry point (e.g. {@code Router::route})
+     * @return Conversion result with normalized waypoints and final geometry
      */
     public ConvertResponse convert(List<GHPoint> explorationWaypoints,
-                                    Function<List<Snap>, FlexiblePathCalculator> explorationPathCalculatorFactory,
-                                    Function<List<Snap>, FlexiblePathCalculator> standardPathCalculatorFactory) {
+                                   Function<List<Snap>, FlexiblePathCalculator> explorationPathCalculatorFactory,
+                                   String profile,
+                                   CustomModel customModel,
+                                   Function<GHRequest, GHResponse> router) {
         StopWatch sw = new StopWatch().start();
 
         if (explorationWaypoints == null || explorationWaypoints.size() < 2) {
@@ -75,68 +83,75 @@ public class RouteConversionService {
 
         logger.info("Converting {} exploration waypoints", explorationWaypoints.size());
 
-        // Step 1: Snap waypoints
-        // These are already snapped positions from the exploration response,
-        // so findClosest should return the same edges
+        // Stage A: snap waypoints (already snapped positions from the exploration response)
         List<Snap> snaps = snapWaypoints(explorationWaypoints);
         if (snaps == null) {
             return ConvertResponse.failure("Failed to snap exploration waypoints");
         }
 
-        // Step 2: Recreate exploration paths with AvoidEdgesWeighting
-        // This matches the logic in ExplorationRoundTripRouting.calculateExplorationRoute()
+        // Stage A: recreate exploration paths with AvoidEdgesWeighting (anti-backtracking).
         ExplorationPathResult exploreResult = calculateExplorationPaths(snaps, explorationPathCalculatorFactory);
         if (exploreResult == null || exploreResult.paths.isEmpty()) {
             return ConvertResponse.failure("Failed to recreate exploration route");
         }
 
         logger.info("Recreated exploration route: {} legs, {} total edges",
-            exploreResult.paths.size(), exploreResult.totalEdges);
+                exploreResult.paths.size(), exploreResult.totalEdges);
 
-        // Step 3: Normalize to minimal waypoints
-        WaypointNormalizer normalizer = new WaypointNormalizer(graph, locationIndex, edgeFilter);
+        // Stage B: normalize to minimal waypoints (edge_key validated via the public router).
+        WaypointNormalizer normalizer = new WaypointNormalizer(graph);
         NormalizationResult normResult = normalizer.normalize(
-            explorationWaypoints, exploreResult.paths, standardPathCalculatorFactory);
+                explorationWaypoints, exploreResult.paths, profile, customModel, router);
 
         if (!normResult.hasWaypoints()) {
             return ConvertResponse.failure("Normalization failed: " + normResult.getFailureReason());
         }
 
-        logger.info("Normalization complete: {} -> {} waypoints, {:.1f}% match",
-            explorationWaypoints.size(), normResult.getWaypoints().size(), normResult.getMatchPercentage());
+        logger.info("Normalization complete: {} -> {} waypoints, {}% match",
+                explorationWaypoints.size(), normResult.getWaypoints().size(),
+                String.format("%.1f", normResult.getMatchPercentage()));
 
-        // Step 4: Calculate final route through normalized waypoints
-        List<Snap> finalSnaps = snapWaypoints(normResult.getWaypoints());
-        if (finalSnaps == null) {
-            return ConvertResponse.failure("Failed to snap normalized waypoints");
-        }
+        // Stage C: final route through the normalized waypoints via the public routing API.
+        GHRequest finalReq = new GHRequest(new ArrayList<>(normResult.getWaypoints()));
+        finalReq.setProfile(profile);
+        if (customModel != null) finalReq.setCustomModel(customModel);
+        finalReq.putHint("instructions", false);
+        // Geometry is mandatory output for /convert; set explicitly so it can't fall back to a
+        // server-wide routing.calc_points=false.
+        finalReq.putHint("calc_points", true);
 
-        FinalRouteResult finalRoute = calculateFinalRoute(finalSnaps, standardPathCalculatorFactory);
-        if (finalRoute == null) {
+        GHResponse finalRsp;
+        try {
+            finalRsp = router.apply(finalReq);
+        } catch (Exception e) {
+            logger.warn("Error calculating final route: {}", e.getMessage());
             return ConvertResponse.failure("Failed to calculate final route");
         }
+        if (finalRsp.hasErrors() || finalRsp.getBest() == null) {
+            logger.warn("Final route had errors: {}", finalRsp.getErrors());
+            return ConvertResponse.failure("Failed to calculate final route");
+        }
+
+        ResponsePath best = finalRsp.getBest();
 
         logger.info("Conversion completed in {}ms", sw.stop().getMillis());
 
         return ConvertResponse.success(
-            normResult.getWaypoints(),
-            finalRoute.points,
-            finalRoute.distance,
-            finalRoute.time,
-            normResult.getMatchPercentage(),
-            explorationWaypoints.size()
+                normResult.getWaypoints(),
+                best.getPoints(),
+                best.getDistance(),
+                best.getTime(),
+                normResult.getMatchPercentage(),
+                explorationWaypoints.size()
         );
     }
 
     /**
-     * Snap waypoints to the road network.
-     *
-     * <p>Since these are already snapped positions from the exploration response,
-     * this should find the same edges.
+     * Snap waypoints to the road network. Since these are already snapped positions from the
+     * exploration response, this should find the same edges.
      */
     private List<Snap> snapWaypoints(List<GHPoint> waypoints) {
         List<Snap> snaps = new ArrayList<>();
-
         for (GHPoint point : waypoints) {
             Snap snap = locationIndex.findClosest(point.getLat(), point.getLon(), edgeFilter);
             if (snap == null || !snap.isValid()) {
@@ -145,15 +160,14 @@ public class RouteConversionService {
             }
             snaps.add(snap);
         }
-
         return snaps;
     }
 
     /**
-     * Recreate exploration paths with AvoidEdgesWeighting.
+     * Recreate exploration paths with {@link AvoidEdgesWeighting} to prevent backtracking.
      *
-     * <p>This matches the logic in ExplorationRoundTripRouting.calculateExplorationRoute()
-     * to ensure we get the same paths.
+     * <p>This MUST match {@code ExplorationRoundTripRouting.calculateExplorationRoute()} so the
+     * recreated paths are identical to the ones the exploration step produced.
      */
     private ExplorationPathResult calculateExplorationPaths(
             List<Snap> snaps,
@@ -166,11 +180,9 @@ public class RouteConversionService {
         try {
             FlexiblePathCalculator pathCalculator = pathCalculatorFactory.apply(snaps);
 
-            // Wrap with AvoidEdgesWeighting to prevent backtracking
-            // This MUST match ExplorationRoundTripRouting.calculateExplorationRoute()
             IntSet previousEdges = new GHIntHashSet();
             AvoidEdgesWeighting avoidWeighting = new AvoidEdgesWeighting(pathCalculator.getWeighting())
-                .setEdgePenaltyFactor(5.0);
+                    .setEdgePenaltyFactor(5.0);
             avoidWeighting.setAvoidedEdges(previousEdges);
             pathCalculator.setWeighting(avoidWeighting);
 
@@ -192,7 +204,6 @@ public class RouteConversionService {
                 paths.add(legPath);
                 totalEdges += legPath.getEdgeCount();
 
-                // Add this leg's edges to avoidance set for subsequent legs
                 for (int j = 0; j < legPath.getEdgeCount(); j++) {
                     previousEdges.add(legPath.getEdges().get(j));
                 }
@@ -207,66 +218,6 @@ public class RouteConversionService {
     }
 
     /**
-     * Calculate final route through waypoints, returning merged points from leg paths.
-     *
-     * <p>We calculate each leg separately and merge their points,
-     * because manually constructed Path objects don't have fromNode set
-     * and cannot use calcPoints().
-     */
-    private FinalRouteResult calculateFinalRoute(List<Snap> snaps,
-                                                  Function<List<Snap>, FlexiblePathCalculator> pathCalculatorFactory) {
-        if (snaps.size() < 2) {
-            return null;
-        }
-
-        try {
-            FlexiblePathCalculator pathCalculator = pathCalculatorFactory.apply(snaps);
-            PointList mergedPoints = null;
-            double totalDistance = 0;
-            long totalTime = 0;
-
-            for (int i = 0; i < snaps.size() - 1; i++) {
-                int fromNode = snaps.get(i).getClosestNode();
-                int toNode = snaps.get(i + 1).getClosestNode();
-
-                List<Path> paths = pathCalculator.calcPaths(fromNode, toNode, new EdgeRestrictions());
-
-                if (paths.isEmpty() || !paths.get(0).isFound()) {
-                    logger.warn("No path found between snaps {} and {}", i, i + 1);
-                    return null;
-                }
-
-                Path legPath = paths.get(0);
-                PointList legPoints = legPath.calcPoints();
-
-                // Initialize mergedPoints on first leg, matching the elevation capability
-                if (mergedPoints == null) {
-                    mergedPoints = new PointList(legPoints.size() * snaps.size(), legPoints.is3D());
-                }
-
-                // Merge points, skipping first point of subsequent legs to avoid duplicates
-                int startIdx = (i == 0) ? 0 : 1;
-                for (int j = startIdx; j < legPoints.size(); j++) {
-                    if (legPoints.is3D()) {
-                        mergedPoints.add(legPoints.getLat(j), legPoints.getLon(j), legPoints.getEle(j));
-                    } else {
-                        mergedPoints.add(legPoints.getLat(j), legPoints.getLon(j));
-                    }
-                }
-
-                totalDistance += legPath.getDistance();
-                totalTime += legPath.getTime();
-            }
-
-            return new FinalRouteResult(mergedPoints, totalDistance, totalTime);
-
-        } catch (Exception e) {
-            logger.warn("Error calculating final route: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    /**
      * Internal result holder for exploration path calculation.
      */
     private static class ExplorationPathResult {
@@ -276,21 +227,6 @@ public class RouteConversionService {
         ExplorationPathResult(List<Path> paths, int totalEdges) {
             this.paths = paths;
             this.totalEdges = totalEdges;
-        }
-    }
-
-    /**
-     * Internal result holder for final route calculation.
-     */
-    private static class FinalRouteResult {
-        final PointList points;
-        final double distance;
-        final long time;
-
-        FinalRouteResult(PointList points, double distance, long time) {
-            this.points = points;
-            this.distance = distance;
-            this.time = time;
         }
     }
 }

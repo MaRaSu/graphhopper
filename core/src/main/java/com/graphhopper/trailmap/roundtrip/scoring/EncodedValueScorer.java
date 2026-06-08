@@ -16,6 +16,7 @@ import com.graphhopper.routing.ev.EnumEncodedValue;
 import com.graphhopper.routing.ev.RoadClass;
 import com.graphhopper.routing.ev.StringEncodedValue;
 import com.graphhopper.trailmap.roundtrip.config.RoundTripProfile;
+import com.graphhopper.util.AngleCalc;
 import com.graphhopper.util.DistanceCalcEarth;
 import com.graphhopper.util.EdgeIteratorState;
 import com.graphhopper.util.FetchMode;
@@ -27,8 +28,10 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -44,10 +47,39 @@ public class EncodedValueScorer implements RouteScorer {
 
     private static final Logger logger = LoggerFactory.getLogger(EncodedValueScorer.class);
     private static final DistanceCalcEarth DIST_CALC = DistanceCalcEarth.DIST_EARTH;
+    private static final AngleCalc ANGLE_CALC = AngleCalc.ANGLE_CALC;
 
     // Dead-end detection parameters
     private static final double DEAD_END_WINDOW_DISTANCE = 1500.0; // Look within 1.5km of waypoint
     private static final double MIN_DEAD_END_THRESHOLD = 50.0; // Minimum 50m to count as dead-end
+
+    // ===== Corridor-overlap (geospatial parallel/antiparallel self-proximity) parameters =====
+    // These detect the route running physically alongside another part of itself on DIFFERENT
+    // edges (e.g. out on a separate cycleway, back on the adjacent road ~10m away), which the
+    // edge-ID repetition checks above cannot see. All are tunable levers.
+    //
+    // Resampling granularity along the route polyline (m). Lateral distance is measured
+    // point-to-segment, so accuracy does not depend on this; ~40m keeps the sample count low.
+    private static final double CORRIDOR_SAMPLE_SPACING = 40.0;
+    // Two passes within this lateral distance count as the same corridor (m).
+    private static final double CORRIDOR_PROXIMITY_DIST = 20.0;
+    // Minimum route-sequence (arc-length) separation before proximity counts (m).
+    // Kills trivial local self-proximity and ordinary road curvature.
+    private static final double CORRIDOR_MIN_ARC_SEPARATION = 200.0;
+    // Headings within this tolerance of 0deg (same direction) or 180deg (opposite) count as a
+    // shared corridor; near-perpendicular self-crossings at junctions are ignored.
+    private static final double CORRIDOR_HEADING_TOL_DEG = 35.0;
+    // Contiguous overlap runs shorter than this are ignored (short shared connectors are fine).
+    private static final double CORRIDOR_MIN_OVERLAP_LENGTH = 250.0;
+    // Proximity between two samples that are both within this distance of the start point is the
+    // legitimate loop closure, not overlap.
+    private static final double CORRIDOR_CLOSURE_RADIUS = 150.0;
+    // Antiparallel ("U-turn and come back") overlap is weighted more heavily than same-direction
+    // corridor reuse when computing the route-level total used for acceptability.
+    private static final double CORRIDOR_ANTIPARALLEL_WEIGHT = 1.0;
+    private static final double CORRIDOR_PARALLEL_WEIGHT = 0.6;
+    // Total weighted corridor overlap above this fails the route (m).
+    private static final double CORRIDOR_MAX_OVERLAP = 300.0;
 
     // Surfaces considered unpaved
     private static final Set<String> UNPAVED_SURFACES = new HashSet<>(Arrays.asList(
@@ -233,6 +265,13 @@ public class EncodedValueScorer implements RouteScorer {
                 .mapToDouble(LegScore::getDistantRepetitionDistance).sum();
         score.withMetric("totalDistantRepetitionDistance", totalDistantRepetitionDist);
 
+        // Third pass: geospatial corridor overlap (parallel/antiparallel reuse on DIFFERENT edges).
+        // Catches "out on the separate cycleway, back on the adjacent road" which the edge-ID
+        // passes above miss. Populates per-leg corridor fields and returns the weighted total.
+        double weightedCorridorOverlap = analyzeCorridorOverlap(paths, score.getLegScores());
+        score.withMetric("totalCorridorOverlapDistance", weightedCorridorOverlap);
+        debugLog.append(String.format("  Corridor overlap: %.0fm (weighted)\n", weightedCorridorOverlap));
+
         // Calculate route-level metrics
         double globalRepetitionRatio = totalDistance > 0 ? totalRepeatedDistance / totalDistance : 0;
         double uniqueEdgeRatio = totalEdgeCount > 0 ? 1.0 - ((double) totalRepeatedEdgeCount / totalEdgeCount) : 1.0;
@@ -369,6 +408,14 @@ public class EncodedValueScorer implements RouteScorer {
                         leg.getLegIndex(), leg.getDeadEndDistance()));
                 break; // One dead-end is enough to trigger fixing
             }
+        }
+
+        // Check geospatial corridor overlap (different-edge parallel/antiparallel reuse)
+        Double corridorOverlap = score.getMetrics().get("totalCorridorOverlapDistance");
+        if (corridorOverlap != null && corridorOverlap > CORRIDOR_MAX_OVERLAP) {
+            acceptable = false;
+            score.withIssue(String.format("Corridor overlap %.0fm exceeds maximum %.0fm",
+                    corridorOverlap, CORRIDOR_MAX_OVERLAP));
         }
 
         // Check distance tolerance (unified quality model)
@@ -610,5 +657,239 @@ public class EncodedValueScorer implements RouteScorer {
         }
 
         return distantDistance;
+    }
+
+    // ========== Corridor Overlap Detection (geospatial) ==========
+
+    /** A resampled point along the full route polyline. */
+    private static final class CorridorVertex {
+        final double lat, lon;
+        final double s;          // arc-length from route start (m)
+        final int edgeId;
+        final int legIndex;
+        double heading;          // local route bearing (deg)
+
+        CorridorVertex(double lat, double lon, double s, int edgeId, int legIndex) {
+            this.lat = lat;
+            this.lon = lon;
+            this.s = s;
+            this.edgeId = edgeId;
+            this.legIndex = legIndex;
+        }
+    }
+
+    /**
+     * Detect geospatial corridor overlap: stretches where the route runs physically close and
+     * parallel/antiparallel to another part of itself on DIFFERENT edges. Populates each leg's
+     * corridorOverlapDistance / corridorAnchor / corridorPartner and sets CORRIDOR_OVERLAP as the
+     * leg's main issue when significant.
+     *
+     * @return total WEIGHTED overlap length in meters (antiparallel weighted higher), used by the
+     *         route-level acceptability threshold.
+     */
+    private double analyzeCorridorOverlap(List<Path> paths, List<LegScore> legScores) {
+        List<CorridorVertex> verts = buildRouteVertices(paths);
+        int n = verts.size();
+        if (n < 3) {
+            return 0;
+        }
+
+        GHPoint start = new GHPoint(verts.get(0).lat, verts.get(0).lon);
+
+        // Spatial grid over vertices for near-neighbour lookup.
+        double cosLat = Math.cos(Math.toRadians(verts.get(n / 2).lat));
+        if (cosLat < 0.1) cosLat = 0.1;
+        final double latCellDeg = CORRIDOR_SAMPLE_SPACING / 111320.0;
+        final double lonCellDeg = CORRIDOR_SAMPLE_SPACING / (111320.0 * cosLat);
+        Map<Long, List<Integer>> grid = new HashMap<>();
+        for (int i = 0; i < n; i++) {
+            CorridorVertex v = verts.get(i);
+            int cx = (int) Math.floor(v.lon / lonCellDeg);
+            int cy = (int) Math.floor(v.lat / latCellDeg);
+            grid.computeIfAbsent(packCell(cx, cy), k -> new ArrayList<>()).add(i);
+        }
+
+        boolean[] overlap = new boolean[n];
+        double[] vertWeight = new double[n];
+        GHPoint[] partner = new GHPoint[n];
+
+        for (int i = 0; i < n; i++) {
+            CorridorVertex vi = verts.get(i);
+            boolean viNearStart = DIST_CALC.calcDist(vi.lat, vi.lon, start.lat, start.lon) < CORRIDOR_CLOSURE_RADIUS;
+
+            double bestLateral = Double.MAX_VALUE;
+            CorridorVertex bestSegA = null, bestSegB = null;
+
+            int ci = (int) Math.floor(vi.lon / lonCellDeg);
+            int cj = (int) Math.floor(vi.lat / latCellDeg);
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    List<Integer> bucket = grid.get(packCell(ci + dx, cj + dy));
+                    if (bucket == null) continue;
+                    for (int j : bucket) {
+                        if (j + 1 >= n) continue;
+                        CorridorVertex a = verts.get(j);
+                        CorridorVertex b = verts.get(j + 1);
+                        // Different-edge gate: same-edge reuse is already owned by the edge-ID passes.
+                        if (a.edgeId == vi.edgeId || b.edgeId == vi.edgeId) continue;
+                        // Arc-length separation gate: ignore near-in-sequence self-proximity.
+                        if (Math.abs(vi.s - a.s) < CORRIDOR_MIN_ARC_SEPARATION) continue;
+                        // Loop-closure gate: start≈end neighbourhood is legitimate, not overlap.
+                        if (viNearStart
+                                && DIST_CALC.calcDist(a.lat, a.lon, start.lat, start.lon) < CORRIDOR_CLOSURE_RADIUS) {
+                            continue;
+                        }
+                        double lateral = pointToSegmentMeters(vi.lat, vi.lon, a.lat, a.lon, b.lat, b.lon);
+                        if (lateral < bestLateral) {
+                            bestLateral = lateral;
+                            bestSegA = a;
+                            bestSegB = b;
+                        }
+                    }
+                }
+            }
+
+            if (bestLateral <= CORRIDOR_PROXIMITY_DIST && bestSegA != null) {
+                double segHeading = ANGLE_CALC.calcAzimuth(bestSegA.lat, bestSegA.lon, bestSegB.lat, bestSegB.lon);
+                double delta = headingDelta(vi.heading, segHeading);
+                if (delta <= CORRIDOR_HEADING_TOL_DEG) {
+                    overlap[i] = true;
+                    vertWeight[i] = CORRIDOR_PARALLEL_WEIGHT;
+                    partner[i] = new GHPoint(bestSegA.lat, bestSegA.lon);
+                } else if (delta >= 180.0 - CORRIDOR_HEADING_TOL_DEG) {
+                    overlap[i] = true;
+                    vertWeight[i] = CORRIDOR_ANTIPARALLEL_WEIGHT;
+                    partner[i] = new GHPoint(bestSegA.lat, bestSegA.lon);
+                }
+            }
+        }
+
+        // Drop contiguous overlap runs shorter than the minimum length (short connectors are fine).
+        int runStart = -1;
+        for (int i = 0; i <= n; i++) {
+            boolean on = i < n && overlap[i];
+            if (on && runStart < 0) {
+                runStart = i;
+            } else if (!on && runStart >= 0) {
+                double runLen = (i - runStart) * CORRIDOR_SAMPLE_SPACING;
+                if (runLen < CORRIDOR_MIN_OVERLAP_LENGTH) {
+                    for (int k = runStart; k < i; k++) overlap[k] = false;
+                }
+                runStart = -1;
+            }
+        }
+
+        // Attribute surviving overlap to legs; choose a mid anchor per leg for the fixer.
+        double[] legOverlap = new double[legScores.size()];
+        List<List<Integer>> legVerts = new ArrayList<>();
+        for (int l = 0; l < legScores.size(); l++) legVerts.add(new ArrayList<>());
+        double weightedTotal = 0;
+        for (int i = 0; i < n; i++) {
+            if (!overlap[i]) continue;
+            weightedTotal += CORRIDOR_SAMPLE_SPACING * vertWeight[i];
+            int leg = verts.get(i).legIndex;
+            if (leg >= 0 && leg < legScores.size()) {
+                legOverlap[leg] += CORRIDOR_SAMPLE_SPACING;
+                legVerts.get(leg).add(i);
+            }
+        }
+
+        for (int l = 0; l < legScores.size(); l++) {
+            if (legOverlap[l] <= 0) continue;
+            LegScore leg = legScores.get(l);
+            leg.setCorridorOverlapDistance(legOverlap[l]);
+            List<Integer> vs = legVerts.get(l);
+            int midVert = vs.get(vs.size() / 2);
+            leg.setCorridorAnchor(new GHPoint(verts.get(midVert).lat, verts.get(midVert).lon));
+            if (partner[midVert] != null) {
+                leg.setCorridorPartner(partner[midVert]);
+            }
+            // Don't clobber a more specific issue already identified on this leg.
+            if (leg.getMainIssue() == IssueType.NONE) {
+                leg.setMainIssue(IssueType.CORRIDOR_OVERLAP);
+            }
+        }
+
+        return weightedTotal;
+    }
+
+    /** Build the full route polyline resampled at CORRIDOR_SAMPLE_SPACING, with edge/leg tags. */
+    private List<CorridorVertex> buildRouteVertices(List<Path> paths) {
+        // Raw polyline points: [lat, lon, edgeId, legIndex], de-duplicated at edge seams.
+        List<double[]> raw = new ArrayList<>();
+        for (int legIdx = 0; legIdx < paths.size(); legIdx++) {
+            for (EdgeIteratorState edge : paths.get(legIdx).calcEdges()) {
+                PointList pts = edge.fetchWayGeometry(FetchMode.ALL);
+                for (int p = 0; p < pts.size(); p++) {
+                    double lat = pts.getLat(p), lon = pts.getLon(p);
+                    if (!raw.isEmpty()) {
+                        double[] last = raw.get(raw.size() - 1);
+                        if (last[0] == lat && last[1] == lon) {
+                            continue; // skip duplicate seam point between consecutive edges
+                        }
+                    }
+                    raw.add(new double[]{lat, lon, edge.getEdge(), legIdx});
+                }
+            }
+        }
+        if (raw.size() < 2) {
+            return new ArrayList<>();
+        }
+
+        List<CorridorVertex> verts = new ArrayList<>();
+        double[] f = raw.get(0);
+        verts.add(new CorridorVertex(f[0], f[1], 0, (int) f[2], (int) f[3]));
+        double cum = 0;
+        double nextEmit = CORRIDOR_SAMPLE_SPACING;
+        for (int i = 1; i < raw.size(); i++) {
+            double[] a = raw.get(i - 1);
+            double[] b = raw.get(i);
+            double segLen = DIST_CALC.calcDist(a[0], a[1], b[0], b[1]);
+            if (segLen <= 0) continue;
+            double d0 = cum;
+            double d1 = cum + segLen;
+            while (nextEmit <= d1) {
+                double ratio = (nextEmit - d0) / segLen;
+                double lat = a[0] + (b[0] - a[0]) * ratio;
+                double lon = a[1] + (b[1] - a[1]) * ratio;
+                verts.add(new CorridorVertex(lat, lon, nextEmit, (int) a[2], (int) a[3]));
+                nextEmit += CORRIDOR_SAMPLE_SPACING;
+            }
+            cum = d1;
+        }
+
+        // Local route heading at each vertex.
+        for (int i = 0; i < verts.size(); i++) {
+            CorridorVertex c = verts.get(i);
+            if (i + 1 < verts.size()) {
+                CorridorVertex nxt = verts.get(i + 1);
+                c.heading = ANGLE_CALC.calcAzimuth(c.lat, c.lon, nxt.lat, nxt.lon);
+            } else if (i > 0) {
+                CorridorVertex prv = verts.get(i - 1);
+                c.heading = ANGLE_CALC.calcAzimuth(prv.lat, prv.lon, c.lat, c.lon);
+            }
+        }
+        return verts;
+    }
+
+    /** Point-to-segment distance in meters (perpendicular when the foot lands on the segment, else endpoint). */
+    private double pointToSegmentMeters(double pLat, double pLon,
+            double aLat, double aLon, double bLat, double bLon) {
+        if (DIST_CALC.validEdgeDistance(pLat, pLon, aLat, aLon, bLat, bLon)) {
+            return DIST_CALC.calcDenormalizedDist(
+                    DIST_CALC.calcNormalizedEdgeDistance(pLat, pLon, aLat, aLon, bLat, bLon));
+        }
+        return Math.min(DIST_CALC.calcDist(pLat, pLon, aLat, aLon),
+                DIST_CALC.calcDist(pLat, pLon, bLat, bLon));
+    }
+
+    /** Smallest angle (deg, 0..180) between two bearings. */
+    private double headingDelta(double h1, double h2) {
+        double d = Math.abs(h1 - h2) % 360.0;
+        return d > 180.0 ? 360.0 - d : d;
+    }
+
+    private long packCell(int cx, int cy) {
+        return (((long) cx) << 32) ^ (cy & 0xffffffffL);
     }
 }

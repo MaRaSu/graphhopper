@@ -65,6 +65,53 @@ public class PathEdgeExtractor {
     }
 
     /**
+     * Extract original (base graph) <i>directed edge keys</i> from a Path, one per edge in
+     * traversal order (no dedup).
+     *
+     * <p>Edge keys encode direction ({@code edgeId*2 + dirBit}), so an out-and-back on the same
+     * physical edge yields two distinct keys. This is the reference space used by the edge_key
+     * normalization, where it is compared against the {@code edge_key} path detail returned by the
+     * public routing API.
+     *
+     * <p>Virtual edges (inserted at snaps when routing through a QueryGraph) are unwrapped to their
+     * underlying base-graph edge key, mirroring {@link #getOriginalEdgeId} but preserving direction.
+     *
+     * @param path The path to extract edge keys from
+     * @return Array of base-graph directed edge keys, or empty if path is null/empty
+     */
+    public static int[] extractOriginalEdgeKeys(Path path) {
+        if (path == null || path.getEdges().isEmpty()) {
+            return new int[0];
+        }
+        IntArrayList result = new IntArrayList();
+        path.forEveryEdge(new Path.EdgeVisitor() {
+            @Override
+            public void next(EdgeIteratorState edge, int index, int prevEdgeId) {
+                result.add(getOriginalEdgeKey(edge));
+            }
+
+            @Override
+            public void finish() {
+            }
+        });
+        return result.toArray();
+    }
+
+    /**
+     * Get the original (base graph) <i>directed</i> edge key from an EdgeIteratorState.
+     *
+     * <p>For virtual edges this unwraps to the underlying real edge key (preserving direction);
+     * for regular edges it returns {@link EdgeIteratorState#getEdgeKey()}.
+     */
+    public static int getOriginalEdgeKey(EdgeIteratorState edge) {
+        if (edge instanceof VirtualEdgeIteratorState) {
+            return ((VirtualEdgeIteratorState) edge).getOriginalEdgeKey();
+        } else {
+            return edge.getEdgeKey();
+        }
+    }
+
+    /**
      * Extract original edge IDs with their polyline index ranges.
      *
      * <p>This is useful for binary search algorithms that need to map

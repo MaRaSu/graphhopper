@@ -3,6 +3,8 @@ package com.graphhopper.trailmap.roundtrip.normalization;
 import com.carrotsearch.hppc.IntArrayList;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.graphhopper.ConvertRequest;
+import com.graphhopper.ConvertResponse;
 import com.graphhopper.GHRequest;
 import com.graphhopper.GHResponse;
 import com.graphhopper.GraphHopper;
@@ -382,14 +384,13 @@ public class WaypointNormalizerIntegrationTest {
         System.out.println("  Edges: " + explorationEdges.size());
         System.out.println("  First 20 edges: " + edgesToString(explorationEdges, 20));
 
-        // Create normalizer with internal API
-        WaypointNormalizer normalizer = new WaypointNormalizer(
-            hopper.getBaseGraph(), locationIndex, edgeFilter);
+        // Create normalizer (edge_key + public-route pattern)
+        WaypointNormalizer normalizer = new WaypointNormalizer(hopper.getBaseGraph());
 
-        // Run normalization using internal APIs
+        // Run normalization: standard profile validated via the public routing API
         System.out.println("\n--- Running Normalization ---");
         NormalizationResult result = normalizer.normalize(
-            waypoints, explorationPaths, standardPathCalculatorFactory);
+            waypoints, explorationPaths, "gravel", null, hopper::route);
 
         System.out.println("\nNormalization Result:");
         System.out.println("  Success: " + result.isSuccess());
@@ -647,6 +648,38 @@ public class WaypointNormalizerIntegrationTest {
         }
 
         System.out.println("\n=== DIAGNOSTIC TEST 3: COMPLETE ===");
+    }
+
+    /**
+     * Regression for the AutoRoute /convert HTTP 400 after the gravel profile gained turn costs.
+     * Uses the exact failing payload (lon,lat in the API → GHPoint(lat,lon)). Before the edge_key
+     * refactor this threw "Weightings supporting turn costs cannot be used with node-based
+     * traversal mode"; now /convert routes Stages B/C through the public API which sets edge-based
+     * traversal for turn-cost profiles.
+     */
+    @Test
+    void testConvertWithGravelTurnCostProfile() {
+        Assumptions.assumeTrue(isInitialized, "GraphHopper not initialized");
+
+        List<GHPoint> waypoints = Arrays.asList(
+            new GHPoint(60.221024, 24.643975),
+            new GHPoint(60.211171, 24.76993),
+            new GHPoint(60.294155, 24.683643),
+            new GHPoint(60.285106, 24.599902),
+            new GHPoint(60.263037, 24.631957),
+            new GHPoint(60.221024, 24.643975));
+
+        ConvertRequest request = new ConvertRequest("gravel", waypoints);
+        ConvertResponse response = hopper.convert(request);
+
+        System.out.println("\n=== Test: /convert with gravel (turn-cost) profile ===");
+        System.out.println("Response: " + response);
+
+        assertFalse(response.hasErrors(),
+            "convert must not error for a turn-cost profile: " + response.getErrors());
+        assertTrue(response.getNormalizedWaypoints().size() >= 2,
+            "should produce at least start+end normalized waypoints");
+        assertTrue(response.getPoints().size() > 0, "should produce route geometry");
     }
 
     @Test

@@ -122,6 +122,7 @@ public class EnhancedRoundTripRouting {
 
         // Fixers in priority order (lower priority = tried first)
         list.add(new DeadEndFixer()); // Priority 5 - fix dead-ends first
+        list.add(new CorridorOverlapFixer()); // Priority 6 - divert parallel-corridor overlap
         list.add(new DistanceFixer()); // Priority 8 - adjust distance
 
         // Disabled until validated:
@@ -329,6 +330,9 @@ public class EnhancedRoundTripRouting {
     /** Minimum dead-end distance to trigger fix (meters) */
     private static final double MIN_DEAD_END_TO_FIX = 50.0;
 
+    /** Minimum corridor-overlap distance on a leg to trigger fix (meters) */
+    private static final double MIN_CORRIDOR_TO_FIX = 250.0;
+
     /** Waypoints closer than this are merged in post-fix cleanup (meters) */
     private static final double WAYPOINT_MERGE_THRESHOLD = 150.0;
 
@@ -367,7 +371,26 @@ public class EnhancedRoundTripRouting {
             }
         }
 
-        // Priority 2: Distance issues
+        // Priority 2: Corridor overlap (geospatial parallel/antiparallel reuse on different edges)
+        for (LegScore leg : score.getLegScores()) {
+            if (leg.getCorridorOverlapDistance() >= MIN_CORRIDOR_TO_FIX
+                    && leg.getCorridorAnchor() != null && leg.getCorridorPartner() != null) {
+                logger.debug("Found corridor overlap in leg {}: {}m",
+                        leg.getLegIndex(), leg.getCorridorOverlapDistance());
+
+                for (RouteFixer fixer : fixers) {
+                    if (fixer.getName().equals("corridor-overlap")) {
+                        FixResult result = fixer.attemptFix(waypoints, score, leg.getLegIndex(), profile);
+                        if (result.isSuccess()) {
+                            return result;
+                        }
+                        logger.debug("CorridorOverlapFixer failed: {}", result.getDescription());
+                    }
+                }
+            }
+        }
+
+        // Priority 3: Distance issues
         IssueType distanceIssue = score.getDistanceIssue();
         if (distanceIssue != IssueType.NONE) {
             logger.debug("Found distance issue: {} (ratio: {})",
@@ -385,7 +408,7 @@ public class EnhancedRoundTripRouting {
             }
         }
 
-        // Priority 3: Other fixers (when re-enabled)
+        // Priority 4: Other fixers (when re-enabled)
         // KinkFixer, AnchorSwapFixer, HingeFixer
 
         return FixResult.failure("No fixable issues found");
