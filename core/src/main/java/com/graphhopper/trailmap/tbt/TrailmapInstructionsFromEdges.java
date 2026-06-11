@@ -1411,6 +1411,30 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     }
 
     /**
+     * Road infrastructure as the <em>reframer demote gate</em> sees it — same as
+     * {@link #isRoadInfrastructure} but with {@code SERVICE_ROAD} excluded.
+     * <p>
+     * SERVICE_ROAD is physically in-between road and trail: often a narrow paved or
+     * gravel lane visually indistinguishable from an OUTDOOR_WAY / track, with no
+     * sign-posted name or class cue the rider can read on the ground. The reframer's
+     * demote-to-CONTINUE / soft-real-turn rationale (geometric ambiguity is the
+     * dominant signal, the rider scans the junction shape rather than absolute angle)
+     * therefore applies to service roads exactly as it does to trails — e.g. a 47°
+     * bend onto a service road reads as "slight right" when no confusable straight
+     * alternative exists, just like the same bend on a track.
+     * <p>
+     * REFRAMER-LOCAL ON PURPOSE. This must NOT replace {@link #isRoadInfrastructure}
+     * in the suppression chain (S1/S2/S3/S5, E6, enrichExtraInfo): there SERVICE_ROAD
+     * keeps full road semantics (name continuity, prominence ordering, the road-infra
+     * competing-alt guard). Only {@link #bothNonRoadAtJunction} uses this variant.
+     */
+    private static boolean isReframerHardRoad(PredictedHighway ph) {
+        return ph == PredictedHighway.MOTORWAY
+                || ph == PredictedHighway.MAJOR_ROAD
+                || ph == PredictedHighway.MINOR_ROAD;
+    }
+
+    /**
      * Non-road continuations that the E6 forced-path anti-suppression pairs with the
      * road-side {@link #isRoadInfrastructure} types. Tight allowlist; extend by enum
      * addition if real-world data shows other non-road types need the same hint.
@@ -1986,20 +2010,26 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     }
 
     /**
-     * Whether neither side of the junction is road infrastructure (motorway / major
-     * road / minor road / service road). Used to gate Shape 1 side-turn and Shape 4
-     * sandwich demotions — the reframer's demote-to-CONTINUE logic targets trail-
-     * network junctions where geometric ambiguity is the dominant signal. At any
-     * junction involving a road, the rule chain's angular signs are intentional
-     * (F1 type-transition cues, leaving-current-street at road-class changes) and
-     * should be preserved.
+     * Whether neither side of the junction is "hard" road infrastructure (motorway /
+     * major road / minor road). Used to gate every reframer demote shape (Shape 1
+     * side-turn, Shape 4 sandwich + past-slight, Shape 6 soft real turn) — the
+     * reframer's demote logic targets junctions where geometric ambiguity is the
+     * dominant signal and the rider scans junction shape, not absolute angle.
+     * <p>
+     * SERVICE_ROAD is treated as non-road here (see {@link #isReframerHardRoad}):
+     * it is physically in-between and visually indistinguishable from a track on the
+     * ground, so the reframer applies. At any junction involving a hard road
+     * (motorway/major/minor) the rule chain's angular signs are intentional (F1
+     * type-transition cues, leaving-current-street at road-class changes) and are
+     * preserved. Type/class/name remain in extraInfo regardless, so a demote never
+     * loses the rider-facing road information — only the ambiguous direction label.
      */
     private boolean bothNonRoadAtJunction(EdgeIteratorState routeEdge) {
         if (predictedHighwayEnc == null || prevEdge == null) return true;
         PredictedHighway prevPH = prevEdge.get(predictedHighwayEnc);
         PredictedHighway currentPH = routeEdge.get(predictedHighwayEnc);
         if (prevPH == null || currentPH == null) return true;
-        return !isRoadInfrastructure(prevPH) && !isRoadInfrastructure(currentPH);
+        return !isReframerHardRoad(prevPH) && !isReframerHardRoad(currentPH);
     }
 
     /**

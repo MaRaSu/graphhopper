@@ -113,9 +113,11 @@ public class EdgeKeyMatching {
     }
 
     /**
-     * Exit bearing of a route polyline — the azimuth of its final segment, mirroring how the
-     * client (and {@code RouteInstructionGenerator}) derive the next leg's start heading. Returns
+     * Exit bearing of a route polyline — the azimuth of its final segment. Returns
      * {@code NaN} when the polyline has fewer than two points.
+     * <p>
+     * Note: {@code RouteInstructionGenerator} does NOT chain a derived heading between segments;
+     * each segment uses only its own {@code initial_heading} from the API request.
      */
     public static double exitHeadingOf(PointList pts) {
         int n = pts.size();

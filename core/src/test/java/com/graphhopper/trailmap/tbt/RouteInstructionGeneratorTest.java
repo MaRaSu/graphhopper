@@ -30,6 +30,7 @@ import com.graphhopper.trailmap.shared.GravelScaleNum;
 import com.graphhopper.trailmap.TrailmapGraphHopper;
 import com.graphhopper.trailmap.shared.TrailmapImportRegistry;
 import com.graphhopper.routing.InstructionsHelper;
+import com.graphhopper.routing.Path;
 import com.graphhopper.routing.weighting.Weighting;
 import com.graphhopper.util.*;
 import com.graphhopper.util.details.PathDetail;
@@ -7348,6 +7349,556 @@ public class RouteInstructionGeneratorTest {
     }
 
     /**
+     * Diagnostic: user reports that on a gravel route with multiple Y-forks onto
+     * WIDE paths (OSM width > 1m) NO TbT instruction is emitted, and asks whether
+     * at least {@code tbt_priority: "visual"} should fire so the client wakes the
+     * display.
+     *
+     * API payload (verbatim):
+     *   waypoints:
+     *     - id=ExSLM3qca83PGLxgSLgku (61.562009, 23.510509)
+     *     - id=bqZZnCgYpR5LMozmyDiKt (61.564174, 23.501469)
+     *   segments: 1 followRoads, profile=gravel
+     *   instruction_profile=gravel, locale=fi, snap_preventions=[ferry]
+     *
+     * This walks the routed edge chain and dumps each junction's alternatives
+     * (PH, surface, gravel_scale, bike access, angle, sign) so we can see which
+     * suppression rule fires at each Y-fork and whether width is observable at all.
+     */
+    @Test
+    void testWideYForkNoInstruction_61_562_23_510() {
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        EncodingManager encodingManager = hopper.getEncodingManager();
+        TranslationMap translationMap = hopper.getTranslationMap();
+
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, baseGraph, encodingManager, translationMap);
+
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        TrailmapInstructionRequest.Waypoint wp1 = makeWaypoint("ExSLM3qca83PGLxgSLgku", 61.562009, 23.510509);
+        TrailmapInstructionRequest.Waypoint wp2 = makeWaypoint("bqZZnCgYpR5LMozmyDiKt", 61.564174, 23.501469);
+        request.setWaypoints(List.of(wp1, wp2));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("ExSLM3qca83PGLxgSLgku");
+        seg.setEnd("bqZZnCgYpR5LMozmyDiKt");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertNotNull(result);
+        assertNotNull(result.instructions);
+        assertTrue(result.instructions.size() > 0, "Should produce instructions");
+
+        // Is a plain OSM width / max_width EV even present in the graph?
+        System.out.println("\n========== WIDE Y-FORK DIAGNOSTIC ==========");
+        System.out.println("has EV 'max_width'  = " + encodingManager.hasEncodedValue("max_width"));
+        System.out.println("has EV 'width'      = " + encodingManager.hasEncodedValue("width"));
+        System.out.println("has EV 'smoothness' = " + encodingManager.hasEncodedValue("smoothness"));
+        System.out.println("has EV 'issue_narrow' = " + encodingManager.hasEncodedValue("issue_narrow"));
+
+        System.out.println("\n--- Instructions BEFORE post-processing ---");
+        printInstructionsDetailed(result);
+
+        // ---- Walk routed edge sequence, dump per-junction alternatives ----
+        EnumEncodedValue<RoadClass> rcEnc = encodingManager.getEnumEncodedValue(RoadClass.KEY, RoadClass.class);
+        EnumEncodedValue<PredictedHighway> phEnc = encodingManager.getEnumEncodedValue(PredictedHighway.KEY, PredictedHighway.class);
+        EnumEncodedValue<PredictedSurface> psEnc = encodingManager.hasEncodedValue(PredictedSurface.KEY)
+                ? encodingManager.getEnumEncodedValue(PredictedSurface.KEY, PredictedSurface.class) : null;
+        EnumEncodedValue<Surface> surfEnc = encodingManager.hasEncodedValue(Surface.KEY)
+                ? encodingManager.getEnumEncodedValue(Surface.KEY, Surface.class) : null;
+        com.graphhopper.routing.ev.DecimalEncodedValue gsEnc = encodingManager.hasEncodedValue(GravelScaleNum.KEY)
+                ? encodingManager.getDecimalEncodedValue(GravelScaleNum.KEY) : null;
+        BooleanEncodedValue bikeAccessEnc = encodingManager.getBooleanEncodedValue(VehicleAccess.key("bike"));
+
+        GHRequest ghReq = new GHRequest(61.562009, 23.510509, 61.564174, 23.501469).setProfile("gravel");
+        ghReq.setPathDetails(List.of("edge_id"));
+        ghReq.putHint("instructions", false);
+        ghReq.putHint("calc_points", true);
+        ghReq.setSnapPreventions(List.of("ferry"));
+        GHResponse ghRsp = hopper.route(ghReq);
+        assertFalse(ghRsp.hasErrors(), "GH route failed: " + ghRsp.getErrors());
+
+        List<PathDetail> edgeIdDetails = ghRsp.getBest().getPathDetails().get("edge_id");
+        assertNotNull(edgeIdDetails);
+        System.out.println("\n--- Edge chain (" + edgeIdDetails.size() + " edges) ---");
+
+        EdgeExplorer explorer = baseGraph.createEdgeExplorer();
+        int prevNode;
+        {
+            EdgeIteratorState e0 = baseGraph.getEdgeIteratorState((Integer) edgeIdDetails.get(0).getValue(), Integer.MIN_VALUE);
+            if (edgeIdDetails.size() == 1) {
+                prevNode = e0.getBaseNode();
+            } else {
+                EdgeIteratorState e1 = baseGraph.getEdgeIteratorState((Integer) edgeIdDetails.get(1).getValue(), Integer.MIN_VALUE);
+                int b1 = e0.getBaseNode(), a1 = e0.getAdjNode();
+                int b2 = e1.getBaseNode(), a2 = e1.getAdjNode();
+                int shared;
+                if (b1 == b2 || b1 == a2) shared = b1;
+                else shared = a1;
+                prevNode = (e0.getBaseNode() == shared) ? e0.getAdjNode() : e0.getBaseNode();
+            }
+        }
+
+        for (int ei = 0; ei < edgeIdDetails.size(); ei++) {
+            int edgeId = (Integer) edgeIdDetails.get(ei).getValue();
+            EdgeIteratorState raw = baseGraph.getEdgeIteratorState(edgeId, Integer.MIN_VALUE);
+            int nextNode = (raw.getBaseNode() == prevNode) ? raw.getAdjNode() : raw.getBaseNode();
+            EdgeIteratorState routeEdge = baseGraph.getEdgeIteratorState(edgeId, nextNode);
+            int adjNode = routeEdge.getAdjNode();
+
+            RoadClass rc = routeEdge.get(rcEnc);
+            PredictedHighway ph = routeEdge.get(phEnc);
+            PredictedSurface ps = psEnc != null ? routeEdge.get(psEnc) : null;
+            Surface surf = surfEnc != null ? routeEdge.get(surfEnc) : null;
+            Double gs = gsEnc != null ? routeEdge.get(gsEnc) : null;
+            String name = routeEdge.getName();
+
+            PointList geo = routeEdge.fetchWayGeometry(FetchMode.ALL);
+            int gN = geo.size();
+            double inFromLat = geo.getLat(gN - 2), inFromLon = geo.getLon(gN - 2);
+            double inToLat = geo.getLat(gN - 1), inToLon = geo.getLon(gN - 1);
+            double incomingBearing = AngleCalc.ANGLE_CALC.calcOrientation(inFromLat, inFromLon, inToLat, inToLon);
+
+            System.out.printf("%n[edge %d] id=%d base=%d→adj=%d  rc=%s ph=%s ps=%s surf=%s gs=%s  name=\"%s\"  len=%.1fm%n",
+                    ei, edgeId, prevNode, adjNode, rc, ph, ps, surf, gs, name, routeEdge.getDistance());
+
+            int routeNextEdgeId = (ei + 1 < edgeIdDetails.size()) ? (Integer) edgeIdDetails.get(ei + 1).getValue() : -1;
+            EdgeIterator iter = explorer.setBaseNode(adjNode);
+            int altCount = 0;
+            List<String> altLines = new ArrayList<>();
+            while (iter.next()) {
+                if (iter.getEdge() == edgeId) continue;
+                altCount++;
+                int altEdgeId = iter.getEdge();
+                RoadClass altRC = iter.get(rcEnc);
+                PredictedHighway altPH = iter.get(phEnc);
+                PredictedSurface altPS = psEnc != null ? iter.get(psEnc) : null;
+                Surface altSurf = surfEnc != null ? iter.get(surfEnc) : null;
+                Double altGS = gsEnc != null ? iter.get(gsEnc) : null;
+                String altName = iter.getName();
+                boolean altAccess = iter.get(bikeAccessEnc);
+
+                PointList altGeo = iter.fetchWayGeometry(FetchMode.ALL);
+                double altToLat = altGeo.getLat(1), altToLon = altGeo.getLon(1);
+                double altBearing = AngleCalc.ANGLE_CALC.calcOrientation(
+                        altGeo.getLat(0), altGeo.getLon(0), altToLat, altToLon);
+                double deltaDeg = Math.toDegrees(
+                        AngleCalc.ANGLE_CALC.alignOrientation(incomingBearing, altBearing) - incomingBearing);
+                int altSign = InstructionsHelper.calculateSign(inToLat, inToLon, altToLat, altToLon, incomingBearing);
+
+                String tag = (altEdgeId == routeNextEdgeId) ? "ROUTE" : "alt  ";
+                altLines.add(String.format(
+                        "        %s edge=%d  rc=%s ph=%s ps=%s surf=%s gs=%s access=%s  Δ=%+.1f° sign=%s  name=\"%s\"",
+                        tag, altEdgeId, altRC, altPH, altPS, altSurf, altGS, altAccess,
+                        deltaDeg, signName(altSign), altName));
+            }
+            if (altCount > 0) {
+                System.out.printf("    junction at node %d — %d outgoing edge(s):%n", adjNode, altCount);
+                for (String s : altLines) System.out.println(s);
+            } else {
+                System.out.printf("    junction at node %d — no alternatives%n", adjNode);
+            }
+            prevNode = adjNode;
+        }
+
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+        System.out.println("\n--- Instructions AFTER post-processing ---");
+        printInstructionsDetailed(result);
+    }
+
+    /**
+     * Diagnostic: user reports a U-turn generated entirely by waypoint misplacement
+     * on a 3-waypoint / 2-segment gravel_mtb route, and that U-turn suppression is
+     * not firing.
+     *
+     * API payload (verbatim):
+     *   waypoints:
+     *     - id=xjpeHskaIV6G-mUgON3kO (61.558387, 23.508853)
+     *     - id=_TOpe9hqP4baKWqMknld1 (61.557721, 23.512598)  <-- middle wp
+     *     - id=6vOqMY6KvM6XsH47e9jfb (61.556869, 23.511434)
+     *   segments:
+     *     - wp1->wp2 followRoads gravel_mtb initial_heading=100.347 heading_penalty=60
+     *     - wp2->wp3 followRoads gravel_mtb initial_heading=33.220  heading_penalty=60
+     *   instruction_profile=gravel_mtb, locale=fi, snap_preventions=[ferry]
+     *
+     * Dumps instructions BEFORE and AFTER post-processing plus both per-segment edge
+     * chains so we can see where the U-turn comes from and which suppression gate fails.
+     */
+    @Test
+    void testUturnFromWptMisplacement_61_558_23_508() {
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        EncodingManager encodingManager = hopper.getEncodingManager();
+        TranslationMap translationMap = hopper.getTranslationMap();
+
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, baseGraph, encodingManager, translationMap);
+
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        TrailmapInstructionRequest.Waypoint w1 = makeWaypoint("xjpeHskaIV6G-mUgON3kO", 61.558387, 23.508853);
+        TrailmapInstructionRequest.Waypoint w2 = makeWaypoint("_TOpe9hqP4baKWqMknld1", 61.557721, 23.512598);
+        TrailmapInstructionRequest.Waypoint w3 = makeWaypoint("6vOqMY6KvM6XsH47e9jfb", 61.556869, 23.511434);
+        request.setWaypoints(List.of(w1, w2, w3));
+
+        TrailmapInstructionRequest.Segment seg1 = new TrailmapInstructionRequest.Segment();
+        seg1.setStart("xjpeHskaIV6G-mUgON3kO");
+        seg1.setEnd("_TOpe9hqP4baKWqMknld1");
+        seg1.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg1.setProfile("gravel_mtb");
+        seg1.setInitialHeading(100.34706486247228);
+        seg1.setHeadingPenalty(60.0);
+
+        TrailmapInstructionRequest.Segment seg2 = new TrailmapInstructionRequest.Segment();
+        seg2.setStart("_TOpe9hqP4baKWqMknld1");
+        seg2.setEnd("6vOqMY6KvM6XsH47e9jfb");
+        seg2.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg2.setProfile("gravel_mtb");
+        seg2.setInitialHeading(33.21980871124032);
+        seg2.setHeadingPenalty(60.0);
+
+        request.setSegments(List.of(seg1, seg2));
+        request.setInstructionProfile("gravel_mtb");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertNotNull(result);
+        assertNotNull(result.instructions);
+        assertTrue(result.instructions.size() > 0, "Should produce instructions");
+
+        System.out.println("\n========== U-TURN FROM WPT MISPLACEMENT — BEFORE POST-PROCESSING ==========");
+        System.out.println("Instructions: " + result.instructions.size());
+        printInstructionsDetailed(result);
+
+        // Per-segment edge chains via standard GH, mirroring the request's headings/penalty.
+        dumpSegmentEdgeChain(baseGraph, encodingManager, "SEG1 wp1->wp2",
+                61.558387, 23.508853, 61.557721, 23.512598, 100.34706486247228);
+        dumpSegmentEdgeChain(baseGraph, encodingManager, "SEG2 wp2->wp3",
+                61.557721, 23.512598, 61.556869, 23.511434, 33.21980871124032);
+
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+        System.out.println("\n========== U-TURN FROM WPT MISPLACEMENT — AFTER POST-PROCESSING ==========");
+        System.out.println("Instructions: " + result.instructions.size());
+        printInstructionsDetailed(result);
+
+        // Flag any remaining U-turn for quick visibility
+        for (int i = 0; i < result.instructions.size(); i++) {
+            int s = result.instructions.get(i).getSign();
+            if (s == Instruction.U_TURN_UNKNOWN || s == Instruction.U_TURN_LEFT || s == Instruction.U_TURN_RIGHT) {
+                System.out.printf(">>> U-turn survived at index %d: sign=%d (%s) dist=%.1fm name=\"%s\"%n",
+                        i, s, signName(s), result.instructions.get(i).getDistance(),
+                        result.instructions.get(i).getName());
+            }
+        }
+    }
+
+    /**
+     * Measurement diagnostic: replicate the generator's exact seg1->seg2 chaining
+     * (seg2 start overridden to seg1's snapped end, heading = seg1 exit azimuth) and
+     * compute the boundary U-turn overshoot length several ways, to validate how a
+     * boundary-U-turn fix should measure the *traversed* overlap.
+     */
+    @Test
+    void measureBoundaryUturnOvershoot_61_558_23_508() {
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        NodeAccess na = baseGraph.getNodeAccess();
+        DistanceCalcEarth dc = DistanceCalcEarth.DIST_EARTH;
+
+        // --- seg1: wp1 -> wp2, heading = seg1 initial_heading ---
+        GHRequest r1 = new GHRequest(61.558387, 23.508853, 61.557721, 23.512598).setProfile("gravel_mtb");
+        r1.setHeadings(List.of(100.34706486247228, Double.NaN));
+        r1.putHint("heading_penalty", 60);
+        r1.setPathDetails(List.of("edge_id"));
+        r1.putHint("instructions", false);
+        r1.putHint("calc_points", true);
+        r1.setSnapPreventions(List.of("ferry"));
+        ResponsePath p1 = hopper.route(r1).getBest();
+        List<Integer> e1 = new ArrayList<>();
+        for (PathDetail d : p1.getPathDetails().get("edge_id")) e1.add((Integer) d.getValue());
+        PointList poly1 = p1.getPoints();
+
+        // generator chains: seg2 start = seg1 last point, heading = azimuth of seg1 last leg
+        double startLat = poly1.getLat(poly1.size() - 1), startLon = poly1.getLon(poly1.size() - 1);
+        double chainHeading = AngleCalc.ANGLE_CALC.calcAzimuth(
+                poly1.getLat(poly1.size() - 2), poly1.getLon(poly1.size() - 2), startLat, startLon);
+
+        // --- seg2: (chained start) -> wp3, heading = chainHeading ---
+        GHRequest r2 = new GHRequest(startLat, startLon, 61.556869, 23.511434).setProfile("gravel_mtb");
+        r2.setHeadings(List.of(chainHeading, Double.NaN));
+        r2.putHint("heading_penalty", 60);
+        r2.setPathDetails(List.of("edge_id"));
+        r2.putHint("instructions", false);
+        r2.putHint("calc_points", true);
+        r2.setSnapPreventions(List.of("ferry"));
+        ResponsePath p2 = hopper.route(r2).getBest();
+        List<Integer> e2 = new ArrayList<>();
+        for (PathDetail d : p2.getPathDetails().get("edge_id")) e2.add((Integer) d.getValue());
+        PointList poly2 = p2.getPoints();
+
+        System.out.println("\n========== BOUNDARY U-TURN OVERSHOOT MEASUREMENT ==========");
+        System.out.println("seg1 edges=" + e1 + " polyPts=" + poly1.size() + " dist=" + Math.round(p1.getDistance()));
+        System.out.println("seg2 edges=" + e2 + " polyPts=" + poly2.size() + " dist=" + Math.round(p2.getDistance()));
+        System.out.printf("chained seg2 start=(%.7f,%.7f) heading=%.1f%n", startLat, startLon, chainHeading);
+
+        int lastPrev = e1.get(e1.size() - 1);
+        int firstCurr = e2.get(0);
+        System.out.println("lastPrevEdge=" + lastPrev + " firstCurrentEdge=" + firstCurr
+                + " sameEdge=" + (lastPrev == firstCurr));
+        if (lastPrev != firstCurr) { System.out.println("Not a same-edge boundary — abort"); return; }
+
+        EdgeIteratorState shared = baseGraph.getEdgeIteratorState(lastPrev, Integer.MIN_VALUE);
+        int sBase = shared.getBaseNode(), sAdj = shared.getAdjNode();
+
+        // boundary node = node of shared edge that both seg1-penult and seg2-second connect to
+        int secondToLastPrev = e1.get(e1.size() - 2);
+        int secondCurr = e2.get(1);
+        EdgeIteratorState pen = baseGraph.getEdgeIteratorState(secondToLastPrev, Integer.MIN_VALUE);
+        EdgeIteratorState cur2 = baseGraph.getEdgeIteratorState(secondCurr, Integer.MIN_VALUE);
+        Set<Integer> penN = Set.of(pen.getBaseNode(), pen.getAdjNode());
+        Set<Integer> cur2N = Set.of(cur2.getBaseNode(), cur2.getAdjNode());
+        int prevEntry = penN.contains(sBase) ? sBase : (penN.contains(sAdj) ? sAdj : -1);
+        int currExit = cur2N.contains(sBase) ? sBase : (cur2N.contains(sAdj) ? sAdj : -1);
+        System.out.printf("shared edge %d: base=%d adj=%d fullLen=%.1fm%n", lastPrev, sBase, sAdj, shared.getDistance());
+        System.out.printf("prevEntryNode=%d currExitNode=%d  isUturn=%b%n",
+                prevEntry, currExit, prevEntry != -1 && prevEntry == currExit);
+
+        int junction = prevEntry; // the node both segments pivot around
+        double jLat = na.getLat(junction), jLon = na.getLon(junction);
+        System.out.printf("junction node=%d coords=(%.7f,%.7f)%n", junction, jLat, jLon);
+        System.out.printf("snap point (seg1 last == seg2 first): seg1Last=(%.7f,%.7f) seg2First=(%.7f,%.7f) coincide=%.2fm%n",
+                poly1.getLat(poly1.size() - 1), poly1.getLon(poly1.size() - 1),
+                poly2.getLat(0), poly2.getLon(0),
+                dc.calcDist(poly1.getLat(poly1.size() - 1), poly1.getLon(poly1.size() - 1),
+                        poly2.getLat(0), poly2.getLon(0)));
+
+        // Measure 1: straight-line distance junction node -> snap point
+        double dGeom = dc.calcDist(jLat, jLon, startLat, startLon);
+        System.out.printf("OVERSHOOT measure 1 (junction-node -> snap, straight line): %.2fm%n", dGeom);
+
+        // Measure 2: length of seg1 polyline tail from the LAST time it passes the junction node
+        int jIdxInPoly1 = -1;
+        for (int i = poly1.size() - 1; i >= 0; i--) {
+            if (dc.calcDist(poly1.getLat(i), poly1.getLon(i), jLat, jLon) < 0.5) { jIdxInPoly1 = i; break; }
+        }
+        double dTail1 = 0;
+        if (jIdxInPoly1 >= 0) {
+            for (int i = jIdxInPoly1; i < poly1.size() - 1; i++)
+                dTail1 += dc.calcDist(poly1.getLat(i), poly1.getLon(i), poly1.getLat(i + 1), poly1.getLon(i + 1));
+        }
+        System.out.printf("OVERSHOOT measure 2 (seg1 polyline tail past junction, idx=%d): %.2fm%n", jIdxInPoly1, dTail1);
+
+        // Measure 3: length of seg2 polyline head until it first reaches the junction node (the return leg)
+        int jIdxInPoly2 = -1;
+        for (int i = 0; i < poly2.size(); i++) {
+            if (dc.calcDist(poly2.getLat(i), poly2.getLon(i), jLat, jLon) < 0.5) { jIdxInPoly2 = i; break; }
+        }
+        double dHead2 = 0;
+        if (jIdxInPoly2 >= 0) {
+            for (int i = 0; i < jIdxInPoly2; i++)
+                dHead2 += dc.calcDist(poly2.getLat(i), poly2.getLon(i), poly2.getLat(i + 1), poly2.getLon(i + 1));
+        }
+        System.out.printf("OVERSHOOT measure 3 (seg2 return-leg head to junction, idx=%d): %.2fm%n", jIdxInPoly2, dHead2);
+    }
+
+    /**
+     * Option-C validation: prove that regenerating instructions over the MERGED edge
+     * chain (seg1 edges + seg2 edges, with both copies of the short overshoot piece
+     * removed) yields a clean continuing turn and NO U-turn — i.e. the generator-level
+     * seam fix produces a consistent result "for free" from normal turn generation.
+     * Also rebuilds the spur-free boundary polyline and checks distance consistency.
+     */
+    @Test
+    void validateMergedChainRegeneration_61_558_23_508() {
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        EncodingManager em = hopper.getEncodingManager();
+        DistanceCalcEarth dc = DistanceCalcEarth.DIST_EARTH;
+        Translation tr = hopper.getTranslationMap().getWithFallBack(Locale.forLanguageTag("fi"));
+        Weighting weighting = hopper.createWeighting(hopper.getProfile("gravel_mtb"), new PMap());
+
+        // seg1 wp1->wp2
+        GHRequest r1 = new GHRequest(61.558387, 23.508853, 61.557721, 23.512598).setProfile("gravel_mtb");
+        r1.setHeadings(List.of(100.34706486247228, Double.NaN));
+        r1.putHint("heading_penalty", 60);
+        r1.setPathDetails(List.of("edge_id"));
+        r1.putHint("instructions", false);
+        r1.setSnapPreventions(List.of("ferry"));
+        ResponsePath p1 = hopper.route(r1).getBest();
+        List<Integer> e1 = new ArrayList<>();
+        for (PathDetail d : p1.getPathDetails().get("edge_id")) e1.add((Integer) d.getValue());
+        PointList poly1 = p1.getPoints();
+
+        double startLat = poly1.getLat(poly1.size() - 1), startLon = poly1.getLon(poly1.size() - 1);
+        double chainHeading = AngleCalc.ANGLE_CALC.calcAzimuth(
+                poly1.getLat(poly1.size() - 2), poly1.getLon(poly1.size() - 2), startLat, startLon);
+
+        // seg2 (chained start) -> wp3
+        GHRequest r2 = new GHRequest(startLat, startLon, 61.556869, 23.511434).setProfile("gravel_mtb");
+        r2.setHeadings(List.of(chainHeading, Double.NaN));
+        r2.putHint("heading_penalty", 60);
+        r2.setPathDetails(List.of("edge_id"));
+        r2.putHint("instructions", false);
+        r2.setSnapPreventions(List.of("ferry"));
+        ResponsePath p2 = hopper.route(r2).getBest();
+        List<Integer> e2 = new ArrayList<>();
+        for (PathDetail d : p2.getPathDetails().get("edge_id")) e2.add((Integer) d.getValue());
+        PointList poly2 = p2.getPoints();
+
+        // Build merged chain: drop seg1's trailing overshoot piece and seg2's leading copy.
+        assertEquals(e1.get(e1.size() - 1), e2.get(0), "boundary should be a shared edge");
+        List<Integer> merged = new ArrayList<>(e1.subList(0, e1.size() - 1));
+        merged.addAll(e2.subList(1, e2.size()));
+        System.out.println("\n========== MERGED-CHAIN REGENERATION (Option C core) ==========");
+        System.out.println("seg1=" + e1 + "  seg2=" + e2);
+        System.out.println("merged (overshoot removed)=" + merged);
+
+        // Resolve from-node deterministically (node of merged[0] not shared with merged[1]).
+        EdgeIteratorState m0 = baseGraph.getEdgeIteratorState(merged.get(0), Integer.MIN_VALUE);
+        EdgeIteratorState m1 = baseGraph.getEdgeIteratorState(merged.get(1), Integer.MIN_VALUE);
+        int a = m0.getBaseNode(), b = m0.getAdjNode();
+        boolean aShared = (m1.getBaseNode() == a || m1.getAdjNode() == a);
+        int fromNode = aShared ? b : a;
+
+        Path path = new Path(baseGraph);
+        for (int id : merged) path.addEdge(id);
+        path.setFromNode(fromNode);
+        path.setFound(true);
+        int cur = fromNode;
+        for (int id : merged) {
+            EdgeIteratorState e = baseGraph.getEdgeIteratorState(id, Integer.MIN_VALUE);
+            cur = (e.getBaseNode() == cur) ? e.getAdjNode() : e.getBaseNode();
+        }
+        path.setEndNode(cur);
+
+        InstructionList instr = TrailmapInstructionsFromEdges.calcInstructions(path, baseGraph, weighting, em, tr);
+        System.out.println("\nRegenerated instructions over merged chain:");
+        int uturns = 0;
+        for (int i = 0; i < instr.size(); i++) {
+            Instruction in = instr.get(i);
+            if (in.getSign() == Instruction.U_TURN_UNKNOWN || in.getSign() == Instruction.U_TURN_LEFT
+                    || in.getSign() == Instruction.U_TURN_RIGHT) uturns++;
+            System.out.printf("  [%d] sign=%d (%s) dist=%.1fm name=\"%s\"%n",
+                    i, in.getSign(), signName(in.getSign()), in.getDistance(), in.getName());
+        }
+        System.out.println("U-turn count in regenerated chain = " + uturns);
+
+        // Build spur-free boundary polyline: seg1 up to junction + seg2 from junction.
+        NodeAccess na = baseGraph.getNodeAccess();
+        // junction = shared node both legs pivot on
+        EdgeIteratorState shared = baseGraph.getEdgeIteratorState(e1.get(e1.size() - 1), Integer.MIN_VALUE);
+        EdgeIteratorState pen = baseGraph.getEdgeIteratorState(e1.get(e1.size() - 2), Integer.MIN_VALUE);
+        Set<Integer> penN = Set.of(pen.getBaseNode(), pen.getAdjNode());
+        int junction = penN.contains(shared.getBaseNode()) ? shared.getBaseNode() : shared.getAdjNode();
+        double jLat = na.getLat(junction), jLon = na.getLon(junction);
+        int j1 = -1; for (int i = poly1.size() - 1; i >= 0; i--) if (dc.calcDist(poly1.getLat(i), poly1.getLon(i), jLat, jLon) < 0.5) { j1 = i; break; }
+        int j2 = -1; for (int i = 0; i < poly2.size(); i++) if (dc.calcDist(poly2.getLat(i), poly2.getLon(i), jLat, jLon) < 0.5) { j2 = i; break; }
+        double mergedPolyLen = 0;
+        for (int i = 0; i < j1; i++) mergedPolyLen += dc.calcDist(poly1.getLat(i), poly1.getLon(i), poly1.getLat(i + 1), poly1.getLon(i + 1));
+        for (int i = j2; i < poly2.size() - 1; i++) mergedPolyLen += dc.calcDist(poly2.getLat(i), poly2.getLon(i), poly2.getLat(i + 1), poly2.getLon(i + 1));
+        double rawConcatLen = p1.getDistance() + p2.getDistance();
+        System.out.printf("%nspur-free boundary polyline: junctionIdx seg1=%d seg2=%d%n", j1, j2);
+        System.out.printf("merged polyline length=%.1fm  raw concat length=%.1fm  removed spur=%.2fm%n",
+                mergedPolyLen, rawConcatLen, rawConcatLen - mergedPolyLen);
+
+        assertEquals(0, uturns, "merged-chain regeneration must produce no U-turn");
+    }
+
+    /**
+     * Measure the seg1/seg2 boundary overshoot for the crossSegmentUturn route (w1->w2->w3),
+     * to confirm whether its boundary U-turn is a short snap artifact (continuation, flanking
+     * edges differ → erased) or a genuine reversal (flanking edges same → preserved).
+     */
+    @Test
+    void measureCrossSegmentUturnOvershoot() {
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        NodeAccess na = baseGraph.getNodeAccess();
+        DistanceCalcEarth dc = DistanceCalcEarth.DIST_EARTH;
+
+        GHRequest r1 = new GHRequest(61.505403, 23.679752, 61.505903, 23.666556).setProfile("gravel");
+        r1.setHeadings(List.of(282.83505622838345, Double.NaN));
+        r1.putHint("heading_penalty", 60);
+        r1.setPathDetails(List.of("edge_id"));
+        r1.putHint("instructions", false);
+        r1.setSnapPreventions(List.of("ferry"));
+        ResponsePath p1 = hopper.route(r1).getBest();
+        List<Integer> e1 = new ArrayList<>();
+        for (PathDetail d : p1.getPathDetails().get("edge_id")) e1.add((Integer) d.getValue());
+        PointList poly1 = p1.getPoints();
+
+        double startLat = poly1.getLat(poly1.size() - 1), startLon = poly1.getLon(poly1.size() - 1);
+        double chainHeading = AngleCalc.ANGLE_CALC.calcAzimuth(
+                poly1.getLat(poly1.size() - 2), poly1.getLon(poly1.size() - 2), startLat, startLon);
+
+        GHRequest r2 = new GHRequest(startLat, startLon, 61.520546, 23.640742).setProfile("gravel");
+        r2.setHeadings(List.of(chainHeading, Double.NaN));
+        r2.putHint("heading_penalty", 60);
+        r2.setPathDetails(List.of("edge_id"));
+        r2.putHint("instructions", false);
+        r2.setSnapPreventions(List.of("ferry"));
+        ResponsePath p2 = hopper.route(r2).getBest();
+        List<Integer> e2 = new ArrayList<>();
+        for (PathDetail d : p2.getPathDetails().get("edge_id")) e2.add((Integer) d.getValue());
+
+        System.out.println("\n========== CROSS-SEGMENT U-TURN OVERSHOOT (w2) ==========");
+        System.out.println("seg1=" + e1 + "  seg2=" + e2);
+        int lastPrev = e1.get(e1.size() - 1), firstCurr = e2.get(0);
+        System.out.println("lastPrevEdge=" + lastPrev + " firstCurrentEdge=" + firstCurr
+                + " sameEdge=" + (lastPrev == firstCurr));
+        if (lastPrev != firstCurr || e1.size() < 2 || e2.size() < 2) { System.out.println("not a same-edge >=2 boundary"); return; }
+
+        EdgeIteratorState shared = baseGraph.getEdgeIteratorState(lastPrev, Integer.MIN_VALUE);
+        int sBase = shared.getBaseNode(), sAdj = shared.getAdjNode();
+        EdgeIteratorState pen = baseGraph.getEdgeIteratorState(e1.get(e1.size() - 2), Integer.MIN_VALUE);
+        Set<Integer> penN = Set.of(pen.getBaseNode(), pen.getAdjNode());
+        int junction = penN.contains(sBase) ? sBase : (penN.contains(sAdj) ? sAdj : -1);
+        double jLat = na.getLat(junction), jLon = na.getLon(junction);
+        double overshoot = dc.calcDist(jLat, jLon, startLat, startLon);
+        int flankPrev = e1.get(e1.size() - 2), flankCurr = e2.get(1);
+        System.out.printf("junction=%d  OVERSHOOT=%.2fm  flankingEdges: prev=%d curr=%d same=%b%n",
+                junction, overshoot, flankPrev, flankCurr, flankPrev == flankCurr);
+        System.out.println(overshoot <= 15.0 && flankPrev != flankCurr
+                ? ">>> SHORT artifact + continuation (flanks differ) → correctly ERASED"
+                : ">>> would be preserved");
+    }
+
+    /** Dump the GH-routed edge chain for one segment with the given heading. */
+    private void dumpSegmentEdgeChain(BaseGraph baseGraph, EncodingManager encodingManager,
+                                      String label, double fromLat, double fromLon,
+                                      double toLat, double toLon, double heading) {
+        EnumEncodedValue<RoadClass> rcEnc = encodingManager.getEnumEncodedValue(RoadClass.KEY, RoadClass.class);
+        EnumEncodedValue<PredictedHighway> phEnc = encodingManager.getEnumEncodedValue(PredictedHighway.KEY, PredictedHighway.class);
+
+        GHRequest ghReq = new GHRequest(fromLat, fromLon, toLat, toLon).setProfile("gravel_mtb");
+        ghReq.setHeadings(List.of(heading, Double.NaN));
+        ghReq.putHint("heading_penalty", 60);
+        ghReq.setPathDetails(List.of("edge_id"));
+        ghReq.putHint("instructions", false);
+        ghReq.putHint("calc_points", true);
+        ghReq.setSnapPreventions(List.of("ferry"));
+        GHResponse ghRsp = hopper.route(ghReq);
+        System.out.printf("%n--- %s edge chain ---%n", label);
+        if (ghRsp.hasErrors()) {
+            System.out.println("   route error: " + ghRsp.getErrors());
+            return;
+        }
+        List<PathDetail> edgeIdDetails = ghRsp.getBest().getPathDetails().get("edge_id");
+        System.out.printf("   distance=%.1fm  edges=%d%n", ghRsp.getBest().getDistance(), edgeIdDetails.size());
+        for (int i = 0; i < edgeIdDetails.size(); i++) {
+            int edgeId = (Integer) edgeIdDetails.get(i).getValue();
+            EdgeIteratorState e = baseGraph.getEdgeIteratorState(edgeId, Integer.MIN_VALUE);
+            System.out.printf("   [%d] edge=%d base=%d adj=%d rc=%s ph=%s len=%.1fm name=\"%s\"%n",
+                    i, edgeId, e.getBaseNode(), e.getAdjNode(), e.get(rcEnc), e.get(phEnc),
+                    e.getDistance(), e.getName());
+        }
+    }
+
+    /**
      * Diagnostic for a real-route case reported during field testing of the
      * reframer. On the current production GH server (no reframer, no recent
      * Trailmap changes) the latter junction emits a single KEEP_LEFT instruction.
@@ -9713,5 +10264,340 @@ public class RouteInstructionGeneratorTest {
         System.out.println("\n========== FIELD REPORT 61_5528_23_5245 missing Y-fork (gravel) — AFTER POST-PROCESSING ==========");
         System.out.println("Instructions: " + result.instructions.size());
         printInstructionsDetailed(result);
+    }
+
+    /**
+     * Field report: instruction is "loiva oikea" (TURN_SLIGHT_RIGHT) but the route
+     * is near-straight at the junction while another alt is ALSO slight-right. The
+     * rider can't tell which "slight right" is meant; guidance should just say
+     * "straight" (CONTINUE_ON_STREET) since the route is the near-straight option.
+     *
+     * API payload (verbatim):
+     *   waypoints:
+     *     - id=Bgf0UtqMMxD9rIij2mFmP (61.52782, 23.626389)
+     *     - id=EtdDLFhR6IHLz6UPQT8hx (61.527685, 23.627943)
+     *   segments: 1 followRoads, profile=gravel
+     *   instruction_profile=gravel, locale=fi, snap_preventions=[ferry]
+     *
+     * Dumps each routed junction's alternatives (PH, surface, angle, sign) so we
+     * can see the route's angle and the competing slight-right alt, and which
+     * reframer shape fires (or fails to fire).
+     */
+    @Test
+    void testLoivaOikeaShouldBeStraight_61_527_23_626() {
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        EncodingManager encodingManager = hopper.getEncodingManager();
+        TranslationMap translationMap = hopper.getTranslationMap();
+
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, baseGraph, encodingManager, translationMap);
+
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+
+        TrailmapInstructionRequest.Waypoint wp1 = makeWaypoint("Bgf0UtqMMxD9rIij2mFmP", 61.52782, 23.626389);
+        TrailmapInstructionRequest.Waypoint wp2 = makeWaypoint("EtdDLFhR6IHLz6UPQT8hx", 61.527685, 23.627943);
+        request.setWaypoints(List.of(wp1, wp2));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("Bgf0UtqMMxD9rIij2mFmP");
+        seg.setEnd("EtdDLFhR6IHLz6UPQT8hx");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertNotNull(result);
+        assertNotNull(result.instructions);
+        assertTrue(result.instructions.size() > 0, "Should produce instructions");
+
+        System.out.println("\n========== LOIVA OIKEA SHOULD BE STRAIGHT — BEFORE POST-PROCESSING ==========");
+        System.out.println("Instructions: " + result.instructions.size());
+        printInstructionsDetailed(result);
+
+        System.out.println("\n--- Polyline (lat, lng) ---");
+        for (int i = 0; i < result.polyline.size(); i++) {
+            System.out.printf("  [%d] %.7f, %.7f%n", i, result.polyline.getLat(i), result.polyline.getLon(i));
+        }
+
+        // ---- Walk the routed edge sequence and dump per-junction alternatives ----
+        EnumEncodedValue<RoadClass> rcEnc = encodingManager.getEnumEncodedValue(RoadClass.KEY, RoadClass.class);
+        EnumEncodedValue<PredictedHighway> phEnc = encodingManager.getEnumEncodedValue(PredictedHighway.KEY, PredictedHighway.class);
+        EnumEncodedValue<PredictedSurface> psEnc = encodingManager.hasEncodedValue(PredictedSurface.KEY)
+                ? encodingManager.getEnumEncodedValue(PredictedSurface.KEY, PredictedSurface.class) : null;
+        EnumEncodedValue<Surface> surfEnc = encodingManager.hasEncodedValue(Surface.KEY)
+                ? encodingManager.getEnumEncodedValue(Surface.KEY, Surface.class) : null;
+        BooleanEncodedValue bikeAccessEnc = encodingManager.getBooleanEncodedValue(VehicleAccess.key("bike"));
+
+        GHRequest ghReq = new GHRequest(61.52782, 23.626389, 61.527685, 23.627943).setProfile("gravel");
+        ghReq.setPathDetails(List.of("edge_id"));
+        ghReq.putHint("instructions", false);
+        ghReq.putHint("calc_points", true);
+        ghReq.setSnapPreventions(List.of("ferry"));
+        GHResponse ghRsp = hopper.route(ghReq);
+        assertFalse(ghRsp.hasErrors(), "GH route failed: " + ghRsp.getErrors());
+
+        List<PathDetail> edgeIdDetails = ghRsp.getBest().getPathDetails().get("edge_id");
+        assertNotNull(edgeIdDetails);
+        System.out.println("\n--- Edge chain (" + edgeIdDetails.size() + " edges) ---");
+
+        EdgeExplorer explorer = baseGraph.createEdgeExplorer();
+        int prevNode;
+        {
+            EdgeIteratorState e0 = baseGraph.getEdgeIteratorState((Integer) edgeIdDetails.get(0).getValue(), Integer.MIN_VALUE);
+            if (edgeIdDetails.size() == 1) {
+                prevNode = e0.getBaseNode();
+            } else {
+                EdgeIteratorState e1 = baseGraph.getEdgeIteratorState((Integer) edgeIdDetails.get(1).getValue(), Integer.MIN_VALUE);
+                int b1 = e0.getBaseNode(), a1 = e0.getAdjNode();
+                int b2 = e1.getBaseNode(), a2 = e1.getAdjNode();
+                int shared;
+                if (b1 == b2 || b1 == a2) shared = b1;
+                else shared = a1;
+                prevNode = (e0.getBaseNode() == shared) ? e0.getAdjNode() : e0.getBaseNode();
+            }
+        }
+
+        for (int ei = 0; ei < edgeIdDetails.size(); ei++) {
+            int edgeId = (Integer) edgeIdDetails.get(ei).getValue();
+            EdgeIteratorState raw = baseGraph.getEdgeIteratorState(edgeId, Integer.MIN_VALUE);
+            int nextNode = (raw.getBaseNode() == prevNode) ? raw.getAdjNode() : raw.getBaseNode();
+            EdgeIteratorState routeEdge = baseGraph.getEdgeIteratorState(edgeId, nextNode);
+            int adjNode = routeEdge.getAdjNode();
+
+            RoadClass rc = routeEdge.get(rcEnc);
+            PredictedHighway ph = routeEdge.get(phEnc);
+            PredictedSurface ps = psEnc != null ? routeEdge.get(psEnc) : null;
+            Surface surf = surfEnc != null ? routeEdge.get(surfEnc) : null;
+            String name = routeEdge.getName();
+
+            PointList geo = routeEdge.fetchWayGeometry(FetchMode.ALL);
+            double startLat = geo.getLat(0), startLon = geo.getLon(0);
+            double endLat = geo.getLat(geo.size() - 1), endLon = geo.getLon(geo.size() - 1);
+
+            System.out.printf("%n[edge %d] id=%d base=%d→adj=%d  rc=%s  ph=%s  ps=%s  surf=%s  name=\"%s\"  len=%.1fm%n",
+                    ei, edgeId, prevNode, adjNode, rc, ph, ps, surf, name, routeEdge.getDistance());
+            System.out.printf("        start=(%.7f, %.7f)  end=(%.7f, %.7f)%n",
+                    startLat, startLon, endLat, endLon);
+
+            int gN = geo.size();
+            double inFromLat = geo.getLat(gN - 2), inFromLon = geo.getLon(gN - 2);
+            double inToLat = geo.getLat(gN - 1), inToLon = geo.getLon(gN - 1);
+            double incomingBearing = AngleCalc.ANGLE_CALC.calcOrientation(inFromLat, inFromLon, inToLat, inToLon);
+
+            int routeNextEdgeId = (ei + 1 < edgeIdDetails.size()) ? (Integer) edgeIdDetails.get(ei + 1).getValue() : -1;
+            EdgeIterator iter = explorer.setBaseNode(adjNode);
+            int altCount = 0;
+            List<String> altLines = new ArrayList<>();
+            while (iter.next()) {
+                if (iter.getEdge() == edgeId) continue;
+                altCount++;
+                int altEdgeId = iter.getEdge();
+                int altAdj = iter.getAdjNode();
+                RoadClass altRC = iter.get(rcEnc);
+                PredictedHighway altPH = iter.get(phEnc);
+                PredictedSurface altPS = psEnc != null ? iter.get(psEnc) : null;
+                Surface altSurf = surfEnc != null ? iter.get(surfEnc) : null;
+                String altName = iter.getName();
+                boolean altAccess = iter.get(bikeAccessEnc);
+
+                PointList altGeo = iter.fetchWayGeometry(FetchMode.ALL);
+                double altFromLat = altGeo.getLat(0), altFromLon = altGeo.getLon(0);
+                double altToLat = altGeo.getLat(1), altToLon = altGeo.getLon(1);
+                double altBearing = AngleCalc.ANGLE_CALC.calcOrientation(altFromLat, altFromLon, altToLat, altToLon);
+
+                double aligned = AngleCalc.ANGLE_CALC.alignOrientation(incomingBearing, altBearing);
+                double deltaRad = aligned - incomingBearing;
+                double deltaDeg = Math.toDegrees(deltaRad);
+                int altSign = InstructionsHelper.calculateSign(inToLat, inToLon, altToLat, altToLon, incomingBearing);
+
+                String tag = (altEdgeId == routeNextEdgeId) ? "ROUTE" : "alt  ";
+                altLines.add(String.format(
+                        "        %s edge=%d adj=%d  rc=%s ph=%s ps=%s surf=%s access=%s  Δ=%+.1f° sign=%s  name=\"%s\"",
+                        tag, altEdgeId, altAdj, altRC, altPH, altPS, altSurf, altAccess,
+                        deltaDeg, signName(altSign), altName));
+            }
+            if (altCount > 0) {
+                System.out.printf("    junction at node %d — %d outgoing edge(s) (excluding incoming):%n", adjNode, altCount);
+                for (String s : altLines) System.out.println(s);
+            } else {
+                System.out.printf("    junction at node %d — no alternatives (dead-end / 2-degree node)%n", adjNode);
+            }
+
+            prevNode = adjNode;
+        }
+
+        InstructionPostProcessor postProcessor = new InstructionPostProcessor();
+        postProcessor.process(result.instructions, request.getInstructionProfile());
+
+        System.out.println("\n========== LOIVA OIKEA SHOULD BE STRAIGHT — AFTER POST-PROCESSING ==========");
+        System.out.println("Instructions: " + result.instructions.size());
+        printInstructionsDetailed(result);
+    }
+
+    // ------------------------------------------------------------------
+    // DIAGNOSTIC: ~3x detour from server-side heading chaining
+    // 4 waypoints / 3 segments, gravel, snap_preventions=[ferry], locale fi.
+    // Client renders ~300m route with 2 short stubs at the middle waypoints.
+    // Server /instructions returns ~900m: leaving wp2 it continues in the
+    // INBOUND heading (chained) instead of turning back as a stub.
+    // ------------------------------------------------------------------
+    private static double polylineDist(PointList p) {
+        double d = 0;
+        for (int i = 0; i < p.size() - 1; i++) {
+            d += DistanceCalcEarth.DIST_EARTH.calcDist(
+                    p.getLat(i), p.getLon(i), p.getLat(i + 1), p.getLon(i + 1));
+        }
+        return d;
+    }
+
+    /** Route one segment via plain GH exactly like a single GHRequest. */
+    private ResponsePath routeSegPlain(double aLat, double aLng, double bLat, double bLng,
+                                       String profile, Double heading, Double headingPenalty,
+                                       List<String> snapPreventions) {
+        GHRequest req = new GHRequest();
+        req.addPoint(new GHPoint(aLat, aLng));
+        req.addPoint(new GHPoint(bLat, bLng));
+        req.setProfile(profile);
+        req.setPathDetails(List.of("edge_id"));
+        req.putHint("instructions", false);
+        req.putHint("calc_points", true);
+        if (snapPreventions != null && !snapPreventions.isEmpty()) {
+            req.setSnapPreventions(snapPreventions);
+        }
+        if (headingPenalty != null) {
+            req.putHint("heading_penalty", headingPenalty);
+        }
+        if (heading != null && !heading.isNaN()) {
+            req.setHeadings(List.of(heading, Double.NaN));
+        }
+        GHResponse rsp = hopper.route(req);
+        if (rsp.hasErrors()) {
+            throw new IllegalStateException("route failed: " + rsp.getErrors());
+        }
+        return rsp.getBest();
+    }
+
+    @Test
+    void diagDetourFromHeadingChaining_61_550_23_554() {
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        EncodingManager encodingManager = hopper.getEncodingManager();
+        TranslationMap translationMap = hopper.getTranslationMap();
+
+        // Exact payload coordinates
+        double w1Lat = 61.550574, w1Lng = 23.554379; // 6srnVdr4KDPqjmmxOcIj0
+        double w2Lat = 61.550035, w2Lng = 23.552747; // JItIt-N00nnKKyU95Lfb6
+        double w3Lat = 61.549208, w3Lng = 23.55411;  // K6BGbecDYbDyzPUi86yjN
+        double w4Lat = 61.549411, w4Lng = 23.554461; // AoTFlcVcmn-INWe3W6UpG
+        double seg3Heading = 146.6696150702877;
+        double seg3Penalty = 60;
+        String profile = "gravel";
+        List<String> snapPrev = List.of("ferry");
+
+        // === 1) Full generator result (the server /instructions path) ===
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("6srnVdr4KDPqjmmxOcIj0", w1Lat, w1Lng),
+                makeWaypoint("JItIt-N00nnKKyU95Lfb6", w2Lat, w2Lng),
+                makeWaypoint("K6BGbecDYbDyzPUi86yjN", w3Lat, w3Lng),
+                makeWaypoint("AoTFlcVcmn-INWe3W6UpG", w4Lat, w4Lng)));
+
+        TrailmapInstructionRequest.Segment s1 = new TrailmapInstructionRequest.Segment();
+        s1.setStart("6srnVdr4KDPqjmmxOcIj0"); s1.setEnd("JItIt-N00nnKKyU95Lfb6");
+        s1.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS); s1.setProfile(profile);
+
+        TrailmapInstructionRequest.Segment s2 = new TrailmapInstructionRequest.Segment();
+        s2.setStart("JItIt-N00nnKKyU95Lfb6"); s2.setEnd("K6BGbecDYbDyzPUi86yjN");
+        s2.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS); s2.setProfile(profile);
+        // NOTE: seg2 has NO initial_heading and NO heading_penalty in the payload.
+
+        TrailmapInstructionRequest.Segment s3 = new TrailmapInstructionRequest.Segment();
+        s3.setStart("K6BGbecDYbDyzPUi86yjN"); s3.setEnd("AoTFlcVcmn-INWe3W6UpG");
+        s3.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS); s3.setProfile(profile);
+        s3.setInitialHeading(seg3Heading); s3.setHeadingPenalty(seg3Penalty);
+
+        request.setSegments(List.of(s1, s2, s3));
+        request.setInstructionProfile(profile);
+        request.setLocale("fi");
+        request.setSnapPreventions(snapPrev);
+
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, baseGraph, encodingManager, translationMap);
+        RouteInstructionGenerator.Result result = generator.generate(request);
+
+        System.out.println("\n========== [GENERATOR] full /instructions result ==========");
+        double genTotal = polylineDist(result.polyline);
+        System.out.printf("Generator polyline: %d points, total length = %.1f m%n",
+                result.polyline.size(), genTotal);
+        System.out.println("Instructions (" + result.instructions.size() + "):");
+        printInstructionsDetailed(result);
+
+        // === 2) CLIENT-style per-segment routing (each segment standalone) ===
+        // seg1/seg2: own initial_heading = none -> no heading.  seg3: 146.67 / penalty 60.
+        System.out.println("\n========== [CLIENT] per-segment, own headings only, no chaining ==========");
+        ResponsePath c1 = routeSegPlain(w1Lat, w1Lng, w2Lat, w2Lng, profile, null, null, snapPrev);
+        ResponsePath c2 = routeSegPlain(w2Lat, w2Lng, w3Lat, w3Lng, profile, null, null, snapPrev);
+        ResponsePath c3 = routeSegPlain(w3Lat, w3Lng, w4Lat, w4Lng, profile, seg3Heading, seg3Penalty, snapPrev);
+        double cd1 = c1.getDistance(), cd2 = c2.getDistance(), cd3 = c3.getDistance();
+        System.out.printf("  client seg1 dist = %.1f m (%d pts)%n", cd1, c1.getPoints().size());
+        System.out.printf("  client seg2 dist = %.1f m (%d pts)   <-- expected ~stub%n", cd2, c2.getPoints().size());
+        System.out.printf("  client seg3 dist = %.1f m (%d pts)%n", cd3, c3.getPoints().size());
+        System.out.printf("  CLIENT TOTAL = %.1f m%n", cd1 + cd2 + cd3);
+
+        // === 3) GENERATOR-style chained routing, reproduced standalone ===
+        // Chain heading + start override from previous segment's polyline tail.
+        System.out.println("\n========== [SERVER-CHAINED] reproduce generator chaining per-segment ==========");
+        // seg1: no chaining yet (first segment), own heading = none
+        ResponsePath g1 = routeSegPlain(w1Lat, w1Lng, w2Lat, w2Lng, profile, null, null, snapPrev);
+        PointList g1p = g1.getPoints();
+        double g1EndLat = g1p.getLat(g1p.size() - 1), g1EndLon = g1p.getLon(g1p.size() - 1);
+        double inboundAz = AngleCalc.ANGLE_CALC.calcAzimuth(
+                g1p.getLat(g1p.size() - 2), g1p.getLon(g1p.size() - 2), g1EndLat, g1EndLon);
+        System.out.printf("  seg1 routed dist = %.1f m, snapped end = (%.6f, %.6f)%n",
+                g1.getDistance(), g1EndLat, g1EndLon);
+        System.out.printf("  --> INBOUND azimuth into wp2 (last 2 polyline pts) = %.2f deg%n", inboundAz);
+        System.out.printf("  --> this azimuth is CHAINED as seg2 start heading, and seg2 start coord%n"
+                + "      is OVERRIDDEN to seg1 snapped end (%.6f, %.6f)%n", g1EndLat, g1EndLon);
+
+        // seg2: chained heading = inboundAz, start override = seg1 snapped end, NO explicit penalty
+        ResponsePath g2 = routeSegPlain(g1EndLat, g1EndLon, w3Lat, w3Lng, profile, inboundAz, null, snapPrev);
+        PointList g2p = g2.getPoints();
+        double g2EndLat = g2p.getLat(g2p.size() - 1), g2EndLon = g2p.getLon(g2p.size() - 1);
+        System.out.printf("  seg2 CHAINED dist = %.1f m (%d pts)   <-- expected BLOW-UP%n",
+                g2.getDistance(), g2p.size());
+        double chainAz2 = AngleCalc.ANGLE_CALC.calcAzimuth(
+                g2p.getLat(g2p.size() - 2), g2p.getLon(g2p.size() - 2), g2EndLat, g2EndLon);
+
+        // seg3: server applies own initial_heading (146.67) since seg3 has one... but note the
+        // generator code is `heading = nextHeading != null ? nextHeading : section.initialHeading`,
+        // so a chained heading OVERRIDES seg3's own 146.67. Reproduce both to be explicit.
+        ResponsePath g3chained = routeSegPlain(g2EndLat, g2EndLon, w4Lat, w4Lng, profile, chainAz2, null, snapPrev);
+        ResponsePath g3own = routeSegPlain(g2EndLat, g2EndLon, w4Lat, w4Lng, profile, seg3Heading, seg3Penalty, snapPrev);
+        System.out.printf("  seg3 (chained az %.2f, no pen) dist = %.1f m%n", chainAz2, g3chained.getDistance());
+        System.out.printf("  seg3 (own heading %.2f, pen 60) dist = %.1f m%n", seg3Heading, g3own.getDistance());
+        System.out.printf("  SERVER-CHAINED TOTAL (using chained seg3) = %.1f m%n",
+                g1.getDistance() + g2.getDistance() + g3chained.getDistance());
+
+        // === 4) Control: route seg2 the client way (free start, own coords) for direct A/B ===
+        System.out.println("\n========== [A/B] seg2 client-free vs server-chained ==========");
+        System.out.printf("  seg2 CLIENT (free start, own coord wp2)      = %.1f m%n", cd2);
+        System.out.printf("  seg2 SERVER (chained inbound az %.2f, override start) = %.1f m%n",
+                inboundAz, g2.getDistance());
+        System.out.printf("  blow-up factor seg2 = %.2fx%n", cd2 > 0 ? g2.getDistance() / cd2 : Double.NaN);
+
+        // Also: does the no-penalty default matter? Route chained-heading seg2 WITH an explicit
+        // large penalty vs the implicit GH default to see if penalty presence changes anything.
+        ResponsePath g2bigPen = routeSegPlain(g1EndLat, g1EndLon, w3Lat, w3Lng, profile, inboundAz, 300.0, snapPrev);
+        ResponsePath g2zeroPen = routeSegPlain(g1EndLat, g1EndLon, w3Lat, w3Lng, profile, inboundAz, 0.0, snapPrev);
+        System.out.printf("  seg2 chained az, penalty=300 = %.1f m%n", g2bigPen.getDistance());
+        System.out.printf("  seg2 chained az, penalty=0   = %.1f m%n", g2zeroPen.getDistance());
+
+        System.out.println("\n========== SUMMARY ==========");
+        System.out.printf("  CLIENT total  ~= %.1f m%n", cd1 + cd2 + cd3);
+        System.out.printf("  GENERATOR total = %.1f m  (factor %.2fx)%n",
+                genTotal, (cd1 + cd2 + cd3) > 0 ? genTotal / (cd1 + cd2 + cd3) : Double.NaN);
     }
 }

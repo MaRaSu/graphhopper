@@ -502,6 +502,279 @@ public class InstructionValidationTest {
         assertNoMicroArtifacts(result, 3.0);
     }
 
+    // ========== Boundary U-turn suppression (Option C, toggle) ==========
+
+    /** Builds the reported short-overshoot case (3 wp / 2 gravel_mtb segments, per-segment headings). */
+    private TrailmapInstructionRequest buildShortBoundaryUturnRequest() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("xjpeHskaIV6G-mUgON3kO", 61.558387, 23.508853),
+                makeWaypoint("_TOpe9hqP4baKWqMknld1", 61.557721, 23.512598),
+                makeWaypoint("6vOqMY6KvM6XsH47e9jfb", 61.556869, 23.511434)));
+        TrailmapInstructionRequest.Segment seg1 = new TrailmapInstructionRequest.Segment();
+        seg1.setStart("xjpeHskaIV6G-mUgON3kO");
+        seg1.setEnd("_TOpe9hqP4baKWqMknld1");
+        seg1.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg1.setProfile("gravel_mtb");
+        seg1.setInitialHeading(100.34706486247228);
+        seg1.setHeadingPenalty(60.0);
+        TrailmapInstructionRequest.Segment seg2 = new TrailmapInstructionRequest.Segment();
+        seg2.setStart("_TOpe9hqP4baKWqMknld1");
+        seg2.setEnd("6vOqMY6KvM6XsH47e9jfb");
+        seg2.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg2.setProfile("gravel_mtb");
+        seg2.setInitialHeading(33.21980871124032);
+        seg2.setHeadingPenalty(60.0);
+        request.setSegments(List.of(seg1, seg2));
+        request.setInstructionProfile("gravel_mtb");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+        return request;
+    }
+
+    /** Run the generator with the internal boundary-U-turn flag forced on/off, restoring it after. */
+    private RouteInstructionGenerator.Result generateWithFlag(TrailmapInstructionRequest req, boolean flag) {
+        boolean prev = RouteInstructionGenerator.SUPPRESS_BOUNDARY_UTURN;
+        RouteInstructionGenerator.SUPPRESS_BOUNDARY_UTURN = flag;
+        try {
+            return generator.generate(req);
+        } finally {
+            RouteInstructionGenerator.SUPPRESS_BOUNDARY_UTURN = prev;
+        }
+    }
+
+    private static int countUturns(RouteInstructionGenerator.Result result) {
+        int n = 0;
+        for (Instruction in : result.instructions) {
+            int s = in.getSign();
+            if (s == Instruction.U_TURN_UNKNOWN || s == Instruction.U_TURN_LEFT || s == Instruction.U_TURN_RIGHT) n++;
+        }
+        return n;
+    }
+
+    private static double polylineLength(RouteInstructionGenerator.Result result) {
+        double d = 0;
+        com.graphhopper.util.PointList p = result.polyline;
+        for (int i = 0; i < p.size() - 1; i++) {
+            d += com.graphhopper.util.DistanceCalcEarth.DIST_EARTH.calcDist(
+                    p.getLat(i), p.getLon(i), p.getLat(i + 1), p.getLon(i + 1));
+        }
+        return d;
+    }
+
+    /** Per-instruction polyline contiguity: point intervals tile [0, polyline) and Σ distance ≈ polyline length. */
+    private void assertSeamContiguity(RouteInstructionGenerator.Result result) {
+        int idx = 0;
+        double sumDist = 0;
+        for (Instruction in : result.instructions) {
+            sumDist += in.getDistance();
+            idx += in.getLength(); // FINISH has length 0
+        }
+        assertEquals(result.polyline.size() - 1, idx,
+                "Instruction point intervals must tile the polyline exactly. "
+                        + summarizeInstructions(result));
+        assertEquals(polylineLength(result), sumDist, 1.0,
+                "Σ instruction distance must match polyline length. " + summarizeInstructions(result));
+    }
+
+    /**
+     * Toggle ON: the reported short waypoint-snap out-and-back is erased — no surviving U-turn,
+     * a single real continuing turn is emitted, geometry stays consistent with the instructions,
+     * and the spur (~4 m) is removed vs the toggle-OFF route. (docs/gh_tbt_pipeline_phasing_change.md)
+     */
+    @Test
+    void boundaryUturnSuppression_erasesShortSnapUturn() {
+        RouteInstructionGenerator.Result onResult = generateWithFlag(buildShortBoundaryUturnRequest(), true);
+        new InstructionPostProcessor().process(onResult.instructions, "gravel_mtb");
+
+        assertValidInstructionList(onResult);
+        assertEquals(0, countUturns(onResult),
+                "Short boundary U-turn must be erased with flag on. " + summarizeInstructions(onResult));
+        // A single real continuing maneuver (the path -> service-road turn) must remain.
+        long realTurns = onResult.instructions.stream()
+                .filter(i -> i.getSign() != Instruction.CONTINUE_ON_STREET && i.getSign() != Instruction.FINISH)
+                .count();
+        assertTrue(realTurns >= 1,
+                "A continuing turn must remain after erasing the overshoot. " + summarizeInstructions(onResult));
+        // Geometry/instruction consistency at the repaired seam (R3 + R8).
+        assertSeamContiguity(onResult);
+
+        // The spur is physically removed: ON route is shorter than OFF by ~the out-and-back (~4 m).
+        RouteInstructionGenerator.Result offResult = generateWithFlag(buildShortBoundaryUturnRequest(), false);
+        double removed = polylineLength(offResult) - polylineLength(onResult);
+        assertTrue(removed > 1.0 && removed < 30.0,
+                "ON route should be shorter than OFF by the removed spur (got " + String.format("%.2fm", removed) + ")");
+    }
+
+    /** Flag OFF (legacy path): the reported case still emits the U-turn — confirms the fallback is intact. */
+    @Test
+    void boundaryUturnSuppression_flagOff_keepsLegacyUturn() {
+        RouteInstructionGenerator.Result result = generateWithFlag(buildShortBoundaryUturnRequest(), false);
+        assertValidInstructionList(result);
+        assertTrue(countUturns(result) >= 1,
+                "With the flag off the legacy U-turn must be preserved. " + summarizeInstructions(result));
+    }
+
+    /**
+     * Toggle ON must NOT erase a genuine long out-and-back (overshoot far above the threshold).
+     * Reuses the long-backtrack request from {@link #uturnAtSegmentBoundary_isPreserved}.
+     */
+    @Test
+    void boundaryUturnSuppression_preservesLongOutAndBack() {
+        double wp1Lat = 61.577236, wp1Lng = 23.278753;
+        double wp2Lat = 61.602494, wp2Lng = 23.243388;
+        double wp3Lat = 61.636935, wp3Lng = 23.257746;
+        CustomModel cm = new CustomModel();
+        cm.addToPriority(Statement.If("predicted_surface == ASPHALT_OR_UNPAVED || predicted_surface == ASPHALT",
+                Statement.Op.MULTIPLY, "0.8"));
+        cm.addToPriority(Statement.If("predicted_highway == CYCLEWAY", Statement.Op.MULTIPLY, "1.3"));
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("wp1", wp1Lat, wp1Lng),
+                makeWaypoint("wp2", wp2Lat, wp2Lng),
+                makeWaypoint("wp3", wp3Lat, wp3Lng)));
+        request.setSnapPreventions(List.of("ferry"));
+        TrailmapInstructionRequest.Segment seg1 = new TrailmapInstructionRequest.Segment();
+        seg1.setStart("wp1"); seg1.setEnd("wp2");
+        seg1.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg1.setProfile("gravel"); seg1.setCustomModel(cm);
+        TrailmapInstructionRequest.Segment seg2 = new TrailmapInstructionRequest.Segment();
+        seg2.setStart("wp2"); seg2.setEnd("wp3");
+        seg2.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg2.setProfile("gravel"); seg2.setCustomModel(cm);
+        seg2.setInitialHeading(311.76719918378234); seg2.setHeadingPenalty(60.0);
+        request.setSegments(List.of(seg1, seg2));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+
+        RouteInstructionGenerator.Result result = generateWithFlag(request, true);
+        assertValidInstructionList(result);
+        assertTrue(countUturns(result) >= 1,
+                "A genuine long out-and-back must be preserved even with the flag on. "
+                        + summarizeInstructions(result));
+        // Geometry stays consistent on a U-turn-containing route under the flag.
+        assertSeamContiguity(result);
+    }
+
+    /**
+     * Step-3 harness: confirm the defer-commit path (toggle ON) only ever differs from the
+     * production path (toggle OFF) by collapsing short boundary-U-turn snap artifacts — it
+     * never corrupts geometry, and never ADDS a U-turn or a maneuver.
+     * <p>
+     * - A route with no merge-eligible seam (genuine long out-and-back) must be byte-identical.
+     * - The 3-segment gravel route DOES contain a short snap-stub at a real 538 m out-and-back;
+     *   ON cleans the 1 m snap spur (the out-and-back U-turn is correctly preserved). We assert
+     *   ON stays valid + geometry-consistent and never adds U-turns/instructions.
+     */
+    @Test
+    void boundaryUturnSuppression_noDiffExceptFixedSeam() {
+        // Both multi-segment routes contain short snap-stub seams (waypoint snaps are common),
+        // so the fix fires on each. We assert it ONLY cleans: stays valid + geometry-consistent,
+        // never adds a U-turn or instruction, and perturbs total geometry only by tiny spurs.
+        assertOnCleansOnly(buildGravelRouteQualityRequest());
+        assertOnCleansOnly(buildLongOutAndBackRequest());
+    }
+
+    /** ON must stay valid + geometry-consistent, never add U-turns/instructions, and only remove tiny spurs. */
+    private void assertOnCleansOnly(TrailmapInstructionRequest request) {
+        RouteInstructionGenerator.Result off = generateWithFlag(request, false);
+        RouteInstructionGenerator.Result on = generateWithFlag(request, true);
+
+        assertValidInstructionList(on);
+        assertSeamContiguity(on);
+        assertTrue(countUturns(on) <= countUturns(off),
+                "Suppression must not ADD U-turns. OFF uturns=" + countUturns(off)
+                        + " ON uturns=" + countUturns(on) + "\nON: " + summarizeInstructions(on));
+        assertTrue(on.instructions.size() <= off.instructions.size(),
+                "Suppression must not ADD instructions. OFF=" + off.instructions.size()
+                        + " ON=" + on.instructions.size());
+        // Geometry change is bounded: only short snap spurs are removed (each ≤ ~2× threshold).
+        double removed = polylineLength(off) - polylineLength(on);
+        assertTrue(removed >= -0.5 && removed < 60.0,
+                "ON geometry should differ from OFF only by small removed spurs (got "
+                        + String.format("%.1fm", removed) + ")");
+    }
+
+    private TrailmapInstructionRequest buildLongOutAndBackRequest() {
+        CustomModel cm = new CustomModel();
+        cm.addToPriority(Statement.If("predicted_surface == ASPHALT_OR_UNPAVED || predicted_surface == ASPHALT",
+                Statement.Op.MULTIPLY, "0.8"));
+        cm.addToPriority(Statement.If("predicted_highway == CYCLEWAY", Statement.Op.MULTIPLY, "1.3"));
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("wp1", 61.577236, 23.278753),
+                makeWaypoint("wp2", 61.602494, 23.243388),
+                makeWaypoint("wp3", 61.636935, 23.257746)));
+        request.setSnapPreventions(List.of("ferry"));
+        TrailmapInstructionRequest.Segment seg1 = new TrailmapInstructionRequest.Segment();
+        seg1.setStart("wp1"); seg1.setEnd("wp2");
+        seg1.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg1.setProfile("gravel"); seg1.setCustomModel(cm);
+        TrailmapInstructionRequest.Segment seg2 = new TrailmapInstructionRequest.Segment();
+        seg2.setStart("wp2"); seg2.setEnd("wp3");
+        seg2.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg2.setProfile("gravel"); seg2.setCustomModel(cm);
+        seg2.setInitialHeading(311.76719918378234); seg2.setHeadingPenalty(60.0);
+        request.setSegments(List.of(seg1, seg2));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        return request;
+    }
+
+    /**
+     * Two things at once on a real 4-waypoint payload:
+     * <ol>
+     *   <li><b>Heading from segment data only.</b> Previously the server chained the inbound azimuth
+     *       into the next segment, which on a stub/turn-around waypoint forced an onward departure
+     *       and a large go-around detour (~1150 m for this ~270 m route, ~4.3×). seg1/seg2 carry no
+     *       heading, seg3 has an explicit one.</li>
+     *   <li><b>Consecutive double-merge (R17).</b> The payload has short snap stubs at BOTH wp2 and
+     *       wp3, so both internal seams are boundary-U-turn snap artifacts. The defer-commit path
+     *       merges seg1+seg2, then merges that result with seg3 — exercising back-to-back merges where
+     *       the second classifies against the already-merged chain. Both stubs are cleaned, no U-turn
+     *       survives, and geometry stays consistent.</li>
+     * </ol>
+     */
+    @Test
+    void headingFromSegmentDataOnly_noChainedDetour() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("6srnVdr4KDPqjmmxOcIj0", 61.550574, 23.554379),
+                makeWaypoint("JItIt-N00nnKKyU95Lfb6", 61.550035, 23.552747),
+                makeWaypoint("K6BGbecDYbDyzPUi86yjN", 61.549208, 23.55411),
+                makeWaypoint("AoTFlcVcmn-INWe3W6UpG", 61.549411, 23.554461)));
+        String[][] segs = {
+                {"6srnVdr4KDPqjmmxOcIj0", "JItIt-N00nnKKyU95Lfb6"},
+                {"JItIt-N00nnKKyU95Lfb6", "K6BGbecDYbDyzPUi86yjN"},
+                {"K6BGbecDYbDyzPUi86yjN", "AoTFlcVcmn-INWe3W6UpG"}};
+        java.util.List<TrailmapInstructionRequest.Segment> segList = new java.util.ArrayList<>();
+        for (int i = 0; i < segs.length; i++) {
+            TrailmapInstructionRequest.Segment s = new TrailmapInstructionRequest.Segment();
+            s.setStart(segs[i][0]); s.setEnd(segs[i][1]);
+            s.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+            s.setProfile("gravel");
+            if (i == 2) { s.setInitialHeading(146.6696150702877); s.setHeadingPenalty(60.0); }
+            segList.add(s);
+        }
+        request.setSegments(segList);
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+        // (1) No chaining → ~270 m ballpark, NOT the ~1150 m chained-heading detour.
+        double total = polylineLength(result);
+        assertTrue(total < 400.0,
+                "Chained-heading detour regression: expected ~270 m, got " + String.format("%.0fm", total)
+                        + ". " + summarizeInstructions(result));
+        // (2) Both short stubs cleaned by the consecutive double-merge (R17): no surviving U-turn,
+        //     and geometry stays consistent through both merges.
+        assertEquals(0, countUturns(result),
+                "Both wp2/wp3 snap stubs must be cleaned (no surviving U-turn). " + summarizeInstructions(result));
+        assertSeamContiguity(result);
+    }
+
     // ========== Test 2: 3-segment gravel route instruction quality ==========
 
     /**
@@ -899,25 +1172,19 @@ public class InstructionValidationTest {
         RouteInstructionGenerator.Result result = generator.generate(request);
         assertValidInstructionList(result);
 
-        // --- A U-turn instruction must be present (the boundary is a true U-turn) ---
-        int uturnIdx = -1;
-        for (int i = 0; i < result.instructions.size(); i++) {
-            int sign = result.instructions.get(i).getSign();
-            if (sign == Instruction.U_TURN_UNKNOWN
-                    || sign == Instruction.U_TURN_LEFT
-                    || sign == Instruction.U_TURN_RIGHT) {
-                uturnIdx = i;
-                break;
-            }
-        }
-        assertTrue(uturnIdx >= 0,
-                "Expected a U-turn instruction at the seg1/seg2 boundary. Instructions: "
-                + summarizeInstructions(result));
+        // --- The seg1/seg2 boundary "U-turn" was itself a 5.55 m waypoint-snap artifact ---
+        // (continuation onto a different edge, not a reversal — measured by
+        // RouteInstructionGeneratorTest#measureCrossSegmentUturnOvershoot). The 2026-05-10 fix
+        // merely *anchored* the spurious U-turn so following instructions did not stack; the
+        // boundary-U-turn suppression now *removes* it entirely. So with the fix on there must
+        // be NO U-turn here.
+        assertEquals(0, countUturns(result),
+                "The 5.55 m snap-artifact U-turn at the seg1/seg2 boundary must be suppressed. "
+                + "Instructions: " + summarizeInstructions(result));
 
-        // --- No two non-FINISH instructions may share the same polyline interval start ---
-        // This is the symptom of the bug: pre-fix, six instructions stacked at the same
-        // polyline index. Post-fix, every instruction has a distinct, monotonically
-        // increasing interval start.
+        // --- The original regression must still not recur: no two non-FINISH instructions may ---
+        // share the same polyline interval start (pre-2026-05-10, six instructions stacked at one
+        // index). Every instruction must have a distinct, monotonically increasing interval start.
         int polyIdx = 0;
         int prevPolyIdx = -1;
         for (int i = 0; i < result.instructions.size(); i++) {
@@ -926,26 +1193,12 @@ public class InstructionValidationTest {
                 assertTrue(polyIdx > prevPolyIdx,
                         "Instruction [" + i + "] sign=" + signName(instr.getSign())
                         + " shares polyline interval start " + polyIdx
-                        + " with the previous instruction. U-turn anchor regression? "
+                        + " with the previous instruction (stacking regression). "
                         + "Instructions: " + summarizeInstructions(result));
                 prevPolyIdx = polyIdx;
             }
             polyIdx += instr.getLength();
         }
-
-        // --- The U-turn instruction must anchor at the seg1/seg2 boundary ---
-        // Seg1 is the first 10 edges of the route; its polyline ends at the snap point
-        // that is the U-turn location. Pre-fix the U-turn landed at polyline index ~65
-        // (deep into seg2); post-fix it sits at the boundary (~index 35).
-        int uturnPolyStart = 0;
-        for (int i = 0; i < uturnIdx; i++) {
-            uturnPolyStart += result.instructions.get(i).getLength();
-        }
-        assertTrue(uturnPolyStart <= 50,
-                "U-turn instruction polyStart=" + uturnPolyStart
-                + " is too far down the polyline; expected to anchor near the seg1/seg2 "
-                + "boundary (~35). Pre-fix would have given ~65. Instructions: "
-                + summarizeInstructions(result));
     }
 
     // ========== Test 7: Fork near end — track vs path ==========

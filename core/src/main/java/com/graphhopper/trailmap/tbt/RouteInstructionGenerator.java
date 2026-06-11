@@ -92,12 +92,18 @@ public class RouteInstructionGenerator {
         // Snap preventions from the top-level request
         List<String> snapPreventions = request.getSnapPreventions();
 
+        // Segment-boundary U-turn suppression via the additive defer-commit path. Controlled by
+        // the internal flag SUPPRESS_BOUNDARY_UTURN (no API surface). When off, the production
+        // path below runs byte-for-byte unchanged. See docs/gh_tbt_pipeline_phasing_change.md.
+        if (SUPPRESS_BOUNDARY_UTURN) {
+            return generateWithBoundaryUturnSuppression(chunks, weighting, tr, snapPreventions, waypointMap);
+        }
+
         // Process each chunk: route sections produce instructions; non-routable chunks
         // produce geometry only. The full polyline is built by concatenation.
         InstructionList allInstructions = new InstructionList(tr);
         PointList fullPolyline = new PointList(128, true);
 
-        Double nextHeading = null;
         TrailmapInstructionRequest.Coordinates nextStartOverride = null;
         // Track the last routable chunk's edge chain for stitching
         List<Integer> prevEdgeIds = null;
@@ -113,7 +119,10 @@ public class RouteInstructionGenerator {
                 // --- Routable chunk: route, extract edges, generate instructions ---
                 Section section = chunk.routableSection;
 
-                Double heading = nextHeading != null ? nextHeading : section.initialHeading;
+                // Each segment uses ONLY its own initial_heading (null → free start). The server
+                // respects the per-segment route data from the API exactly; it does not replicate
+                // the client UI nor chain a heading from the previous segment.
+                Double heading = section.initialHeading;
                 if (nextStartOverride != null) {
                     section.points.set(0, nextStartOverride);
                 }
@@ -193,17 +202,12 @@ public class RouteInstructionGenerator {
                 prevRoutePolyline = routePolyline;
                 prevProfile = section.profile;
 
-                // Chain heading and snapped coordinate for next chunk
+                // Start the next segment exactly where this one ended (polyline continuity).
+                // No heading chaining — heading comes only from the next segment's own data.
                 PointList pts = routePolyline;
-                if (pts.size() >= 2) {
-                    nextHeading = AngleCalc.ANGLE_CALC.calcAzimuth(
-                            pts.getLat(pts.size() - 2), pts.getLon(pts.size() - 2),
-                            pts.getLat(pts.size() - 1), pts.getLon(pts.size() - 1));
-                    nextStartOverride = coordOf(pts.getLat(pts.size() - 1), pts.getLon(pts.size() - 1));
-                } else {
-                    nextHeading = null;
-                    nextStartOverride = null;
-                }
+                nextStartOverride = (pts.size() >= 1)
+                        ? coordOf(pts.getLat(pts.size() - 1), pts.getLon(pts.size() - 1))
+                        : null;
 
             } else {
                 // --- Non-routable chunk (direct or coordinates) ---
@@ -233,10 +237,7 @@ public class RouteInstructionGenerator {
                 prevRoutePolyline = null;
                 prevProfile = null;
 
-                // Do NOT chain heading from non-routable segments — the straight-line
-                // direction of a direct/coordinates gap is meaningless for road snapping
-                // and would force the next routed segment to start in the wrong direction.
-                nextHeading = null;
+                // Across a non-routable gap the next segment starts fresh from its own waypoint.
                 nextStartOverride = null;
             }
         }
@@ -261,6 +262,311 @@ public class RouteInstructionGenerator {
 
         LOGGER.info("Generated {} instructions, polyline has {} points", allInstructions.size(), fullPolyline.size());
         return new Result(allInstructions, fullPolyline);
+    }
+
+    // ============================================================================
+    // Experimental: segment-boundary U-turn suppression (Option C, defer-commit).
+    // Additive path, gated by request.suppressBoundaryUturn. The production generate()
+    // body above is left unchanged. See docs/gh_tbt_pipeline_phasing_change.md.
+    // ============================================================================
+
+    /**
+     * Internal feature flag (no API surface) for segment-boundary U-turn suppression.
+     * On by default. Package-private and non-final only so tests can A/B it; production
+     * never flips it. Set false to fall back to the legacy per-segment path.
+     */
+    static boolean SUPPRESS_BOUNDARY_UTURN = true;
+
+    /** One-way traversed overshoot (m) at/below which a boundary U-turn is treated as a snap artifact. Tunable. */
+    private static final double BOUNDARY_UTURN_MAX_TRAVERSED_M = 15.0;
+    /** Tolerance (m) for locating the junction node within a segment polyline. */
+    private static final double JUNCTION_MATCH_TOLERANCE_M = 0.5;
+
+    /** A routable section held (not yet committed) so it can merge with the next one. */
+    private static class PendingSection {
+        List<Integer> edgeIds;
+        PointList routePolyline;
+        TrailmapInstructionRequest.Coordinates startCoord;
+        InstructionList sectionInstructions;
+        boolean resumingAfterGap;
+        String resumeType;
+        boolean needsUturnHint;   // long boundary U-turn: stamp anchor hint at commit
+    }
+
+    /** A detected short same-edge boundary U-turn (snap artifact eligible for erasure). */
+    private static class BoundarySeam {
+        int junctionNode;
+        int prevPolyJunctionIdx;   // last occurrence of junction in the previous section's polyline
+        int currPolyJunctionIdx;   // first occurrence of junction in the current section's polyline
+        double overshootM;
+    }
+
+    /**
+     * Defer-commit variant of generate(): a routable section is held until the next one
+     * is seen. If their seam is a short snap-artifact U-turn, they are merged (overshoot
+     * erased from edges + geometry) and instructions regenerated over the merged chain —
+     * so the correct continuing turn is produced by normal turn logic and no rollback of
+     * already-committed state is needed. All other seams commit and stitch exactly as the
+     * production path does.
+     */
+    private Result generateWithBoundaryUturnSuppression(
+            List<Chunk> chunks, Weighting weighting, Translation tr,
+            List<String> snapPreventions,
+            Map<String, TrailmapInstructionRequest.Coordinates> waypointMap) {
+
+        InstructionList allInstructions = new InstructionList(tr);
+        PointList fullPolyline = new PointList(128, true);
+
+        TrailmapInstructionRequest.Coordinates nextStartOverride = null;
+        String pendingResumeType = null;
+        PendingSection pending = null;
+
+        for (Chunk chunk : chunks) {
+            if (chunk.routableSection != null) {
+                Section section = chunk.routableSection;
+
+                // Heading from this segment's own data only — never chained (see generate()).
+                Double heading = section.initialHeading;
+                if (nextStartOverride != null) {
+                    section.points.set(0, nextStartOverride);
+                }
+
+                GHResponse response = routeSection(section, heading, snapPreventions);
+                if (response.hasErrors()) {
+                    throw new IllegalStateException("Routing failed: " +
+                            response.getErrors().stream().map(Throwable::getMessage).collect(Collectors.joining(", ")));
+                }
+                ResponsePath responsePath = response.getBest();
+                List<Integer> edgeIds = extractEdgeIds(responsePath);
+                PointList routePolyline = responsePath.getPoints();
+
+                // Try to merge this section into the held one at a short boundary U-turn.
+                boolean didMerge = false;
+                if (pending != null && pending.edgeIds != null && !pending.edgeIds.isEmpty() && !edgeIds.isEmpty()) {
+                    BoundarySeam seam = classifyShortBoundaryUturn(
+                            pending.edgeIds, edgeIds, pending.routePolyline, routePolyline);
+                    if (seam != null) {
+                        LOGGER.debug("Boundary U-turn snap artifact at node {} (overshoot {}m) — merging segments",
+                                seam.junctionNode, String.format("%.1f", seam.overshootM));
+                        pending = mergeSections(pending, edgeIds, routePolyline, seam, weighting, tr);
+                        didMerge = true;
+                    }
+                }
+
+                if (!didMerge) {
+                    // Commit the previously held section, then process this one as the new held section.
+                    List<Integer> prevEdgeIds = null;
+                    PointList prevRoutePolyline = null;
+                    if (pending != null) {
+                        commitPending(allInstructions, fullPolyline, pending, false);
+                        prevEdgeIds = pending.edgeIds;
+                        prevRoutePolyline = pending.routePolyline;
+                    }
+
+                    boolean uturnAtBoundary = false;
+                    if (prevEdgeIds != null && !prevEdgeIds.isEmpty() && !edgeIds.isEmpty()) {
+                        uturnAtBoundary = stitchEdgeChains(prevEdgeIds, edgeIds, prevRoutePolyline, routePolyline,
+                                fullPolyline, section.profile, snapPreventions);
+                    }
+
+                    PendingSection ps = new PendingSection();
+                    ps.edgeIds = edgeIds;
+                    ps.routePolyline = routePolyline;
+                    ps.startCoord = section.points.get(0);
+                    ps.resumingAfterGap = pendingResumeType != null;
+                    ps.resumeType = pendingResumeType;
+                    if (!edgeIds.isEmpty()) {
+                        Path syntheticPath = buildSyntheticPath(edgeIds, section.points.get(0));
+                        ps.sectionInstructions = TrailmapInstructionsFromEdges.calcInstructions(
+                                syntheticPath, baseGraph, weighting, encodedValueLookup, tr);
+                        if (uturnAtBoundary && !ps.sectionInstructions.isEmpty()
+                                && ps.sectionInstructions.get(0).getSign() == Instruction.CONTINUE_ON_STREET) {
+                            ps.sectionInstructions.get(0).setSign(Instruction.U_TURN_UNKNOWN);
+                            ps.needsUturnHint = true;
+                        }
+                    } else {
+                        ps.sectionInstructions = new InstructionList(tr);
+                    }
+                    pending = ps;
+                    pendingResumeType = null;
+                }
+
+                // Start the next segment where this one ended (polyline continuity); no heading chaining.
+                nextStartOverride = (routePolyline.size() >= 1)
+                        ? coordOf(routePolyline.getLat(routePolyline.size() - 1),
+                                  routePolyline.getLon(routePolyline.size() - 1))
+                        : null;
+
+            } else {
+                // Non-routable chunk: flush the held section first, then emit the gap.
+                if (pending != null) {
+                    commitPending(allInstructions, fullPolyline, pending, false);
+                    pending = null;
+                }
+                if (!allInstructions.isEmpty()) {
+                    allInstructions.get(allInstructions.size() - 1)
+                            .setExtraInfo("next_segment_type", chunk.segmentType);
+                }
+                PointList gapGeometry = buildGapGeometry(chunk, waypointMap);
+                Instruction directInstr = new Instruction(Instruction.CONTINUE_ON_STREET, "", gapGeometry);
+                directInstr.setDistance(calcGapDistance(gapGeometry));
+                directInstr.setExtraInfo("segment_type", chunk.segmentType);
+                directInstr.setExtraInfo("tbt_available", false);
+                directInstr.setExtraInfo("confirm_reason", "entering_direct_segment");
+                allInstructions.add(directInstr);
+                appendGapPolyline(fullPolyline, gapGeometry);
+
+                pendingResumeType = chunk.segmentType;
+                nextStartOverride = null;
+            }
+        }
+
+        // Commit the final held section (it is the last chunk → keep its FINISH).
+        if (pending != null) {
+            commitPending(allInstructions, fullPolyline, pending, true);
+        }
+
+        if (!allInstructions.isEmpty()
+                && allInstructions.get(allInstructions.size() - 1).getSign() != Instruction.FINISH) {
+            PointList finishPt = new PointList(1, true);
+            if (fullPolyline.size() > 0) {
+                int last = fullPolyline.size() - 1;
+                finishPt.add(fullPolyline.getLat(last), fullPolyline.getLon(last),
+                        fullPolyline.is3D() ? fullPolyline.getEle(last) : Double.NaN);
+            }
+            allInstructions.add(new Instruction(Instruction.FINISH, "", finishPt));
+        }
+
+        remapInstructionGeometry(allInstructions, fullPolyline);
+        LOGGER.info("Generated {} instructions (boundary-uturn-suppression path), polyline has {} points",
+                allInstructions.size(), fullPolyline.size());
+        return new Result(allInstructions, fullPolyline);
+    }
+
+    /**
+     * Commit a held section: append its instructions (stripping leading CONTINUE / FINISH per the
+     * same rules as the production path) and its route polyline. Stamps resume / U-turn anchor hints
+     * using the commit-time polyline size so geometry remapping anchors correctly.
+     */
+    private void commitPending(InstructionList allInstructions, PointList fullPolyline,
+                               PendingSection pending, boolean isLastRoutableChunk) {
+        if (pending.edgeIds == null || pending.edgeIds.isEmpty()
+                || pending.sectionInstructions == null || pending.sectionInstructions.isEmpty()) {
+            return; // degenerate / empty section — nothing to commit (matches production skip)
+        }
+        if (pending.needsUturnHint && fullPolyline.size() > 0
+                && pending.sectionInstructions.get(0).getSign() == Instruction.U_TURN_UNKNOWN) {
+            pending.sectionInstructions.get(0).setExtraInfo("_polyline_start_hint", fullPolyline.size() - 1);
+        }
+        int instrCountBefore = allInstructions.size();
+        appendInstructions(allInstructions, pending.sectionInstructions, fullPolyline.size(),
+                isLastRoutableChunk, pending.resumingAfterGap);
+        if (pending.resumingAfterGap && allInstructions.size() > instrCountBefore) {
+            Instruction firstNew = allInstructions.get(instrCountBefore);
+            firstNew.setExtraInfo("tbt_resumed", true);
+            firstNew.setExtraInfo("prev_segment_type", pending.resumeType);
+            firstNew.setExtraInfo("_polyline_start_hint", fullPolyline.size());
+        }
+        appendRoutePolyline(fullPolyline, pending.routePolyline);
+    }
+
+    /**
+     * Classify the seam between a held section and the current one. Returns a non-null
+     * BoundarySeam only for a SHORT same-edge opposite-direction overlap (snap artifact):
+     * both sections ≥2 edges, share the boundary edge traversed in opposite directions,
+     * traversed overshoot ≤ {@link #BOUNDARY_UTURN_MAX_TRAVERSED_M}, and the junction node
+     * is locatable in both polylines. Returns null otherwise (preserve current behavior:
+     * long out-and-back, same-direction, disconnected, single-edge legs, ambiguous geometry).
+     */
+    private BoundarySeam classifyShortBoundaryUturn(List<Integer> prevEdgeIds, List<Integer> currEdgeIds,
+                                                    PointList prevPoly, PointList currPoly) {
+        if (prevEdgeIds.size() < 2 || currEdgeIds.size() < 2) return null;
+        int lastPrev = prevEdgeIds.get(prevEdgeIds.size() - 1);
+        int firstCurr = currEdgeIds.get(0);
+        if (lastPrev != firstCurr) return null; // same-edge boundary only (bounds to single-piece overshoot)
+        if (prevPoly == null || prevPoly.isEmpty() || currPoly == null || currPoly.isEmpty()) return null;
+
+        EdgeIteratorState shared = baseGraph.getEdgeIteratorState(lastPrev, Integer.MIN_VALUE);
+        int sBase = shared.getBaseNode(), sAdj = shared.getAdjNode();
+
+        EdgeIteratorState prevPenult = baseGraph.getEdgeIteratorState(
+                prevEdgeIds.get(prevEdgeIds.size() - 2), Integer.MIN_VALUE);
+        EdgeIteratorState currSecond = baseGraph.getEdgeIteratorState(currEdgeIds.get(1), Integer.MIN_VALUE);
+        int prevEntry = (prevPenult.getBaseNode() == sBase || prevPenult.getAdjNode() == sBase) ? sBase
+                : ((prevPenult.getBaseNode() == sAdj || prevPenult.getAdjNode() == sAdj) ? sAdj : -1);
+        int currExit = (currSecond.getBaseNode() == sBase || currSecond.getAdjNode() == sBase) ? sBase
+                : ((currSecond.getBaseNode() == sAdj || currSecond.getAdjNode() == sAdj) ? sAdj : -1);
+        if (prevEntry == -1 || prevEntry != currExit) return null; // not a U-turn (both pivot on same node)
+
+        int junction = prevEntry;
+        NodeAccess na = baseGraph.getNodeAccess();
+        double jLat = na.getLat(junction), jLon = na.getLon(junction);
+        double snapLat = prevPoly.getLat(prevPoly.size() - 1), snapLon = prevPoly.getLon(prevPoly.size() - 1);
+        double overshoot = DistanceCalcEarth.DIST_EARTH.calcDist(jLat, jLon, snapLat, snapLon);
+        if (overshoot > BOUNDARY_UTURN_MAX_TRAVERSED_M) return null; // genuine out-and-back → preserve
+
+        int j1 = -1;
+        for (int i = prevPoly.size() - 1; i >= 0; i--) {
+            if (DistanceCalcEarth.DIST_EARTH.calcDist(prevPoly.getLat(i), prevPoly.getLon(i), jLat, jLon)
+                    < JUNCTION_MATCH_TOLERANCE_M) { j1 = i; break; }
+        }
+        int j2 = -1;
+        for (int i = 0; i < currPoly.size(); i++) {
+            if (DistanceCalcEarth.DIST_EARTH.calcDist(currPoly.getLat(i), currPoly.getLon(i), jLat, jLon)
+                    < JUNCTION_MATCH_TOLERANCE_M) { j2 = i; break; }
+        }
+        if (j1 < 0 || j2 < 0) return null; // junction not on a polyline vertex within tolerance → decline
+
+        BoundarySeam seam = new BoundarySeam();
+        seam.junctionNode = junction;
+        seam.prevPolyJunctionIdx = j1;
+        seam.currPolyJunctionIdx = j2;
+        seam.overshootM = overshoot;
+        return seam;
+    }
+
+    /**
+     * Merge a held section with the current one across a short boundary U-turn: drop both
+     * copies of the overshoot edge, splice a spur-free polyline at the junction, and regenerate
+     * instructions over the merged chain (yielding the correct continuing turn, no U-turn).
+     * The merged section inherits the held section's start coord and resume status, and becomes
+     * the new held section (so a following seam classifies against the merged edge chain).
+     */
+    private PendingSection mergeSections(PendingSection pending, List<Integer> currEdgeIds,
+                                         PointList currPoly, BoundarySeam seam,
+                                         Weighting weighting, Translation tr) {
+        List<Integer> mergedEdges = new ArrayList<>(pending.edgeIds.subList(0, pending.edgeIds.size() - 1));
+        mergedEdges.addAll(currEdgeIds.subList(1, currEdgeIds.size()));
+
+        PointList prevPoly = pending.routePolyline;
+        boolean is3D = prevPoly.is3D();
+        PointList mergedPoly = new PointList(prevPoly.size() + currPoly.size(), is3D);
+        for (int i = 0; i <= seam.prevPolyJunctionIdx; i++) {
+            mergedPoly.add(prevPoly.getLat(i), prevPoly.getLon(i), is3D ? prevPoly.getEle(i) : Double.NaN);
+        }
+        for (int i = seam.currPolyJunctionIdx + 1; i < currPoly.size(); i++) {
+            mergedPoly.add(currPoly.getLat(i), currPoly.getLon(i),
+                    currPoly.is3D() ? currPoly.getEle(i) : Double.NaN);
+        }
+
+        InstructionList mergedInstr;
+        if (!mergedEdges.isEmpty()) {
+            Path mergedPath = buildSyntheticPath(mergedEdges, pending.startCoord);
+            mergedInstr = TrailmapInstructionsFromEdges.calcInstructions(
+                    mergedPath, baseGraph, weighting, encodedValueLookup, tr);
+        } else {
+            mergedInstr = new InstructionList(tr);
+        }
+
+        PendingSection ps = new PendingSection();
+        ps.edgeIds = mergedEdges;
+        ps.routePolyline = mergedPoly;
+        ps.startCoord = pending.startCoord;
+        ps.sectionInstructions = mergedInstr;
+        ps.resumingAfterGap = pending.resumingAfterGap;
+        ps.resumeType = pending.resumeType;
+        ps.needsUturnHint = false;
+        return ps;
     }
 
     // ---- Chunk building ----
