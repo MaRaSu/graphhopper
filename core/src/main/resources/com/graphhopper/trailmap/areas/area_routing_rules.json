@@ -1,5 +1,5 @@
 {
-  "description": "Trailmap area routing rules - defines which OSM area polygons are passable",
+  "description": "Trailmap area routing rules - defines which OSM area polygons are passable. Curated to small 'connector' areas that frequently lack mapped internal ways. Large landscape polygons (parks, recreation_ground, camp_site, motorway service areas) are intentionally excluded: area routing only stores the polygon PERIMETER, so for large areas the boundary is a detour (e.g. following a lake shore or field edge) rather than a useful crossing, and those areas almost always already have their internal paths mapped.",
   "rules": [
     {
       "name": "parking_lots",
@@ -31,34 +31,6 @@
       }
     },
     {
-      "name": "parks",
-      "description": "Public parks with foot access",
-      "required_tags": {
-        "leisure": "park"
-      },
-      "forbidden_tags": [],
-      "area_check": "explicit_or_closed",
-      "access": {
-        "foot": true,
-        "bike": false,
-        "car": false
-      }
-    },
-    {
-      "name": "recreation_ground",
-      "description": "Recreation grounds and sports fields",
-      "required_tags": {
-        "landuse": "recreation_ground"
-      },
-      "forbidden_tags": [],
-      "area_check": "explicit_or_closed",
-      "access": {
-        "foot": true,
-        "bike": false,
-        "car": false
-      }
-    },
-    {
       "name": "squares",
       "description": "Town squares and plazas",
       "required_tags": {
@@ -73,38 +45,10 @@
       }
     },
     {
-      "name": "service_areas",
-      "description": "Highway service areas (rest stops with amenities)",
-      "required_tags": {
-        "highway": "services"
-      },
-      "forbidden_tags": [],
-      "area_check": "explicit_or_closed",
-      "access": {
-        "foot": true,
-        "bike": true,
-        "car": false
-      }
-    },
-    {
       "name": "rest_areas",
       "description": "Highway rest areas",
       "required_tags": {
         "highway": "rest_area"
-      },
-      "forbidden_tags": [],
-      "area_check": "explicit_or_closed",
-      "access": {
-        "foot": true,
-        "bike": true,
-        "car": false
-      }
-    },
-    {
-      "name": "camping",
-      "description": "Campgrounds and camp sites",
-      "required_tags": {
-        "tourism": "camp_site"
       },
       "forbidden_tags": [],
       "area_check": "explicit_or_closed",

@@ -40,6 +40,14 @@ public class AreaAccessParser implements TagParser {
             "no", "private", "restricted", "military", "emergency", "agricultural", "forestry", "delivery"
     ));
 
+    // Per-edge length cap for area edges (meters). Area routing stores only the polygon
+    // BOUNDARY, so a long boundary segment is almost never a legitimate crossing of a small
+    // connector area (parking lot, plaza) — it is a perimeter run along a shoreline / field
+    // edge that the router would misuse as a through-route. Suppress access on area edges
+    // longer than this. Real highway ways are never affected (they return early above).
+    // Tunable: ~80 m stricter, ~120-150 m looser. See AreaEdgeRoutingDebugTest.
+    static final double MAX_AREA_EDGE_LENGTH_M = 100.0;
+
     private final BooleanEncodedValue bikeAccessEnc;
     private final BooleanEncodedValue footAccessEnc;
     private final AreaRoutingRules rules;
@@ -71,6 +79,18 @@ public class AreaAccessParser implements TagParser {
 
         // Check global forbidden tags
         if (hasGlobalForbiddenTag(way)) {
+            return;
+        }
+
+        // Size cap: suppress access on over-long area boundary edges (see MAX_AREA_EDGE_LENGTH_M).
+        // edge_distance is an artificial tag set per edge by OSMReader.setArtificialWayTags before
+        // tag parsing. Fail open if absent (should not happen for built edges).
+        double edgeDistance = way.getTag("edge_distance", Double.NaN);
+        if (!Double.isNaN(edgeDistance) && edgeDistance > MAX_AREA_EDGE_LENGTH_M) {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Skipping area access for over-long edge ({} m > {} m) on way {}",
+                        edgeDistance, MAX_AREA_EDGE_LENGTH_M, way.getId());
+            }
             return;
         }
 

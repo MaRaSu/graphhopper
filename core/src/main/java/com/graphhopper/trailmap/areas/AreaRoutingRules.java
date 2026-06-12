@@ -222,26 +222,6 @@ public class AreaRoutingRules {
         pedestrian.setAccess(Map.of("foot", true, "bike", true, "car", false));
         ruleList.add(pedestrian);
 
-        // Parks
-        Rule parks = new Rule();
-        parks.setName("parks");
-        parks.setDescription("Public parks with foot access");
-        parks.setRequiredTags(Map.of("leisure", "park"));
-        parks.setForbiddenTags(List.of());
-        parks.setAreaCheck("explicit_or_closed");
-        parks.setAccess(Map.of("foot", true, "bike", false, "car", false));
-        ruleList.add(parks);
-
-        // Recreation grounds
-        Rule recreation = new Rule();
-        recreation.setName("recreation_ground");
-        recreation.setDescription("Recreation grounds and sports fields");
-        recreation.setRequiredTags(Map.of("landuse", "recreation_ground"));
-        recreation.setForbiddenTags(List.of());
-        recreation.setAreaCheck("explicit_or_closed");
-        recreation.setAccess(Map.of("foot", true, "bike", false, "car", false));
-        ruleList.add(recreation);
-
         // Squares
         Rule squares = new Rule();
         squares.setName("squares");
@@ -252,16 +232,6 @@ public class AreaRoutingRules {
         squares.setAccess(Map.of("foot", true, "bike", true, "car", false));
         ruleList.add(squares);
 
-        // Service areas
-        Rule serviceAreas = new Rule();
-        serviceAreas.setName("service_areas");
-        serviceAreas.setDescription("Highway service areas (rest stops with amenities)");
-        serviceAreas.setRequiredTags(Map.of("highway", "services"));
-        serviceAreas.setForbiddenTags(List.of());
-        serviceAreas.setAreaCheck("explicit_or_closed");
-        serviceAreas.setAccess(Map.of("foot", true, "bike", true, "car", false));
-        ruleList.add(serviceAreas);
-
         // Rest areas
         Rule restAreas = new Rule();
         restAreas.setName("rest_areas");
@@ -271,16 +241,6 @@ public class AreaRoutingRules {
         restAreas.setAreaCheck("explicit_or_closed");
         restAreas.setAccess(Map.of("foot", true, "bike", true, "car", false));
         ruleList.add(restAreas);
-
-        // Campgrounds
-        Rule camping = new Rule();
-        camping.setName("camping");
-        camping.setDescription("Campgrounds and camp sites");
-        camping.setRequiredTags(Map.of("tourism", "camp_site"));
-        camping.setForbiddenTags(List.of());
-        camping.setAreaCheck("explicit_or_closed");
-        camping.setAccess(Map.of("foot", true, "bike", true, "car", false));
-        ruleList.add(camping);
 
         // Picnic sites
         Rule picnic = new Rule();
