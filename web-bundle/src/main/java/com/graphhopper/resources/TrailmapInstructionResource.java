@@ -62,8 +62,16 @@ public class TrailmapInstructionResource {
             RouteInstructionGenerator.Result result = generator.generate(request);
             postProcessor.process(result.instructions, request.getInstructionProfile());
 
+            // Derive each instruction's polyline interval from its coordinate-matched position on the
+            // FINAL (post-processed) list, not from cumulative getLength(). The latter desyncs by a
+            // point wherever an instruction's point count differs from its polyline span (e.g. a
+            // coordinates-gap resume coinciding with the next turn), which on a simplified polyline
+            // shows up as the turn marker drifting tens-to-hundreds of metres past the real turn.
+            List<Integer> intervalStarts =
+                    RouteInstructionGenerator.matchInstructionStarts(result.instructions, result.polyline);
+
             TrailmapInstructionResponse response = new TrailmapInstructionResponse();
-            response.setInstructions(serializeInstructions(result.instructions));
+            response.setInstructions(serializeInstructions(result.instructions, result.polyline, intervalStarts));
             response.setPoints(ResponsePathSerializer.encodePolyline(result.polyline, false, POLYLINE_PRECISION));
             response.setPointsEncoded(true);
             response.setPointsEncodedMultiplier(POLYLINE_PRECISION);
@@ -143,31 +151,52 @@ public class TrailmapInstructionResource {
     /**
      * Serialize InstructionList to the same JSON format as GH's InstructionListSerializer.
      */
-    private List<Map<String, Object>> serializeInstructions(InstructionList instructions) {
+    private List<Map<String, Object>> serializeInstructions(
+            InstructionList instructions, PointList polyline, List<Integer> intervalStarts) {
         List<Map<String, Object>> result = new ArrayList<>(instructions.size());
-        int pointsIndex = 0;
+        int lastPointIdx = Math.max(0, polyline.size() - 1);
 
-        for (Instruction instruction : instructions) {
+        for (int i = 0; i < instructions.size(); i++) {
+            Instruction instruction = instructions.get(i);
             Map<String, Object> instrJson = new LinkedHashMap<>();
 
             instrJson.put("text", Helper.firstBig(instruction.getTurnDescription(instructions.getTr())));
             instrJson.put("street_name", instruction.getName());
-            instrJson.put("time", instruction.getTime());
-            instrJson.put("distance", Helper.round(instruction.getDistance(), 3));
             instrJson.put("sign", instruction.getSign());
             Map<String, Object> extraInfo = instruction.getExtraInfoJSON();
-            for (String key : extraInfo.keySet()) {
+            for (Map.Entry<String, Object> e : extraInfo.entrySet()) {
+                String key = e.getKey();
+                if (key.startsWith("_")) continue;   // internal keys (e.g. _cum_route_m) are not for the client
                 if (RESERVED_INSTRUCTION_KEYS.contains(key)) {
                     throw new IllegalStateException("extraInfo key '" + key
                             + "' collides with reserved instruction field (sign=" + instruction.getSign()
                             + ", text=" + instruction.getTurnDescription(instructions.getTr()) + ")");
                 }
+                instrJson.put(key, e.getValue());
             }
-            instrJson.putAll(extraInfo);
 
-            int tmpIndex = pointsIndex + instruction.getLength();
-            instrJson.put("interval", Arrays.asList(pointsIndex, tmpIndex));
-            pointsIndex = tmpIndex;
+            // interval = [coordinate-matched start, next instruction's start] (last → final point).
+            // Derived from geometry position, so the start index lands exactly on this instruction's
+            // turn vertex regardless of point-count quirks. Tiles the polyline monotonically.
+            int startIdx = intervalStarts.get(i);
+            int endIdx = (i + 1 < intervalStarts.size()) ? intervalStarts.get(i + 1) : lastPointIdx;
+            instrJson.put("interval", Arrays.asList(startIdx, endIdx));
+
+            // distance over the interval span, so the "distance to next turn" agrees with where the
+            // marker sits. Identical to the leg distance on healthy routes; corrected where the marker moved.
+            double dist = 0;
+            for (int p = startIdx; p < endIdx; p++)
+                dist += DistanceCalcEarth.DIST_EARTH.calcDist(
+                        polyline.getLat(p), polyline.getLon(p), polyline.getLat(p + 1), polyline.getLon(p + 1));
+            instrJson.put("distance", Helper.round(dist, 3));
+
+            // time scaled to the corrected distance, keeping the per-instruction time/distance ratio
+            // (local speed) consistent. No-op on healthy routes where dist == the instruction's distance.
+            // Guarded on oldDist > 1 m (same threshold the remap uses) to avoid amplifying a near-zero leg.
+            long time = instruction.getTime();
+            double oldDist = instruction.getDistance();
+            if (oldDist > 1.0 && dist > 0) time = Math.round(time * (dist / oldDist));
+            instrJson.put("time", time);
 
             result.add(instrJson);
         }

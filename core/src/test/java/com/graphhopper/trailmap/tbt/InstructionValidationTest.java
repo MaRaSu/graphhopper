@@ -1426,6 +1426,64 @@ public class InstructionValidationTest {
                 "Cycleway fork should use angle-based sign, not KEEP_RIGHT");
     }
 
+    /**
+     * Paved road forks: the route bends ~34° left onto a paved road (Vanhamaantie →
+     * Teollisuustie, both asphalt) while a compacted/gravel minor road continues nearly
+     * straight (~10° off the incoming heading). The reframer must NOT relabel the left
+     * bend as "straight" (CONTINUE) just because the surface filter discounts the
+     * different-surface straight branch — a way going straight ahead owns the "straight"
+     * direction regardless of surface, so the route's bend is a real turn.
+     *
+     * Regression: previously the surface filter emptied the visible-alt set, the
+     * no-competition reframe demoted KEEP_LEFT → CONTINUE_ON_STREET ("suoraan"), and the
+     * fork was lost. The surface-blind straight-ahead reference now vetoes that demote.
+     *
+     * Origin: diagnoseGravelForkReframedToStraight in RouteInstructionGeneratorTest
+     */
+    @Test
+    void pavedRouteBendingFromGravelStraightAhead_notReframedToStraight() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("b2h7hiL9XChxVYy-zQGoL", 61.174563, 23.712415),
+                makeWaypoint("3D52rop44wsDQr1Ig6jdn", 61.175132, 23.711271)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("b2h7hiL9XChxVYy-zQGoL");
+        seg.setEnd("3D52rop44wsDQr1Ig6jdn");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        // The fork onto Teollisuustie.
+        Instruction forkInstr = null;
+        for (Instruction instr : result.instructions) {
+            if ("Teollisuustie".equals(instr.getName())) {
+                forkInstr = instr;
+                break;
+            }
+        }
+        assertNotNull(forkInstr,
+                "Expected an instruction onto Teollisuustie. "
+                + "Instructions: " + summarizeInstructions(result));
+
+        int sign = forkInstr.getSign();
+        assertNotEquals(Instruction.CONTINUE_ON_STREET, sign,
+                "Route bends ~34° left off a straight-ahead gravel road; the turn must NOT be "
+                + "reframed to CONTINUE (\"suoraan\"). " + summarizeInstructions(result));
+        assertTrue(sign == Instruction.KEEP_LEFT
+                        || sign == Instruction.TURN_SLIGHT_LEFT
+                        || sign == Instruction.TURN_LEFT,
+                "Fork onto Teollisuustie must keep a leftward sign (the rule chain emits KEEP_LEFT). "
+                + "Got: " + signName(sign) + ". " + summarizeInstructions(result));
+    }
+
     // ========== Test 11: Complex turns foot route — not collapsed to false join ==========
 
     /**
@@ -3363,5 +3421,136 @@ public class InstructionValidationTest {
             case Instruction.U_TURN_RIGHT: return "U_TURN_RIGHT";
             default: return "UNKNOWN(" + sign + ")";
         }
+    }
+
+    // ===================================================================================
+    // Interval-index correctness (TbT marker placement). The client locates each instruction
+    // by its polyline interval; these guard the two fixes that keep that index on the real turn.
+    // ===================================================================================
+
+    /**
+     * The client-facing interval index must be derived from each instruction's coordinate-matched
+     * polyline position (matchInstructionStarts), run on the FINAL post-processed list — not from
+     * cumulative getLength(). On the reported 152 km route this proves (a) the legacy getLength
+     * accounting drifted by a polyline point = hundreds of metres, and (b) the new interval start
+     * lands exactly on each instruction's turn vertex. Reuses the diagnostic payload.
+     */
+    @Test
+    void intervalStartsLandOnTurns_152kmRoute() throws Exception {
+        Assumptions.assumeTrue(hopper != null, "graph cache required");
+        TrailmapInstructionRequest request =
+                new ObjectMapper().readValue(RouteInstructionGeneratorTest.DRIFT_JSON, TrailmapInstructionRequest.class);
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        new InstructionPostProcessor().process(result.instructions, request.getInstructionProfile());
+        PointList poly = result.polyline;
+        int N = poly.size();
+        List<Integer> starts = RouteInstructionGenerator.matchInstructionStarts(result.instructions, poly);
+
+        assertEquals(result.instructions.size(), starts.size(), "one start per instruction");
+        int prev = 0;
+        for (int s : starts) {
+            assertTrue(s >= 0 && s < N, "start in bounds: " + s);
+            assertTrue(s >= prev, "starts monotonic non-decreasing");
+            prev = s;
+        }
+
+        double[] cum = new double[N];
+        for (int k = 1; k < N; k++)
+            cum[k] = cum[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    poly.getLat(k - 1), poly.getLon(k - 1), poly.getLat(k), poly.getLon(k));
+
+        // (a) the legacy getLength()-based interval drifted significantly here.
+        int acc = 0; double worstLegacyM = 0;
+        for (int i = 0; i < result.instructions.size(); i++) {
+            int legacyStart = Math.min(acc, N - 1);
+            worstLegacyM = Math.max(worstLegacyM, Math.abs(cum[legacyStart] - cum[starts.get(i)]));
+            acc += result.instructions.get(i).getLength();
+        }
+        assertTrue(worstLegacyM > 100.0,
+                "expected the legacy getLength interval to drift >100m on this route; was " + worstLegacyM);
+
+        // (b) the new interval start sits on each instruction's own turn vertex.
+        double worstNewM = 0; int worstI = -1;
+        for (int i = 0; i < result.instructions.size(); i++) {
+            Instruction ins = result.instructions.get(i);
+            if (i == 0 || ins.getSign() == Instruction.FINISH || ins.getPoints().size() == 0) continue;
+            int s = starts.get(i);
+            double d = DistanceCalcEarth.DIST_EARTH.calcDist(
+                    poly.getLat(s), poly.getLon(s), ins.getPoints().getLat(0), ins.getPoints().getLon(0));
+            if (d > worstNewM) { worstNewM = d; worstI = i; }
+        }
+        assertTrue(worstNewM < 1.0,
+                "interval start must sit on the instruction's turn vertex; worst=" + worstNewM
+                + "m at #" + worstI + " (" + (worstI >= 0 ? result.instructions.get(worstI).getName() : "") + ")");
+    }
+
+    /**
+     * Self-crossing routes: when the polyline passes the same coordinate X twice and a turn belongs to
+     * the 2ND pass with NO instruction anchor between the passes, the bare monotonic matcher took the
+     * 1st pass. The independent route-distance key (_cum_route_m, stamped by remap) resolves it to the
+     * 2nd pass. Also exercises the with-anchor and no-key (legacy fallback) paths.
+     */
+    @Test
+    void selfCrossingTurn_distanceAnchoredMatcher_resolvesTo2ndPass() {
+        Assumptions.assumeTrue(hopper != null, "translation needed");
+        Translation tr = hopper.getTranslationMap().getWithFallBack(Locale.ENGLISH);
+
+        // X (61.0010, 24.0010) appears at index 1 AND index 4.  0:A 1:X 2:B 3:C 4:X 5:D 6:E
+        double xLat = 61.0010, xLon = 24.0010;
+        PointList poly = new PointList(7, false);
+        poly.add(61.0000, 24.0000);
+        poly.add(xLat, xLon);
+        poly.add(61.0020, 24.0000);
+        poly.add(61.0015, 23.9990);
+        poly.add(xLat, xLon);
+        poly.add(61.0000, 24.0020);
+        poly.add(60.9990, 24.0030);
+
+        double[] pc = new double[7];
+        for (int k = 1; k < 7; k++)
+            pc[k] = pc[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    poly.getLat(k - 1), poly.getLon(k - 1), poly.getLat(k), poly.getLon(k));
+
+        PointList xPts = new PointList(1, false); xPts.add(xLat, xLon);
+        PointList aPts = new PointList(1, false); aPts.add(61.0000, 24.0000);
+        PointList ePts = new PointList(1, false); ePts.add(60.9990, 24.0030);
+
+        // Case 1: turn on the 2nd pass, NO anchor between the passes, distance key present → resolves to idx 4.
+        InstructionList noAnchor = new InstructionList(tr);
+        noAnchor.add(cum(new Instruction(Instruction.CONTINUE_ON_STREET, "start", aPts), 0));
+        noAnchor.add(cum(new Instruction(Instruction.TURN_LEFT, "turn-at-2nd-X", clonePts(xPts)), pc[4]));
+        noAnchor.add(cum(new Instruction(Instruction.FINISH, "", ePts), pc[6]));
+        assertEquals(4, RouteInstructionGenerator.matchInstructionStarts(noAnchor, poly).get(1),
+                "distance-anchored matcher resolves the turn to the 2nd pass even with no anchor between passes");
+
+        // Case 2: an anchor between the passes → also correct.
+        InstructionList withAnchor = new InstructionList(tr);
+        PointList cPts = new PointList(1, false); cPts.add(61.0015, 23.9990);
+        withAnchor.add(cum(new Instruction(Instruction.CONTINUE_ON_STREET, "start", clonePts(aPts)), 0));
+        withAnchor.add(cum(new Instruction(Instruction.TURN_RIGHT, "anchor-at-C", cPts), pc[3]));
+        withAnchor.add(cum(new Instruction(Instruction.TURN_LEFT, "turn-at-2nd-X", clonePts(xPts)), pc[4]));
+        withAnchor.add(cum(new Instruction(Instruction.FINISH, "", clonePts(ePts)), pc[6]));
+        assertEquals(4, RouteInstructionGenerator.matchInstructionStarts(withAnchor, poly).get(2),
+                "with an anchor between the passes, the 2nd pass is taken correctly too");
+
+        // Case 3: no distance key → graceful legacy fallback (first occurrence), no crash/cascade.
+        InstructionList noKey = new InstructionList(tr);
+        noKey.add(new Instruction(Instruction.CONTINUE_ON_STREET, "start", clonePts(aPts)));
+        noKey.add(new Instruction(Instruction.TURN_LEFT, "turn-at-2nd-X", clonePts(xPts)));
+        noKey.add(new Instruction(Instruction.FINISH, "", clonePts(ePts)));
+        assertEquals(1, RouteInstructionGenerator.matchInstructionStarts(noKey, poly).get(1),
+                "without the distance key, falls back to legacy first-occurrence behavior");
+    }
+
+    private static Instruction cum(Instruction instr, double cumRouteM) {
+        instr.setExtraInfo("_cum_route_m", cumRouteM);
+        return instr;
+    }
+
+    private static PointList clonePts(PointList p) {
+        PointList c = new PointList(p.size(), p.is3D());
+        for (int i = 0; i < p.size(); i++) c.add(p.getLat(i), p.getLon(i));
+        return c;
     }
 }

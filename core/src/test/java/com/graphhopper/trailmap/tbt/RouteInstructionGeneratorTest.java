@@ -660,6 +660,209 @@ public class RouteInstructionGeneratorTest {
         assertEquals(1, finishCount, "Should have exactly one FINISH instruction");
     }
 
+    // ===================================================================================
+    // Diagnostic: gravel fork reframed to "straight" (suoraan) — investigation only.
+    // Payload: single followRoads gravel segment, locale fi, snap_preventions=[ferry],
+    // no custom_model. Reframer demoted a real turn to CONTINUE_ON_STREET; the user
+    // reports a visible fork where the confusable alt looks straighter than the route.
+    // ===================================================================================
+    @Test
+    void diagnoseGravelForkReframedToStraight() {
+        final double wp1Lat = 61.174563, wp1Lng = 23.712415;
+        final double wp2Lat = 61.175132, wp2Lng = 23.711271;
+
+        TrailmapInstructionRequest req = new TrailmapInstructionRequest();
+        req.setWaypoints(List.of(
+                makeWaypoint("b2h7hiL9XChxVYy-zQGoL", wp1Lat, wp1Lng),
+                makeWaypoint("3D52rop44wsDQr1Ig6jdn", wp2Lat, wp2Lng)));
+        req.setSnapPreventions(List.of("ferry"));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("b2h7hiL9XChxVYy-zQGoL");
+        seg.setEnd("3D52rop44wsDQr1Ig6jdn");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+        req.setSegments(List.of(seg));
+        req.setInstructionProfile("gravel");
+        req.setLocale("fi");
+
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        EncodingManager em = hopper.getEncodingManager();
+        TranslationMap tm = hopper.getTranslationMap();
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(hopper, baseGraph, em, tm);
+
+        RouteInstructionGenerator.Result result = generator.generate(req);
+        assertNotNull(result);
+        new InstructionPostProcessor().process(result.instructions, req.getInstructionProfile());
+
+        System.out.println("\n===== GRAVEL FORK REFRAME DIAGNOSTIC =====");
+        System.out.println("Instructions: " + result.instructions.size()
+                + ", polyline points: " + result.polyline.size());
+        printInstructionsDetailed(result);
+
+        probeJunctions(baseGraph, em, wp1Lat, wp1Lng, wp2Lat, wp2Lng);
+    }
+
+    /**
+     * Replays the route at node granularity and, at every interior junction, reproduces
+     * the reframer's visual-alt collection (unfiltered explorer + surface filter + 75°/115°
+     * forward cone) so the alt-angle distribution the reframer saw is visible. Angles are
+     * LEFT-positive degrees, matching turn_angle_deg.
+     */
+    private void probeJunctions(BaseGraph baseGraph, EncodingManager em,
+                                double fromLat, double fromLng, double toLat, double toLng) {
+        GHRequest r = new GHRequest(fromLat, fromLng, toLat, toLng).setProfile("gravel");
+        r.setSnapPreventions(List.of("ferry"));
+        r.setPathDetails(List.of("edge_key"));
+        r.putHint("instructions", false);
+        r.putHint("calc_points", true);
+        GHResponse rsp = hopper.route(r);
+        assertFalse(rsp.hasErrors(), "probe routing failed: " + rsp.getErrors());
+
+        ResponsePath path = rsp.getBest();
+        List<PathDetail> keyDetails = path.getPathDetails().get("edge_key");
+        assertNotNull(keyDetails, "edge_key path details missing");
+
+        // Oriented edge sequence (from->to), dropping consecutive duplicate keys.
+        List<EdgeIteratorState> edges = new ArrayList<>();
+        int lastKey = Integer.MIN_VALUE;
+        for (PathDetail d : keyDetails) {
+            int key = ((Number) d.getValue()).intValue();
+            if (key == lastKey) continue;
+            edges.add(baseGraph.getEdgeIteratorStateForKey(key));
+            lastKey = key;
+        }
+
+        NodeAccess na = baseGraph.getNodeAccess();
+        EnumEncodedValue<PredictedHighway> phEnc =
+                em.getEnumEncodedValue(PredictedHighway.KEY, PredictedHighway.class);
+        EnumEncodedValue<PredictedSurface> psEnc =
+                em.getEnumEncodedValue(PredictedSurface.KEY, PredictedSurface.class);
+        EnumEncodedValue<RoadClass> rcEnc =
+                em.getEnumEncodedValue(RoadClass.KEY, RoadClass.class);
+        EdgeExplorer explorer = baseGraph.createEdgeExplorer();
+
+        System.out.println("\n----- JUNCTION GEOMETRY PROBE (" + edges.size() + " oriented edges) -----");
+        System.out.println("(angles LEFT-positive deg; '*' = collected by reframer visual-alt filter)");
+
+        for (int i = 0; i + 1 < edges.size(); i++) {
+            EdgeIteratorState inc = edges.get(i);
+            EdgeIteratorState route = edges.get(i + 1);
+            int jNode = inc.getAdjNode();
+            if (jNode != route.getBaseNode()) {
+                // orientation mismatch (snap artifact) — skip
+                continue;
+            }
+            double jLat = na.getLat(jNode), jLon = na.getLon(jNode);
+
+            // doublePrev mirrors the fork: 2nd-to-last incoming geometry point, else prev node.
+            PointList incGeo = inc.fetchWayGeometry(FetchMode.ALL);
+            double dpLat, dpLon;
+            if (incGeo.size() <= 2) {
+                dpLat = na.getLat(inc.getBaseNode());
+                dpLon = na.getLon(inc.getBaseNode());
+            } else {
+                dpLat = incGeo.getLat(incGeo.size() - 2);
+                dpLon = incGeo.getLon(incGeo.size() - 2);
+            }
+            double prevOrientation = AngleCalc.ANGLE_CALC.calcOrientation(dpLat, dpLon, jLat, jLon);
+
+            GHPoint routePt = InstructionsHelper.getPointForOrientationCalculation(route, na);
+            double routeDelta = InstructionsHelper.calculateOrientationDelta(
+                    jLat, jLon, routePt.getLat(), routePt.getLon(), prevOrientation);
+
+            PredictedHighway routePH = route.get(phEnc);
+            PredictedSurface routeSurf = route.get(psEnc);
+            PredictedSurface prevSurf = inc.get(psEnc);
+
+            // Enumerate physical alts at the junction.
+            List<String> altLines = new ArrayList<>();
+            int physicalAlts = 0;
+            EdgeIterator it = explorer.setBaseNode(jNode);
+            while (it.next()) {
+                if (it.getEdge() == route.getEdge() || it.getEdge() == inc.getEdge()) continue;
+                physicalAlts++;
+                GHPoint altPt = InstructionsHelper.getPointForOrientationCalculation(it, na);
+                double altDelta = InstructionsHelper.calculateOrientationDelta(
+                        jLat, jLon, altPt.getLat(), altPt.getLon(), prevOrientation);
+                PredictedHighway altPH = it.get(phEnc);
+                PredictedSurface altSurf = it.get(psEnc);
+                double absAlt = Math.abs(altDelta);
+
+                // Reframer collectVisualAltDeltas filters:
+                boolean surfaceDropped = probeSurfacesClearlyDiffer(altSurf, prevSurf)
+                        && probeSurfacesClearlyDiffer(altSurf, routeSurf);
+                boolean coneOk;
+                if (absAlt <= Math.toRadians(75)) {
+                    coneOk = true;
+                } else if (absAlt > Math.toRadians(115)) {
+                    coneOk = false;
+                } else {
+                    coneOk = probeIsConfusableFrom(routePH, altPH);
+                }
+                boolean collected = !surfaceDropped && coneOk;
+
+                altLines.add(String.format(
+                        "        %s alt edge=%d delta=%+.1f  PH=%s surf=%s rc=%s%s%s",
+                        collected ? "*" : " ", it.getEdge(), Math.toDegrees(altDelta),
+                        altPH, altSurf, it.get(rcEnc),
+                        surfaceDropped ? "  [surf-drop]" : "",
+                        (!coneOk) ? "  [cone-drop]" : ""));
+            }
+
+            System.out.printf("%n  junction node=%d (%.6f,%.6f)  routeDelta=%+.1f  routePH=%s routeSurf=%s  prevPH=%s prevSurf=%s  physicalAlts=%d%n",
+                    jNode, jLat, jLon, Math.toDegrees(routeDelta),
+                    routePH, routeSurf, inc.get(phEnc), prevSurf, physicalAlts);
+            for (String l : altLines) System.out.println(l);
+        }
+    }
+
+    private static boolean probeIsAsphalt(PredictedSurface s) {
+        return s == PredictedSurface.ASPHALT;
+    }
+
+    private static boolean probeSurfacesClearlyDiffer(PredictedSurface a, PredictedSurface b) {
+        if (a == PredictedSurface.ASPHALT_OR_UNPAVED || b == PredictedSurface.ASPHALT_OR_UNPAVED) return false;
+        return probeIsAsphalt(a) != probeIsAsphalt(b);
+    }
+
+    private static boolean probeIsConfusableFrom(PredictedHighway current, PredictedHighway alt) {
+        if (current == null || alt == null) return false;
+        switch (current) {
+            case PATH:
+            case OUTDOOR_PATH:
+                return alt == PredictedHighway.PATH || alt == PredictedHighway.OUTDOOR_PATH
+                        || alt == PredictedHighway.ROUGH_TRACK || alt == PredictedHighway.GOOD_TRACK
+                        || alt == PredictedHighway.FOOTWAY || alt == PredictedHighway.CITY_PATH;
+            case FOOTWAY:
+            case CITY_PATH:
+                return alt == PredictedHighway.PATH || alt == PredictedHighway.OUTDOOR_PATH
+                        || alt == PredictedHighway.FOOTWAY || alt == PredictedHighway.CITY_PATH
+                        || alt == PredictedHighway.ROUGH_TRACK;
+            case ROUGH_TRACK:
+                return alt == PredictedHighway.PATH || alt == PredictedHighway.OUTDOOR_PATH
+                        || alt == PredictedHighway.ROUGH_TRACK || alt == PredictedHighway.GOOD_TRACK
+                        || alt == PredictedHighway.CYCLEWAY || alt == PredictedHighway.OUTDOOR_WAY
+                        || alt == PredictedHighway.SERVICE_ROAD;
+            case GOOD_TRACK:
+                return alt == PredictedHighway.ROUGH_TRACK || alt == PredictedHighway.GOOD_TRACK
+                        || alt == PredictedHighway.CYCLEWAY || alt == PredictedHighway.OUTDOOR_WAY
+                        || alt == PredictedHighway.SERVICE_ROAD;
+            case CYCLEWAY:
+                return alt == PredictedHighway.ROUGH_TRACK || alt == PredictedHighway.GOOD_TRACK
+                        || alt == PredictedHighway.CYCLEWAY || alt == PredictedHighway.OUTDOOR_WAY
+                        || alt == PredictedHighway.FOOTWAY;
+            case OUTDOOR_WAY:
+                return alt == PredictedHighway.ROUGH_TRACK || alt == PredictedHighway.GOOD_TRACK
+                        || alt == PredictedHighway.CYCLEWAY || alt == PredictedHighway.OUTDOOR_WAY;
+            case SERVICE_ROAD:
+                return alt == PredictedHighway.ROUGH_TRACK || alt == PredictedHighway.GOOD_TRACK
+                        || alt == PredictedHighway.SERVICE_ROAD;
+            default:
+                return alt == current;
+        }
+    }
+
     /**
      * Diagnostic test for U-turn at segment boundary.
      * Routes two segments individually via standard GH (with instructions) to see what GH
@@ -10600,4 +10803,307 @@ public class RouteInstructionGeneratorTest {
         System.out.printf("  GENERATOR total = %.1f m  (factor %.2fx)%n",
                 genTotal, (cd1 + cd2 + cd3) > 0 ? genTotal / (cd1 + cd2 + cd3) : Double.NaN);
     }
+
+    // =====================================================================================
+    // TbT instruction DRIFT detector — diagnostic only (no production code touched).
+    //
+    // Context: on a long (152 km) loop route the client reports that each TbT instruction
+    // marker, which it places at the instruction's start index into the route polyline,
+    // progressively drifts away from the actual turn in the path. After remap, each
+    // instruction occupies a contiguous slice [startIdx, startIdx+getLength()) of the full
+    // polyline (cumulative — the same index the client uses). If remapInstructionGeometry()
+    // mis-anchors one instruction (its first graph node is not found near-exactly in the
+    // polyline → global-closest fallback jumps forward), the monotonic searchFrom poisons
+    // every later instruction and the whole tail drifts.
+    //
+    // Detection strategy (uses only the final Result; needs no ground-truth side channel):
+    //   For every instruction carrying a strong claimed turn (|turn_angle_deg| >= 35), compare
+    //   the claim against the ACTUAL local bearing change of the polyline at the index where
+    //   the instruction is placed. A well-placed turn shows a matching bend; a drifted turn
+    //   sits on near-straight geometry. We also locate the nearest polyline vertex whose real
+    //   bend matches the claim and report the signed along-route offset in metres = the drift.
+    //   The first instruction whose offset blows past tolerance is the poisoning event.
+    // =====================================================================================
+    @Test
+    void diagnoseTbtDrift_152km_loop() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(hopper != null, "graph cache required");
+
+        ObjectMapper mapper = new ObjectMapper();
+        TrailmapInstructionRequest request = mapper.readValue(DRIFT_JSON, TrailmapInstructionRequest.class);
+
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, hopper.getBaseGraph(), hopper.getEncodingManager(), hopper.getTranslationMap());
+        RouteInstructionGenerator.Result result = generator.generate(request);
+
+        InstructionList instrs = result.instructions;
+        PointList poly = result.polyline;
+        int N = poly.size();
+        assertTrue(N > 100, "expected a long polyline");
+
+        // Cumulative along-route distance per polyline vertex.
+        double[] cum = new double[N];
+        for (int i = 1; i < N; i++) {
+            cum[i] = cum[i - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    poly.getLat(i - 1), poly.getLon(i - 1), poly.getLat(i), poly.getLon(i));
+        }
+        System.out.printf("%n=== TbT DRIFT DETECTOR ===%n");
+        System.out.printf("instructions=%d  polylinePts=%d  routeLen=%.0f m%n",
+                instrs.size(), N, cum[N - 1]);
+
+        final double SPAN_M = 7.0;           // local bearing arm length (short = junction, not curve)
+        final double STRONG_TURN = 45.0;     // |turn_angle_deg| that MUST coincide with a real bend
+        final double NEAR_M = 18.0;          // window around the marker to look for the real bend
+        final double BEND_OK = 25.0;         // |bend| that counts as a genuine junction bend
+        final double SEARCH_M = 600.0;       // bounded window to estimate drift of a misplaced marker
+
+        // Per-instruction placed start index in the polyline (cumulative getLength()).
+        int[] startIdx = new int[instrs.size()];
+        int acc = 0;
+        for (int i = 0; i < instrs.size(); i++) {
+            startIdx[i] = Math.min(acc, N - 1);
+            acc += instrs.get(i).getLength();
+        }
+
+        // Helper: max |bend| over polyline vertices within +/-windowM of cum-distance `centerM`.
+        // Returns {bestSignedBend, alongOffsetToBest}. Robust to single-vertex zigzag noise.
+        // (inlined below)
+
+        int strongCount = 0, misplacedCount = 0, collapsedCount = 0;
+        int firstMisplaced = -1;
+        System.out.printf("%n%-4s %-14s %8s %9s %9s %7s %-10s  %s%n",
+                "idx", "sign", "claimDeg", "bendNear", "driftM", "lenPts", "flags", "name");
+
+        for (int i = 0; i < instrs.size(); i++) {
+            Instruction ins = instrs.get(i);
+            int sign = ins.getSign();
+            int s = startIdx[i];
+            Object ta = ins.getExtraInfoJSON().get("turn_angle_deg");
+            double claim = (ta instanceof Number) ? ((Number) ta).doubleValue() : Double.NaN;
+            int lenPts = ins.getLength();
+
+            List<String> flags = new ArrayList<>();
+            // COLLAPSED (noise-free): a real instruction (distance>10m) whose remapped polyline
+            // slice is a single point => remap stacked it onto its neighbour's index.
+            boolean collapsed = sign != Instruction.FINISH && lenPts <= 1 && ins.getDistance() > 10;
+            if (collapsed) { flags.add("COLLAPSED"); collapsedCount++; }
+
+            boolean strong = !Double.isNaN(claim) && Math.abs(claim) >= STRONG_TURN;
+            // Strongest real bend in the polyline within +/-NEAR_M of the placed marker.
+            double bendNear = 0;
+            if (s > 0 && s < N - 1) {
+                for (int j = 1; j < N - 1; j++) {
+                    if (Math.abs(cum[j] - cum[s]) > NEAR_M) continue;
+                    double bj = localBend(poly, cum, j, SPAN_M);
+                    if (Math.abs(bj) > Math.abs(bendNear)) bendNear = bj;
+                }
+            }
+
+            double driftM = Double.NaN;
+            if (strong) {
+                strongCount++;
+                if (Math.abs(bendNear) < BEND_OK) {
+                    // The marker sits on geometry that is straight within +/-NEAR_M, yet the
+                    // instruction claims a >=45 deg turn => the marker is OFF its real junction.
+                    // Estimate how far: nearest vertex (within +/-SEARCH_M) with a real same-sign bend.
+                    flags.add("MISPLACED");
+                    misplacedCount++;
+                    if (firstMisplaced < 0) firstMisplaced = i;
+                    double bestAbs = Double.MAX_VALUE;
+                    for (int j = 1; j < N - 1; j++) {
+                        double off = cum[j] - cum[s];
+                        if (Math.abs(off) > SEARCH_M) continue;
+                        double bj = localBend(poly, cum, j, SPAN_M);
+                        if (Math.abs(bj) >= BEND_OK && Math.signum(bj) == Math.signum(claim)
+                                && Math.abs(off) < bestAbs) { bestAbs = Math.abs(off); driftM = off; }
+                    }
+                }
+            }
+
+            if (!flags.isEmpty()) {
+                System.out.printf("%-4d %-14s %8s %9s %9s %7d %-10s  %s%n",
+                        i, signName(sign),
+                        Double.isNaN(claim) ? "-" : String.format("%.0f", claim),
+                        String.format("%.0f", bendNear),
+                        Double.isNaN(driftM) ? ">600" : String.format("%.0f", driftM),
+                        lenPts, String.join(",", flags), ins.getName());
+            }
+        }
+
+        System.out.printf("%n--- SUMMARY ---%n");
+        System.out.printf("strong turns (|claim|>=%.0f) evaluated = %d%n", STRONG_TURN, strongCount);
+        System.out.printf("MISPLACED markers (strong turn on straight geometry) = %d%n", misplacedCount);
+        System.out.printf("COLLAPSED instructions (zero-length slice) = %d%n", collapsedCount);
+        if (firstMisplaced >= 0) {
+            Instruction f = instrs.get(firstMisplaced);
+            System.out.printf("FIRST MISPLACED at instruction #%d sign=%s name=\"%s\" placedAlong=%.0f m%n",
+                    firstMisplaced, signName(f.getSign()), f.getName(), cum[startIdx[firstMisplaced]]);
+        } else {
+            System.out.println("No misplaced markers — every strong turn sits on a real bend.");
+        }
+    }
+
+    /**
+     * Reads the gated REMAP_DIAG log to pinpoint WHERE and WHY a marker's polyline anchor is wrong.
+     * For each coord-matched instruction it classifies the match as exact / fallback, and for
+     * fallbacks distinguishes the two root sub-causes:
+     *   (a) TRUE_NODE_BEHIND_CURSOR — the node matches near-exactly at an index < searchFrom, so the
+     *       monotonic forward search could not reach it (cursor poisoning from an earlier over-jump).
+     *   (b) NOT_IN_POLYLINE — no near-exact match anywhere (synthetic geometry vs simplified polyline
+     *       precision mismatch); the global-closest fallback then lands wherever is nearest.
+     */
+    @Test
+    void diagnoseTbtRemapMatching_152km_loop() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(hopper != null, "graph cache required");
+        ObjectMapper mapper = new ObjectMapper();
+        TrailmapInstructionRequest request = mapper.readValue(DRIFT_JSON, TrailmapInstructionRequest.class);
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, hopper.getBaseGraph(), hopper.getEncodingManager(), hopper.getTranslationMap());
+
+        RouteInstructionGenerator.REMAP_DIAG_LOG.clear();
+        RouteInstructionGenerator.REMAP_DIAG = true;
+        RouteInstructionGenerator.Result result;
+        try {
+            result = generator.generate(request);
+        } finally {
+            RouteInstructionGenerator.REMAP_DIAG = false;
+        }
+        List<double[]> log = RouteInstructionGenerator.REMAP_DIAG_LOG;
+        int N = result.polyline.size();
+        // ~degrees→metres for a manhattan lat+lon sum near lat 61 (rough, for readability only).
+        final double DEG2M = 90000.0;
+
+        String[] branchName = {"first", "FINISH", "hint", "emptyPts", "coord"};
+        System.out.printf("%n=== REMAP MATCHING DIAGNOSTIC ===  records=%d polylinePts=%d%n", log.size(), N);
+        System.out.printf("%-4s %-9s %5s %8s %7s %9s %8s %9s  %s%n",
+                "i", "branch", "sign", "searchFr", "chosen", "chosen~m", "gBestIdx", "gBest~m", "note");
+
+        int firstFallback = -1, firstBehind = -1;
+        int exact = 0, fbBehind = 0, fbNotInPoly = 0;
+        for (double[] r : log) {
+            int i = (int) r[0], branch = (int) r[1], sign = (int) r[2], searchFrom = (int) r[3], chosen = (int) r[4];
+            double chosenDist = r[5];
+            int gIdx = (int) r[6];
+            double gDist = r[7];
+            List<String> note = new ArrayList<>();
+            boolean show = branch != 4;
+            if (branch == 4) {
+                boolean isExact = chosenDist < 5e-6;
+                boolean gExact = gDist < 5e-6;
+                if (isExact) {
+                    exact++;
+                } else {
+                    if (firstFallback < 0) firstFallback = i;
+                    if (gExact && gIdx < searchFrom) {
+                        note.add("TRUE_NODE_BEHIND_CURSOR@" + gIdx + " (cursor=" + searchFrom + ")");
+                        fbBehind++;
+                        if (firstBehind < 0) firstBehind = i;
+                    } else if (!gExact) {
+                        note.add("NOT_IN_POLYLINE(globalBest~" + String.format("%.1f", gDist * DEG2M) + "m)");
+                        fbNotInPoly++;
+                    } else {
+                        note.add("FALLBACK(exact ahead@" + gIdx + "?)");
+                    }
+                    show = true;
+                }
+            }
+            if (show) {
+                System.out.printf("%-4d %-9s %5d %8d %7d %9s %8d %9s  %s%n",
+                        i, branchName[branch], sign, searchFrom, chosen,
+                        String.format("%.1f", chosenDist * DEG2M), gIdx,
+                        gDist == Double.MAX_VALUE ? "-" : String.format("%.1f", gDist * DEG2M),
+                        String.join(",", note));
+            }
+        }
+        System.out.printf("%n--- SUMMARY ---%n");
+        System.out.printf("coord-match: exact=%d  fallback(cursor-poisoned)=%d  fallback(not-in-polyline)=%d%n",
+                exact, fbBehind, fbNotInPoly);
+        if (firstFallback >= 0) System.out.printf("first FALLBACK at instruction #%d%n", firstFallback);
+        if (firstBehind >= 0) System.out.printf("first TRUE_NODE_BEHIND_CURSOR at instruction #%d%n", firstBehind);
+
+        // ============================================================================
+        // INDEX vs COORDINATE divergence.
+        // remap anchors each instruction at the COORDINATE `chosen` (exact). But the GH
+        // instruction contract exposes each instruction's polyline position as an INTERVAL =
+        // cumulative getLength(). When remap forces a COLLAPSED instruction (empty slice) to
+        // keep 1 point, Sigma getLength() runs ahead of the true polyline index. An index-based
+        // client then places every later instruction too far along — and it only ever grows.
+        // ============================================================================
+        InstructionList instrs = result.instructions;
+        double[] cum = new double[N];
+        for (int k = 1; k < N; k++)
+            cum[k] = cum[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    result.polyline.getLat(k - 1), result.polyline.getLon(k - 1),
+                    result.polyline.getLat(k), result.polyline.getLon(k));
+        int n = instrs.size();
+        int[] coordIdx = new int[n];
+        int[] len = new int[n];
+        for (int i = 0; i < n; i++) {
+            coordIdx[i] = (i < log.size()) ? (int) log.get(i)[4] : -1;
+            len[i] = instrs.get(i).getLength();
+        }
+        // Tiling injectors: an instruction whose point-count (getLength) != its coordinate span
+        // (coordIdx[i+1]-coordIdx[i]) shifts every later interval index. These are the culprits.
+        System.out.printf("%n-- tiling injectors (getLength != coordinate span) --%n");
+        System.out.printf("%-4s %8s %8s %6s %6s %6s  %s%n",
+                "i", "coordIdx", "nextCrd", "span", "len", "delta", "name/branch");
+        int runningDelta = 0;
+        for (int i = 0; i < n; i++) {
+            int span = (i + 1 < n) ? (coordIdx[i + 1] - coordIdx[i]) : (N - 1 - coordIdx[i]);
+            int delta = len[i] - span;
+            if (delta != 0) {
+                int branch = (i < log.size()) ? (int) log.get(i)[1] : -1;
+                System.out.printf("%-4d %8d %8d %6d %6d %6d  %s [%s]%n",
+                        i, coordIdx[i], (i + 1 < n ? coordIdx[i + 1] : N - 1), span, len[i], delta,
+                        instrs.get(i).getName(), branchName[Math.max(branch, 0)]);
+            }
+        }
+
+        System.out.printf("%n%-4s %8s %8s %8s %10s %7s  %s%n",
+                "i", "coordIdx", "intvlIdx", "dPts", "driftM", "lenPts", "name");
+        int acc = 0; int lastDriftPts = 0;
+        double maxDriftM = 0;
+        for (int i = 0; i < n; i++) {
+            Instruction ins = instrs.get(i);
+            int intervalIdx = Math.min(acc, N - 1);                       // cumulative getLength()
+            int dPts = intervalIdx - coordIdx[i];
+            double driftM = cum[Math.min(intervalIdx, N - 1)] - cum[Math.min(Math.max(coordIdx[i], 0), N - 1)];
+            if (Math.abs(driftM) > Math.abs(maxDriftM)) maxDriftM = driftM;
+            if (dPts != lastDriftPts || Math.abs(driftM) > 50) {
+                System.out.printf("%-4d %8d %8d %8d %10.0f %7d  %s%n",
+                        i, coordIdx[i], intervalIdx, dPts, driftM, ins.getLength(), ins.getName());
+            }
+            lastDriftPts = dPts;
+            acc += ins.getLength();
+        }
+        System.out.printf("Sigma getLength()=%d  polylinePts=%d  (diff=%d)%n", acc, N, acc - N);
+        System.out.printf("max index-vs-coordinate drift = %.0f m%n", maxDriftM);
+    }
+
+    /** Local bearing change (deg, +right) at polyline vertex k, measured over ~spanM arms each side. */
+    private static double localBend(PointList poly, double[] cum, int k, double spanM) {
+        int N = poly.size();
+        int a = k;
+        while (a > 0 && (cum[k] - cum[a]) < spanM) a--;
+        int b = k;
+        while (b < N - 1 && (cum[b] - cum[k]) < spanM) b++;
+        if (a == k || b == k) return 0;
+        double az1 = AngleCalc.ANGLE_CALC.calcAzimuth(poly.getLat(a), poly.getLon(a), poly.getLat(k), poly.getLon(k));
+        double az2 = AngleCalc.ANGLE_CALC.calcAzimuth(poly.getLat(k), poly.getLon(k), poly.getLat(b), poly.getLon(b));
+        // Return LEFT-positive to match this pipeline's turn_angle_deg convention
+        // (empirically TURN_LEFT carries positive turn_angle_deg, TURN_RIGHT negative).
+        return angDiff(az2, az1); // az1 - az2 normalized to [-180,180]; +counterclockwise = left
+    }
+
+    /** Signed normalized difference toAz - fromAz in (-180,180]. */
+    private static double angDiff(double fromAz, double toAz) {
+        double d = toAz - fromAz;
+        while (d > 180) d -= 360;
+        while (d <= -180) d += 360;
+        return d;
+    }
+
+    // Package-private so the regression test in InstructionValidationTest can reuse this exact payload.
+    static final String DRIFT_JSON = """
+{"waypoints":[{"id":"6e0459e4-48f3-4c81-9afd-fcec366940b4","coordinates":{"lat":61.463295,"lng":23.73266}},{"id":"b4632d35-1d94-4292-b865-923b1b39031d","coordinates":{"lat":61.46328876574603,"lng":23.733274229622193}},{"id":"103ef63e-c909-4a06-bc27-69d05ccf093c","coordinates":{"lat":61.4632063,"lng":23.7345019}},{"id":"15cff04f-8cc4-4c5a-adc8-4315a8f15207","coordinates":{"lat":61.463024,"lng":23.743151}},{"id":"d38ad9f7-35a8-4f63-81dc-4892b942a6ae","coordinates":{"lat":61.46293,"lng":23.74368}},{"id":"0080e3d8-0a2e-4125-95b5-a2aa33b8906b","coordinates":{"lat":61.456174206096165,"lng":23.738276471054917}},{"id":"d2a5b456-90cc-4cef-9bc6-f75441f72954","coordinates":{"lat":61.45579704859237,"lng":23.7375852103164}},{"id":"d38524df-f9ba-4ed9-a6ec-169a522ef432","coordinates":{"lat":61.45576,"lng":23.73687}},{"id":"a5362812-db70-4c76-85c9-ff1415d0e802","coordinates":{"lat":61.421502,"lng":23.744755}},{"id":"86fad099-5064-45db-9add-2b5b44e825a0","coordinates":{"lat":61.418412,"lng":23.75861}},{"id":"28d2e5d2-63f0-45e2-9d57-a73cd25a8055","coordinates":{"lat":61.418451,"lng":23.759329}},{"id":"d8062ccb-11d7-42b3-a126-126d365111e3","coordinates":{"lat":61.427773,"lng":23.820409}},{"id":"b622da8e-a461-45b9-8304-5b767a45be59","coordinates":{"lat":61.43154,"lng":23.845689}},{"id":"7255325b-3d2d-403a-bee3-6867cdd69898","coordinates":{"lat":61.4083,"lng":23.898363}},{"id":"6bdae948-7632-4752-86f8-708f0c6503e4","coordinates":{"lat":61.292235,"lng":24.008465}},{"id":"48643892-1432-4636-908c-3ad8fce7b602","coordinates":{"lat":61.28885,"lng":24.017077}},{"id":"4c44db26-adda-4909-a23e-820f39bd338e","coordinates":{"lat":61.28917,"lng":24.020702}},{"id":"365f3a91-db16-48ea-8e1d-3a28b85ba0da","coordinates":{"lat":61.28921,"lng":24.022144}},{"id":"4dc24553-0b87-4079-9758-d3a65c1eccfc","coordinates":{"lat":61.285121,"lng":24.02437}},{"id":"4f189262-7bc3-4fb5-bad5-1c803a273bc7","coordinates":{"lat":61.284446,"lng":24.031587}},{"id":"2d55b57b-cff2-4237-8fbe-220dc0a32854","coordinates":{"lat":61.283953,"lng":24.03619}},{"id":"1180ba85-c651-413f-a793-6ce3f291896e","coordinates":{"lat":61.278315,"lng":24.0315}},{"id":"b545749e-87f8-49f7-9e24-d02d3597e196","coordinates":{"lat":61.275238,"lng":24.029483}},{"id":"a1790a08-d980-4c10-84f4-eec24c3fba5f","coordinates":{"lat":61.274305,"lng":24.043595}},{"id":"331d0811-6630-43e7-ad7b-85062d4b62b1","coordinates":{"lat":61.267138,"lng":24.0599681}},{"id":"92ed3fee-e451-49fa-bd6b-d2f1f448993b","coordinates":{"lat":61.266737,"lng":24.0608145}},{"id":"14723008-0c5f-46db-b22e-351131169c44","coordinates":{"lat":61.253269,"lng":24.079394}},{"id":"5956f55b-b837-4580-a1ce-4239e3de1680","coordinates":{"lat":61.252422,"lng":24.079963}},{"id":"bff6e733-edb3-41d3-876b-f23c5bea451e","coordinates":{"lat":61.203419,"lng":24.061517}},{"id":"3541a3eb-7d25-425a-93ee-fb19f6c4ed1d","coordinates":{"lat":61.16942,"lng":24.036588}},{"id":"7299fb03-2a34-4da6-94cf-4fe38efd729b","coordinates":{"lat":61.168706,"lng":24.028923}},{"id":"6cd65514-b2a3-4397-b0e0-2b2ee5d686f4","coordinates":{"lat":61.16634,"lng":24.01966}},{"id":"93d88373-4991-457f-ad59-9b3224d16808","coordinates":{"lat":61.15679,"lng":24.00576}},{"id":"ad9e8c8a-9771-45e1-ad61-ef70a5b5804f","coordinates":{"lat":61.118689,"lng":23.870644}},{"id":"33585a0f-316a-4c93-a6ed-f32dc5bc1826","coordinates":{"lat":61.095233,"lng":23.804794}},{"id":"8a9e5954-a848-44ac-8716-0e7693c2bc01","coordinates":{"lat":61.150169,"lng":23.69409}},{"id":"93b0d405-60d5-4623-a59f-fd63f700316f","coordinates":{"lat":61.175126,"lng":23.710974}},{"id":"d6a43f73-0d73-419e-a558-4db8df5fe2f7","coordinates":{"lat":61.189228,"lng":23.718894}},{"id":"5376144a-d16c-4f2d-aa0b-0c095610579f","coordinates":{"lat":61.213967,"lng":23.752105}},{"id":"5730316e-91f7-4e47-a85f-e1c472d0c83e","coordinates":{"lat":61.215595,"lng":23.75234}},{"id":"08b3a5c0-214a-4bbd-85c7-c9c33014a124","coordinates":{"lat":61.215743,"lng":23.754292}},{"id":"ba9c450c-8d5b-40e3-9644-a5495cb0d778","coordinates":{"lat":61.215849,"lng":23.758798}},{"id":"17563a3a-f3d6-481f-99a0-4941be2ecc4d","coordinates":{"lat":61.215807,"lng":23.771999}},{"id":"f184ddb1-661d-403d-8662-4977d5cd2543","coordinates":{"lat":61.213812,"lng":23.770565}},{"id":"7f8d3d35-6f81-48a9-88c0-3f9698cf8623","coordinates":{"lat":61.21368,"lng":23.770711}},{"id":"3bda6ddc-ab75-48cd-99f1-187aefc83e39","coordinates":{"lat":61.202836,"lng":23.797112}},{"id":"891d65ef-6669-4c1c-89d9-b5d8084422f9","coordinates":{"lat":61.195685,"lng":23.834813}},{"id":"68046332-50aa-426b-9f06-57c2e9da0d89","coordinates":{"lat":61.30554,"lng":23.793444}},{"id":"a1ef593c-aad7-4c8f-aa8f-e8d8b6b027fc","coordinates":{"lat":61.350554,"lng":23.786497}},{"id":"d6987cff-ccb6-4dd8-8bab-561dd937bf5a","coordinates":{"lat":61.388736,"lng":23.757229}},{"id":"69a7aef2-126a-4940-a51e-9cefa9ead660","coordinates":{"lat":61.413732,"lng":23.729653}},{"id":"990ac286-9e87-4968-9579-68fdd57a2047","coordinates":{"lat":61.46291,"lng":23.743668}},{"id":"02805b98-a956-421b-acf7-bc1c53604b59","coordinates":{"lat":61.463118,"lng":23.737247}},{"id":"1cef867e-c0e2-48bd-9d58-7980e4a5e78d","coordinates":{"lat":61.46314,"lng":23.734501}},{"id":"5eb01de1-9a14-4e0d-8915-69d264037620","coordinates":{"lat":61.46322,"lng":23.733943}},{"id":"299a6094-75c7-4bbf-be4c-c032d0669d7e","coordinates":{"lat":61.463297,"lng":23.73248}}],"segments":[{"start":"6e0459e4-48f3-4c81-9afd-fcec366940b4","end":"b4632d35-1d94-4292-b865-923b1b39031d","type":"followRoads","profile":"gravel"},{"start":"b4632d35-1d94-4292-b865-923b1b39031d","end":"103ef63e-c909-4a06-bc27-69d05ccf093c","type":"coordinates","track_coordinates":[{"lat":61.46328876574603,"lng":23.733274229622193},{"lat":61.463269999999994,"lng":23.733273333333333},{"lat":61.46324,"lng":23.733886666666667},{"lat":61.4632063,"lng":23.7345019}]},{"start":"103ef63e-c909-4a06-bc27-69d05ccf093c","end":"15cff04f-8cc4-4c5a-adc8-4315a8f15207","type":"followRoads","profile":"gravel"},{"start":"15cff04f-8cc4-4c5a-adc8-4315a8f15207","end":"d38ad9f7-35a8-4f63-81dc-4892b942a6ae","type":"followRoads","profile":"gravel","initial_heading":91.19769225097313,"heading_penalty":60},{"start":"d38ad9f7-35a8-4f63-81dc-4892b942a6ae","end":"0080e3d8-0a2e-4125-95b5-a2aa33b8906b","type":"followRoads","profile":"gravel","initial_heading":242.4184431198513,"heading_penalty":60},{"start":"0080e3d8-0a2e-4125-95b5-a2aa33b8906b","end":"d2a5b456-90cc-4cef-9bc6-f75441f72954","type":"coordinates","track_coordinates":[{"lat":61.456174206096165,"lng":23.738276471054917},{"lat":61.45618538461538,"lng":23.738252307692306},{"lat":61.45592,"lng":23.73775},{"lat":61.45583,"lng":23.73728},{"lat":61.45585,"lng":23.73753},{"lat":61.45579704859237,"lng":23.7375852103164}]},{"start":"d2a5b456-90cc-4cef-9bc6-f75441f72954","end":"d38524df-f9ba-4ed9-a6ec-169a522ef432","type":"followRoads","profile":"gravel"},{"start":"d38524df-f9ba-4ed9-a6ec-169a522ef432","end":"a5362812-db70-4c76-85c9-ff1415d0e802","type":"followRoads","profile":"gravel","initial_heading":218.8809863979961,"heading_penalty":60},{"start":"a5362812-db70-4c76-85c9-ff1415d0e802","end":"86fad099-5064-45db-9add-2b5b44e825a0","type":"followRoads","profile":"gravel","initial_heading":125.73558814145916,"heading_penalty":60},{"start":"86fad099-5064-45db-9add-2b5b44e825a0","end":"28d2e5d2-63f0-45e2-9d57-a73cd25a8055","type":"followRoads","profile":"gravel","initial_heading":79.68124056884359,"heading_penalty":60},{"start":"28d2e5d2-63f0-45e2-9d57-a73cd25a8055","end":"d8062ccb-11d7-42b3-a126-126d365111e3","type":"followRoads","profile":"gravel","initial_heading":51.314100131916526,"heading_penalty":60},{"start":"d8062ccb-11d7-42b3-a126-126d365111e3","end":"b622da8e-a461-45b9-8304-5b767a45be59","type":"followRoads","profile":"gravel","initial_heading":70.3649468200164,"heading_penalty":60},{"start":"b622da8e-a461-45b9-8304-5b767a45be59","end":"7255325b-3d2d-403a-bee3-6867cdd69898","type":"followRoads","profile":"gravel","initial_heading":188.5374920657487,"heading_penalty":60},{"start":"7255325b-3d2d-403a-bee3-6867cdd69898","end":"6bdae948-7632-4752-86f8-708f0c6503e4","type":"followRoads","profile":"gravel","initial_heading":178.20133344158864,"heading_penalty":60},{"start":"6bdae948-7632-4752-86f8-708f0c6503e4","end":"48643892-1432-4636-908c-3ad8fce7b602","type":"followRoads","profile":"gravel","initial_heading":63.9592786704538,"heading_penalty":60},{"start":"48643892-1432-4636-908c-3ad8fce7b602","end":"4c44db26-adda-4909-a23e-820f39bd338e","type":"followRoads","profile":"gravel","initial_heading":357.77776559149123,"heading_penalty":60},{"start":"4c44db26-adda-4909-a23e-820f39bd338e","end":"365f3a91-db16-48ea-8e1d-3a28b85ba0da","type":"followRoads","profile":"gravel","initial_heading":87.78859336994473,"heading_penalty":60},{"start":"365f3a91-db16-48ea-8e1d-3a28b85ba0da","end":"4dc24553-0b87-4079-9758-d3a65c1eccfc","type":"followRoads","profile":"gravel","initial_heading":1.4152057539731333,"heading_penalty":60},{"start":"4dc24553-0b87-4079-9758-d3a65c1eccfc","end":"4f189262-7bc3-4fb5-bad5-1c803a273bc7","type":"followRoads","profile":"gravel","initial_heading":132.2615774279992,"heading_penalty":60},{"start":"4f189262-7bc3-4fb5-bad5-1c803a273bc7","end":"2d55b57b-cff2-4237-8fbe-220dc0a32854","type":"followRoads","profile":"gravel","initial_heading":105.46434134973063,"heading_penalty":60},{"start":"2d55b57b-cff2-4237-8fbe-220dc0a32854","end":"1180ba85-c651-413f-a793-6ce3f291896e","type":"followRoads","profile":"gravel","initial_heading":127.33986996782546,"heading_penalty":60},{"start":"1180ba85-c651-413f-a793-6ce3f291896e","end":"b545749e-87f8-49f7-9e24-d02d3597e196","type":"followRoads","profile":"gravel","initial_heading":229.97379980960983,"heading_penalty":60},{"start":"b545749e-87f8-49f7-9e24-d02d3597e196","end":"a1790a08-d980-4c10-84f4-eec24c3fba5f","type":"followRoads","profile":"gravel","initial_heading":178.57375600842366,"heading_penalty":60},{"start":"a1790a08-d980-4c10-84f4-eec24c3fba5f","end":"331d0811-6630-43e7-ad7b-85062d4b62b1","type":"followRoads","profile":"gravel","initial_heading":174.4771077732383,"heading_penalty":60},{"start":"331d0811-6630-43e7-ad7b-85062d4b62b1","end":"92ed3fee-e451-49fa-bd6b-d2f1f448993b","type":"coordinates","track_coordinates":[{"lat":61.267138,"lng":24.0599681},{"lat":61.26709,"lng":24.06053},{"lat":61.26677,"lng":24.06034},{"lat":61.26674,"lng":24.06082},{"lat":61.266737,"lng":24.0608145}]},{"start":"92ed3fee-e451-49fa-bd6b-d2f1f448993b","end":"14723008-0c5f-46db-b22e-351131169c44","type":"followRoads","profile":"gravel"},{"start":"14723008-0c5f-46db-b22e-351131169c44","end":"5956f55b-b837-4580-a1ce-4239e3de1680","type":"followRoads","profile":"gravel","initial_heading":109.67558114394218,"heading_penalty":60},{"start":"5956f55b-b837-4580-a1ce-4239e3de1680","end":"bff6e733-edb3-41d3-876b-f23c5bea451e","type":"followRoads","profile":"gravel","initial_heading":201.37747625463044,"heading_penalty":60},{"start":"bff6e733-edb3-41d3-876b-f23c5bea451e","end":"3541a3eb-7d25-425a-93ee-fb19f6c4ed1d","type":"followRoads","profile":"gravel","initial_heading":149.12847522064726,"heading_penalty":60},{"start":"3541a3eb-7d25-425a-93ee-fb19f6c4ed1d","end":"7299fb03-2a34-4da6-94cf-4fe38efd729b","type":"followRoads","profile":"gravel","initial_heading":260.1955022538789,"heading_penalty":60},{"start":"7299fb03-2a34-4da6-94cf-4fe38efd729b","end":"6cd65514-b2a3-4397-b0e0-2b2ee5d686f4","type":"followRoads","profile":"gravel","initial_heading":249.0246464977097,"heading_penalty":60},{"start":"6cd65514-b2a3-4397-b0e0-2b2ee5d686f4","end":"93d88373-4991-457f-ad59-9b3224d16808","type":"followRoads","profile":"gravel","initial_heading":237.76602582338901,"heading_penalty":60},{"start":"93d88373-4991-457f-ad59-9b3224d16808","end":"ad9e8c8a-9771-45e1-ad61-ef70a5b5804f","type":"followRoads","profile":"gravel","initial_heading":267.81766217800066,"heading_penalty":60},{"start":"ad9e8c8a-9771-45e1-ad61-ef70a5b5804f","end":"33585a0f-316a-4c93-a6ed-f32dc5bc1826","type":"followRoads","profile":"gravel","initial_heading":199.64141413538405,"heading_penalty":60},{"start":"33585a0f-316a-4c93-a6ed-f32dc5bc1826","end":"8a9e5954-a848-44ac-8716-0e7693c2bc01","type":"followRoads","profile":"gravel","initial_heading":327.29068131258015,"heading_penalty":60},{"start":"8a9e5954-a848-44ac-8716-0e7693c2bc01","end":"93b0d405-60d5-4623-a59f-fd63f700316f","type":"followRoads","profile":"gravel","initial_heading":275.5296741004616,"heading_penalty":60},{"start":"93b0d405-60d5-4623-a59f-fd63f700316f","end":"d6a43f73-0d73-419e-a558-4db8df5fe2f7","type":"followRoads","profile":"gravel","initial_heading":267.3306480521395,"heading_penalty":60},{"start":"d6a43f73-0d73-419e-a558-4db8df5fe2f7","end":"5376144a-d16c-4f2d-aa0b-0c095610579f","type":"followRoads","profile":"gravel","initial_heading":37.20711097784084,"heading_penalty":60},{"start":"5376144a-d16c-4f2d-aa0b-0c095610579f","end":"5730316e-91f7-4e47-a85f-e1c472d0c83e","type":"followRoads","profile":"gravel","initial_heading":351.57202147103226,"heading_penalty":60},{"start":"5730316e-91f7-4e47-a85f-e1c472d0c83e","end":"08b3a5c0-214a-4bbd-85c7-c9c33014a124","type":"followRoads","profile":"gravel","initial_heading":75.25227681248232,"heading_penalty":60},{"start":"08b3a5c0-214a-4bbd-85c7-c9c33014a124","end":"ba9c450c-8d5b-40e3-9644-a5495cb0d778","type":"followRoads","profile":"gravel","initial_heading":99.58006479373708,"heading_penalty":60},{"start":"ba9c450c-8d5b-40e3-9644-a5495cb0d778","end":"17563a3a-f3d6-481f-99a0-4941be2ecc4d","type":"followRoads","profile":"gravel","initial_heading":136.2608228380124,"heading_penalty":60},{"start":"17563a3a-f3d6-481f-99a0-4941be2ecc4d","end":"f184ddb1-661d-403d-8662-4977d5cd2543","type":"followRoads","profile":"gravel","initial_heading":199.4523380629909,"heading_penalty":60},{"start":"f184ddb1-661d-403d-8662-4977d5cd2543","end":"7f8d3d35-6f81-48a9-88c0-3f9698cf8623","type":"followRoads","profile":"gravel","initial_heading":220.30227222780155,"heading_penalty":60},{"start":"7f8d3d35-6f81-48a9-88c0-3f9698cf8623","end":"3bda6ddc-ab75-48cd-99f1-187aefc83e39","type":"followRoads","profile":"gravel","initial_heading":151.79370866400902,"heading_penalty":60},{"start":"3bda6ddc-ab75-48cd-99f1-187aefc83e39","end":"891d65ef-6669-4c1c-89d9-b5d8084422f9","type":"followRoads","profile":"gravel","initial_heading":131.5396506061344,"heading_penalty":60},{"start":"891d65ef-6669-4c1c-89d9-b5d8084422f9","end":"68046332-50aa-426b-9f06-57c2e9da0d89","type":"followRoads","profile":"gravel","initial_heading":354.7009822316387,"heading_penalty":60},{"start":"68046332-50aa-426b-9f06-57c2e9da0d89","end":"a1ef593c-aad7-4c8f-aa8f-e8d8b6b027fc","type":"followRoads","profile":"gravel","initial_heading":326.68907562769283,"heading_penalty":60},{"start":"a1ef593c-aad7-4c8f-aa8f-e8d8b6b027fc","end":"d6987cff-ccb6-4dd8-8bab-561dd937bf5a","type":"followRoads","profile":"gravel","initial_heading":270.00010311511204,"heading_penalty":60},{"start":"d6987cff-ccb6-4dd8-8bab-561dd937bf5a","end":"69a7aef2-126a-4940-a51e-9cefa9ead660","type":"followRoads","profile":"gravel","initial_heading":357.7613918776715,"heading_penalty":60},{"start":"69a7aef2-126a-4940-a51e-9cefa9ead660","end":"990ac286-9e87-4968-9579-68fdd57a2047","type":"followRoads","profile":"gravel","initial_heading":290.82764723045455,"heading_penalty":60},{"start":"990ac286-9e87-4968-9579-68fdd57a2047","end":"02805b98-a956-421b-acf7-bc1c53604b59","type":"followRoads","profile":"gravel","initial_heading":359.38204741785756,"heading_penalty":60},{"start":"02805b98-a956-421b-acf7-bc1c53604b59","end":"1cef867e-c0e2-48bd-9d58-7980e4a5e78d","type":"followRoads","profile":"gravel","initial_heading":271.9544174588452,"heading_penalty":60},{"start":"1cef867e-c0e2-48bd-9d58-7980e4a5e78d","end":"5eb01de1-9a14-4e0d-8915-69d264037620","type":"followRoads","profile":"gravel","initial_heading":273.81653029302043,"heading_penalty":60},{"start":"5eb01de1-9a14-4e0d-8915-69d264037620","end":"299a6094-75c7-4bbf-be4c-c032d0669d7e","type":"followRoads","profile":"gravel","initial_heading":273.01438937983727,"heading_penalty":60}],"instruction_profile":"gravel","locale":"fi","snap_preventions":["ferry"]}
+""";
 }

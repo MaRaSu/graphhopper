@@ -1034,8 +1034,33 @@ public class RouteInstructionGenerator {
      * We find that node's location in the full polyline by coordinate matching,
      * then slice the polyline at those boundaries.
      */
+    /**
+     * Diagnostic hook for the marker-drift investigation (off by default; no behavior change).
+     * When {@link #REMAP_DIAG} is true, {@link #remapInstructionGeometry} appends one record per
+     * instruction to {@link #REMAP_DIAG_LOG} describing how its polyline anchor was chosen. The
+     * decisive field is the GLOBAL best match (over the whole polyline): if the true node matches
+     * near-exactly at an index BEHIND searchFrom, the monotonic forward search could not reach it.
+     * Record layout (double[]):
+     *   [0]=instrIndex [1]=branch [2]=sign [3]=searchFrom [4]=chosenIdx [5]=chosenDist
+     *   [6]=globalBestIdx [7]=globalBestDist [8]=targetLat [9]=targetLon
+     * branch: 0=first(i==0) 1=FINISH 2=hint 3=emptyPts 4=coordMatch
+     */
+    static boolean REMAP_DIAG = false;
+    static final List<double[]> REMAP_DIAG_LOG = new ArrayList<>();
+
     private void remapInstructionGeometry(InstructionList instructions, PointList fullPolyline) {
         if (instructions.isEmpty() || fullPolyline.isEmpty()) return;
+
+        // Stamp an independent, monotonic position key on each instruction BEFORE the per-instruction
+        // distances are overwritten below: the cumulative synthetic route distance to each instruction.
+        // matchInstructionStarts() uses it to disambiguate repeated coordinates (self-crossings /
+        // out-and-backs) that bare coordinate matching cannot tell apart. It rides through
+        // post-processing on the surviving instructions and is dropped at serialization (internal "_" key).
+        double cumRouteM = 0;
+        for (Instruction instr : instructions) {
+            instr.setExtraInfo("_cum_route_m", cumRouteM);
+            cumRouteM += instr.getDistance();   // pre-remap leg length (synthetic; independent of matching)
+        }
 
         // For each instruction, determine its start index in the full polyline.
         // The first instruction starts at index 0, FINISH starts at the last point.
@@ -1046,11 +1071,15 @@ public class RouteInstructionGenerator {
 
             if (instr.getSign() == Instruction.FINISH) {
                 instrPolyStarts.add(fullPolyline.size() - 1);
+                if (REMAP_DIAG) REMAP_DIAG_LOG.add(new double[]{i, 1, instr.getSign(),
+                        -1, fullPolyline.size() - 1, 0, -1, 0, Double.NaN, Double.NaN});
                 continue;
             }
 
             if (i == 0) {
                 instrPolyStarts.add(0);
+                if (REMAP_DIAG) REMAP_DIAG_LOG.add(new double[]{i, 0, instr.getSign(),
+                        0, 0, 0, -1, 0, Double.NaN, Double.NaN});
                 continue;
             }
 
@@ -1063,12 +1092,17 @@ public class RouteInstructionGenerator {
                 hint = Math.max(hint, instrPolyStarts.get(instrPolyStarts.size() - 1));
                 hint = Math.min(hint, fullPolyline.size() - 1);
                 instrPolyStarts.add(hint);
+                if (REMAP_DIAG) REMAP_DIAG_LOG.add(new double[]{i, 2, instr.getSign(),
+                        instrPolyStarts.get(instrPolyStarts.size() - 2), hint, 0, -1, 0, Double.NaN, Double.NaN});
                 continue;
             }
 
             PointList instrPts = instr.getPoints();
             if (instrPts.size() == 0) {
                 instrPolyStarts.add(instrPolyStarts.get(instrPolyStarts.size() - 1));
+                if (REMAP_DIAG) REMAP_DIAG_LOG.add(new double[]{i, 3, instr.getSign(),
+                        instrPolyStarts.get(instrPolyStarts.size() - 1),
+                        instrPolyStarts.get(instrPolyStarts.size() - 1), 0, -1, 0, Double.NaN, Double.NaN});
                 continue;
             }
 
@@ -1098,6 +1132,17 @@ public class RouteInstructionGenerator {
                 if (bestDist < 5e-6) {
                     break;
                 }
+            }
+            if (REMAP_DIAG) {
+                // Unconstrained global best over the ENTIRE polyline (diagnostic only).
+                int gBestIdx = 0; double gBestDist = Double.MAX_VALUE;
+                for (int pi = 0; pi < fullPolyline.size(); pi++) {
+                    double dist = Math.abs(fullPolyline.getLat(pi) - targetLat)
+                            + Math.abs(fullPolyline.getLon(pi) - targetLon);
+                    if (dist < gBestDist) { gBestDist = dist; gBestIdx = pi; }
+                }
+                REMAP_DIAG_LOG.add(new double[]{i, 4, instr.getSign(),
+                        searchFrom, bestIdx, bestDist, gBestIdx, gBestDist, targetLat, targetLon});
             }
             instrPolyStarts.add(bestIdx);
         }
@@ -1153,6 +1198,144 @@ public class RouteInstructionGenerator {
         for (Instruction instr : instructions) {
             instr.getExtraInfoJSON().remove("_polyline_start_hint");
         }
+    }
+
+    /**
+     * Coordinate-match each instruction's first geometry point to the route polyline and return the
+     * per-instruction polyline start index. This is the same monotonic forward match
+     * {@link #remapInstructionGeometry} uses, but exposed so the {@code interval} indices sent to the
+     * client are derived from each instruction's ACTUAL geometry position rather than recomputed by
+     * cumulative {@code getLength()}.
+     * <p>
+     * Why this exists: {@code getLength()} (point count) only equals an instruction's polyline span
+     * when every instruction's geometry tiles the polyline exactly. It does not when an instruction's
+     * point count differs from its span — e.g. an empty slice forced to 1 point (a coordinates-gap
+     * resume that coincides with the next turn). A single such instruction shifts every later
+     * cumulative index by one, which on a simplified polyline can be hundreds of metres. Matching by
+     * coordinate makes each interval start land exactly on the instruction's turn vertex, independent
+     * of point counts. See docs/gh_tbt_instruction_pipeline.md.
+     * <p>
+     * Must be called on the FINAL instruction list (after {@link #remapInstructionGeometry} has set
+     * each instruction's geometry to polyline slices, and after any post-processing), so the first
+     * point of every instruction is a real polyline coordinate.
+     *
+     * @return a list of start indices, one per instruction, monotonically non-decreasing. The interval
+     *         for instruction {@code i} is {@code [starts.get(i), i+1<n ? starts.get(i+1) : polyline.size()-1]}.
+     */
+    public static List<Integer> matchInstructionStarts(InstructionList instructions, PointList polyline) {
+        List<Integer> starts = new ArrayList<>(instructions.size());
+        if (instructions.isEmpty()) return starts;
+        // Degenerate (no geometry): still return one entry per instruction so callers can index 1:1.
+        if (polyline.isEmpty()) {
+            for (int i = 0; i < instructions.size(); i++) starts.add(0);
+            return starts;
+        }
+        int n = polyline.size();
+
+        // Cumulative polyline distance per vertex — the scale against which each instruction's
+        // independent route-distance key (_cum_route_m) is compared to disambiguate repeated coordinates.
+        double[] polyCum = new double[n];
+        for (int k = 1; k < n; k++)
+            polyCum[k] = polyCum[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    polyline.getLat(k - 1), polyline.getLon(k - 1), polyline.getLat(k), polyline.getLon(k));
+
+        // Anchor = the last instruction placed with high confidence. A flagged/recovered instruction
+        // does NOT advance the anchor, so a single bad match cannot cascade down the rest of the route.
+        int anchorIdx = 0;
+        double anchorRouteM = readCumRouteM(instructions.get(0));
+
+        for (int i = 0; i < instructions.size(); i++) {
+            Instruction instr = instructions.get(i);
+            if (instr.getSign() == Instruction.FINISH) {
+                starts.add(n - 1);
+                continue;
+            }
+            if (i == 0) {
+                starts.add(0);
+                anchorIdx = 0;
+                anchorRouteM = readCumRouteM(instr);
+                continue;
+            }
+            PointList pts = instr.getPoints();
+            if (pts.size() == 0) {
+                // Defensive (remap guarantees >=1 point per non-FINISH instruction). Keep the output
+                // monotonic: a non-confident predecessor may have been placed ahead of the anchor.
+                starts.add(Math.max(anchorIdx, starts.get(starts.size() - 1)));
+                continue;
+            }
+
+            double targetLat = pts.getLat(0), targetLon = pts.getLon(0);
+            double cumThis = readCumRouteM(instr);
+            boolean haveKey = !Double.isNaN(cumThis) && !Double.isNaN(anchorRouteM);
+            // Expected polyline distance = the last confident position plus this leg's synthetic length.
+            // Only used to choose AMONG multiple occurrences — never to second-guess a unique match.
+            double expectedCum = haveKey ? polyCum[anchorIdx] + (cumThis - anchorRouteM) : Double.NaN;
+
+            // Scan from the anchor: count near-exact occurrences of this turn, remember the first and
+            // the one nearest the expected route distance, and the global-closest coordinate as a last resort.
+            int exactCount = 0, firstExact = -1, distBest = -1;
+            double distBestErr = Double.MAX_VALUE;
+            int closestIdx = anchorIdx; double closestCoord = Double.MAX_VALUE;
+            for (int pi = anchorIdx; pi < n; pi++) {
+                double cd = Math.abs(polyline.getLat(pi) - targetLat) + Math.abs(polyline.getLon(pi) - targetLon);
+                if (cd < closestCoord) { closestCoord = cd; closestIdx = pi; }
+                if (cd < 5e-6) {                                  // a near-exact occurrence of this turn
+                    exactCount++;
+                    if (firstExact < 0) firstExact = pi;
+                    double cumErr = haveKey ? Math.abs(polyCum[pi] - expectedCum) : 0.0;
+                    if (cumErr < distBestErr) { distBestErr = cumErr; distBest = pi; }
+                    if (!haveKey) break;                          // no key → first match wins (legacy behavior)
+                }
+            }
+
+            int idx;
+            boolean confident;
+            if (exactCount >= 1) {
+                // Unique match → take it (identical to the exact fix-1 behavior, no distance second-guessing).
+                // Multiple matches (a self-crossing) → take the occurrence nearest the expected route distance.
+                idx = haveKey ? distBest : firstExact;
+                confident = true;
+            } else {
+                // No near-exact match anywhere ahead (e.g. the point was simplified away, or a poisoned
+                // anchor put the true occurrence behind us). Place by expected distance so the error is
+                // CONTAINED to this one instruction, and don't trust it as the next anchor.
+                idx = haveKey ? indexNearestCum(polyCum, expectedCum, anchorIdx) : closestIdx;
+                confident = false;
+                LOGGER.warn("TbT interval: instruction #{} ('{}') has no near-exact polyline match "
+                        + "(closest ~{} m); best-effort placing at idx {} (single-instruction recovery)",
+                        i, instr.getName(), Math.round(closestCoord * DIAG_DEG_TO_M), idx);
+            }
+
+            // Guarantee monotonic output so intervals tile without reversal.
+            int prev = starts.get(starts.size() - 1);
+            if (idx < prev) idx = prev;
+            starts.add(idx);
+
+            if (confident) { anchorIdx = idx; anchorRouteM = cumThis; }
+        }
+        return starts;
+    }
+
+    /** ~manhattan-degrees→metres near lat 61, for human-readable log messages only. */
+    private static final double DIAG_DEG_TO_M = 90000.0;
+
+    private static double readCumRouteM(Instruction instr) {
+        Object v = instr.getExtraInfoJSON().get("_cum_route_m");
+        return (v instanceof Number) ? ((Number) v).doubleValue() : Double.NaN;
+    }
+
+    /** Lowest polyline index >= floor whose cumulative distance is nearest {@code target}. Monotonic,
+     *  so it yields a best-effort placement that cannot reverse the interval tiling. */
+    private static int indexNearestCum(double[] polyCum, double target, int floor) {
+        int n = polyCum.length;
+        if (Double.isNaN(target)) return Math.min(Math.max(floor, 0), n - 1);
+        int best = Math.min(Math.max(floor, 0), n - 1); double bestErr = Double.MAX_VALUE;
+        for (int pi = Math.max(0, floor); pi < n; pi++) {
+            double err = Math.abs(polyCum[pi] - target);
+            if (err < bestErr) { bestErr = err; best = pi; }
+            if (polyCum[pi] >= target) break;   // monotonic: past target, only gets farther
+        }
+        return best;
     }
 
     // ---- Polyline building ----

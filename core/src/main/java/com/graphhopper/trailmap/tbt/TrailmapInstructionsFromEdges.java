@@ -1575,6 +1575,19 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     private static final double REFRAMER_SHAPE1_ROUTE_NEAR_STRAIGHT = Math.toRadians(20);
     private static final double REFRAMER_SHAPE1_ALT_CLEARLY_OFF = Math.toRadians(60);
 
+    // Straight-ahead reference (surface-blind) — guards every "relabel the route as
+    // straight (CONTINUE)" outcome. The surface filter in collectVisualAltDeltas exists
+    // to discount confusable forks; it must NOT make the reframer blind to a way that
+    // simply continues straight ahead. A way going straight (regardless of surface)
+    // owns the "straight" direction, so the route's bend away from it is a real turn and
+    // must not be flattened to CONTINUE. A reference exists when some visible forward way
+    // (unfiltered explorer, any surface) stays within REFRAMER_STRAIGHT_AHEAD_BAND of the
+    // incoming heading AND is straighter than the route by at least
+    // REFRAMER_STRAIGHTER_THAN_ROUTE_MARGIN (so it only fires when an alt genuinely
+    // out-competes the route for "straight", not when the route itself is near-straight).
+    private static final double REFRAMER_STRAIGHT_AHEAD_BAND = Math.toRadians(30);
+    private static final double REFRAMER_STRAIGHTER_THAN_ROUTE_MARGIN = Math.toRadians(15);
+
     // Shape 6 — Soft real-turn. Demotes TURN_LEFT/RIGHT → TURN_SLIGHT_LEFT/RIGHT
     // at non-road junctions when the visible-alt distribution makes the turn
     // read as soft despite the geometric angle being past 40°.
@@ -1668,6 +1681,15 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                 sameSideMoreExtreme = true;
             }
         }
+
+        // Surface-blind straight-ahead reference. When some visible way continues straight
+        // ahead while the route bends clearly away from it, the route is NOT the straight
+        // option — forbid any demote-to-CONTINUE below. Computed without the surface filter
+        // so a different-surface straight way (e.g. a gravel road continuing while the paved
+        // route bends off) still anchors "straight". Does not affect KEEP upgrades or the
+        // soft-turn / past-slight demotes (those don't produce a "straight" label).
+        boolean straightAheadReference =
+                hasStraightAheadReferenceIgnoringSurface(baseNode, routeEdge, routeDelta);
 
         // Shape 4 (sandwich) past-slight branch — the route is past the slight bucket
         // but sits in the middle of a fan with at least one same-side alt that is more
@@ -1802,11 +1824,15 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         }
 
         // Shape 1 — no forward competitor visible. Demote slight to CONTINUE.
+        // Skipped when a surface-blind straight-ahead reference exists: the alt set being
+        // empty only means no same-surface competitor; a different-surface way going
+        // straight still makes the route's bend a real turn, so keep the rule-chain sign.
         if (altDeltas.isEmpty()) {
-            if (decidedSign == Instruction.TURN_SLIGHT_LEFT
-                    || decidedSign == Instruction.TURN_SLIGHT_RIGHT
-                    || decidedSign == Instruction.KEEP_LEFT
-                    || decidedSign == Instruction.KEEP_RIGHT) {
+            if (!straightAheadReference
+                    && (decidedSign == Instruction.TURN_SLIGHT_LEFT
+                        || decidedSign == Instruction.TURN_SLIGHT_RIGHT
+                        || decidedSign == Instruction.KEEP_LEFT
+                        || decidedSign == Instruction.KEEP_RIGHT)) {
                 lastReframerShape = "shape_1_no_competition";
                 return Instruction.CONTINUE_ON_STREET;
             }
@@ -1823,7 +1849,8 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         // bothNonRoadAtJunction).
         if (leftOfRoute && rightOfRoute) {
             double routeClamp = shape4RouteClampFor(routeDelta, altDeltas);
-            if (Math.abs(routeDelta) <= routeClamp
+            if (!straightAheadReference
+                    && Math.abs(routeDelta) <= routeClamp
                     && bothNonRoadAtJunction(routeEdge)
                     && (decidedSign == Instruction.TURN_SLIGHT_LEFT
                         || decidedSign == Instruction.TURN_SLIGHT_RIGHT
@@ -1903,7 +1930,8 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                 break;
             }
         }
-        if (routeIsNearStraight && allAltsClearlyOff
+        if (!straightAheadReference
+                && routeIsNearStraight && allAltsClearlyOff
                 && bothNonRoadAtJunction(routeEdge)
                 && (decidedSign == Instruction.TURN_SLIGHT_LEFT
                     || decidedSign == Instruction.TURN_SLIGHT_RIGHT
@@ -1913,6 +1941,34 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             return Instruction.CONTINUE_ON_STREET;
         }
         return decidedSign;
+    }
+
+    /**
+     * Surface-blind straight-ahead reference: is there a visible way leaving the junction
+     * (other than the route and the road just travelled) that continues roughly straight
+     * ahead AND is clearly straighter than the route? Read from the unfiltered explorer with
+     * NO surface filter — a way going straight owns the "straight" direction regardless of
+     * its surface, so the route's bend away from it is a real turn that must not be relabelled
+     * CONTINUE. The narrow band ({@link #REFRAMER_STRAIGHT_AHEAD_BAND}) inherently excludes
+     * back-legs and side-turns, so no separate forward-cone test is needed here.
+     */
+    private boolean hasStraightAheadReferenceIgnoringSurface(int baseNode, EdgeIteratorState routeEdge,
+                                                             double routeDelta) {
+        double routeAbs = Math.abs(routeDelta);
+        EdgeIterator iter = allExplorer.setBaseNode(baseNode);
+        while (iter.next()) {
+            if (iter.getEdge() == routeEdge.getEdge()) continue;
+            if (prevEdge != null && iter.getEdge() == prevEdge.getEdge()) continue;
+            GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(iter, nodeAccess);
+            double altDelta = InstructionsHelper.calculateOrientationDelta(
+                    prevLat, prevLon, altPoint.getLat(), altPoint.getLon(), prevOrientation);
+            double altAbs = Math.abs(altDelta);
+            if (altAbs <= REFRAMER_STRAIGHT_AHEAD_BAND
+                    && routeAbs - altAbs >= REFRAMER_STRAIGHTER_THAN_ROUTE_MARGIN) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
