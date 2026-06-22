@@ -61,10 +61,11 @@ public class GravelOutputWriter {
 
     /**
      * Write per-way styling attributes (way id → {@code gravel_scale}, {@code predicted_highway},
-     * {@code predicted_surface}), restricted to the retained qualifying ways. Consumed downstream
-     * only for map styling / verification; not part of the way-ID contract.
+     * {@code predicted_surface}, {@code connectivity}), restricted to the retained qualifying ways.
+     * Consumed downstream for map styling / PostGIS / verification; not part of the way-ID contract.
      */
-    public void writeWayAttributes(File file, Set<Long> wayIds, Map<Long, String[]> attrs)
+    public void writeWayAttributes(File file, Set<Long> wayIds, Map<Long, String[]> attrs,
+                                   Map<Long, String> connectivity)
             throws IOException {
         // Sorted by way id for deterministic, diff-friendly output.
         Map<String, Object> ways = new TreeMap<>(Comparator.comparingLong(Long::parseLong));
@@ -75,6 +76,10 @@ public class GravelOutputWriter {
             m.put("gravel_scale", a[0]);
             m.put("predicted_highway", a[1]);
             m.put("predicted_surface", a[2]);
+            // "through" (case A: through-route, 2-vertex-connected to the road grid) vs "island"
+            // (case B: standalone gravel cluster rescued by length). For downstream styling/PostGIS.
+            String conn = connectivity.get(wid);
+            if (conn != null) m.put("connectivity", conn);
             ways.put(Long.toString(wid), m);
         }
         Map<String, Object> root = new LinkedHashMap<>();

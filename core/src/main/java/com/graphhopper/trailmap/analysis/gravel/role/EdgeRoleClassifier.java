@@ -6,8 +6,10 @@
  */
 package com.graphhopper.trailmap.analysis.gravel.role;
 
+import com.graphhopper.routing.ev.BooleanEncodedValue;
 import com.graphhopper.routing.ev.EnumEncodedValue;
 import com.graphhopper.routing.ev.RoadClass;
+import com.graphhopper.routing.ev.VehicleAccess;
 import com.graphhopper.routing.util.EncodingManager;
 import com.graphhopper.trailmap.analysis.gravel.GravelAnalysisConfig;
 import com.graphhopper.trailmap.shared.GravelScale;
@@ -41,29 +43,43 @@ public class EdgeRoleClassifier {
     private final EnumEncodedValue<RoadClass> roadClassEnc;
     private final EnumEncodedValue<MtbScale> mtbScaleEnc;
     private final EnumEncodedValue<PredictedSurface> predictedSurfaceEnc;
+    /** Trailmap bike access (BikeAccessParser). Null if the build does not carry it — gate disabled. */
+    private final BooleanEncodedValue bikeAccessEnc;
 
     public EdgeRoleClassifier(GravelAnalysisConfig config,
                               EnumEncodedValue<GravelScale> gravelScaleEnc,
                               EnumEncodedValue<RoadClass> roadClassEnc,
                               EnumEncodedValue<MtbScale> mtbScaleEnc,
-                              EnumEncodedValue<PredictedSurface> predictedSurfaceEnc) {
+                              EnumEncodedValue<PredictedSurface> predictedSurfaceEnc,
+                              BooleanEncodedValue bikeAccessEnc) {
         this.config = config;
         this.gravelScaleEnc = gravelScaleEnc;
         this.roadClassEnc = roadClassEnc;
         this.mtbScaleEnc = mtbScaleEnc;
         this.predictedSurfaceEnc = predictedSurfaceEnc;
+        this.bikeAccessEnc = bikeAccessEnc;
     }
 
     /** Resolve EV handles from the encoding manager and build a classifier. */
     public static EdgeRoleClassifier create(GravelAnalysisConfig config, EncodingManager em) {
+        String bikeAccessKey = VehicleAccess.key("bike");
         return new EdgeRoleClassifier(config,
                 em.getEnumEncodedValue(GravelScale.KEY, GravelScale.class),
                 em.getEnumEncodedValue(RoadClass.KEY, RoadClass.class),
                 em.getEnumEncodedValue(MtbScale.KEY, MtbScale.class),
-                em.getEnumEncodedValue(PredictedSurface.KEY, PredictedSurface.class));
+                em.getEnumEncodedValue(PredictedSurface.KEY, PredictedSurface.class),
+                em.hasEncodedValue(bikeAccessKey) ? em.getBooleanEncodedValue(bikeAccessKey) : null);
     }
 
     public EdgeRole classify(EdgeIteratorState edge) {
+        // Access pre-gate: a way a bicycle cannot legally traverse in EITHER direction is excluded
+        // entirely (IGNORED) — it is neither gravel output nor a usable connector, exactly like a
+        // non-rideable pedestrian way (a gravel "loop" closing only through it is still a dead-end).
+        // bike_access is produced by BikeAccessParser, the authoritative Trailmap bike-access policy
+        // (blocks no/restricted/military/emergency/private), so the qualifying access values are
+        // decided there, never re-decided here.
+        if (!isBikeTraversable(edge))
+            return EdgeRole.IGNORED;
         GravelScale gravel = edge.get(gravelScaleEnc);
         RoadClass roadClass = edge.get(roadClassEnc);
         MtbScale mtb = edge.get(mtbScaleEnc);
@@ -71,27 +87,36 @@ public class EdgeRoleClassifier {
         return classify(gravel, roadClass, mtb, surface);
     }
 
+    /** True iff a bicycle may traverse the edge in at least one direction (or access is unavailable). */
+    private boolean isBikeTraversable(EdgeIteratorState edge) {
+        return bikeAccessEnc == null || edge.get(bikeAccessEnc) || edge.getReverse(bikeAccessEnc);
+    }
+
     /**
-     * Whether an (otherwise IGNORED) edge is eligible to act as a <b>Phase 2 connector</b>: a
-     * gravel_scale-eligible track or a connector-class path. Only meaningful when connectors are
-     * enabled; the caller applies it solely to edges the base cascade classified IGNORED.
+     * Whether an edge is eligible to act as a <b>Phase 2 connector</b>: a near-Target gravel way that
+     * just misses the Target bands. Candidacy is by {@code gravel_scale} band (a key of {@code
+     * connectorWeights}), gated by the same surface + bike-access rules as Target. Quality (the
+     * cost-per-metre weight) is read from {@code connectorWeights} by the caller. Pure-quality test —
+     * road class does not gate it (a near-Target track and a near-Target path are both candidates,
+     * differing only by their weight).
      */
     public boolean isConnectorCandidate(EdgeIteratorState edge) {
-        RoadClass roadClass = edge.get(roadClassEnc);
-        if (config.connectorPathClasses.contains(roadClass))
-            return true;
-        return roadClass == RoadClass.TRACK
-                && config.connectorTrackGravelScales.contains(edge.get(gravelScaleEnc));
+        if (!isBikeTraversable(edge))
+            return false;
+        if (config.excludedSurfaces.contains(edge.get(predictedSurfaceEnc)))
+            return false;
+        return config.connectorWeights.containsKey(edge.get(gravelScaleEnc));
     }
 
     /** Classify from decoded values; testable without an edge. {@code roadClass} is unused
      *  (kept for signature stability) — connectivity now comes from ALL edges being ANCHOR. */
     public EdgeRole classify(GravelScale gravel, RoadClass roadClass, MtbScale mtb,
                              PredictedSurface surface) {
-        // TARGET — qualifying gravel (a rideable gravel_scale, a gravel-family surface, and not a
-        // genuine MTB trail). Decided purely on gravel quality; road type does not gate it.
+        // TARGET — qualifying gravel: a rideable gravel_scale, a non-asphalt surface, and not a
+        // genuine MTB trail. gravel_scale carries the quality judgement; the surface gate only
+        // rejects paved / asphalt-ambiguous surfaces. Road type does not gate it.
         if (config.targetGravelScales.contains(gravel)
-                && config.targetSurfaces.contains(surface)
+                && !config.excludedSurfaces.contains(surface)
                 && !config.mtbTrailScales.contains(mtb))
             return EdgeRole.TARGET;
         // IGNORED — a non-rideable pedestrian way: excluded entirely, does NOT connect.

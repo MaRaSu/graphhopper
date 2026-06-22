@@ -35,6 +35,8 @@ public class AnalysisGraph {
     private final int[] nameHash;
     private final boolean[] backbone;
     private final boolean[] removed;
+    /** Connector cost-per-metre (quality weight) for CONNECTOR edges; 0 for others. Set post-build. */
+    private final double[] connectorWeight;
 
     // CSR adjacency: for node n, analysis-edge ids are adjEdges[adjStart[n] .. adjStart[n+1]).
     private final int[] adjStart;
@@ -55,6 +57,7 @@ public class AnalysisGraph {
         this.nameHash = nameHash;
         this.backbone = backbone;
         this.removed = new boolean[ghEdgeId.length];
+        this.connectorWeight = new double[ghEdgeId.length];
         this.adjStart = adjStart;
         this.adjEdges = adjEdges;
     }
@@ -110,6 +113,16 @@ public class AnalysisGraph {
     /** Reassign an edge's role. Used by the Phase 2 connector pre-pass (CONNECTOR → ANCHOR). */
     public void setRole(int e, EdgeRole r) {
         role[e] = r;
+    }
+
+    /** Connector cost-per-metre (quality weight); the connector resolver costs an edge as
+     *  {@code lengthM(e) * connectorWeight(e)}. 0 for non-connector edges. */
+    public double connectorWeight(int e) {
+        return connectorWeight[e];
+    }
+
+    public void setConnectorWeight(int e, double w) {
+        connectorWeight[e] = w;
     }
 
     public double lengthM(int e) {

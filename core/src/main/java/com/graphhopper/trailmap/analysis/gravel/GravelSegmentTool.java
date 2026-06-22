@@ -27,6 +27,7 @@ import com.graphhopper.trailmap.TrailmapGraphHopper;
 import com.graphhopper.trailmap.analysis.gravel.graph.AnalysisGraph;
 import com.graphhopper.trailmap.analysis.gravel.group.LogicalRoadGrouper;
 import com.graphhopper.trailmap.analysis.gravel.output.GravelOutputWriter;
+import com.graphhopper.trailmap.analysis.gravel.prune.ConnectorOutputClassifier;
 import com.graphhopper.trailmap.analysis.gravel.prune.ConnectorResolver;
 import com.graphhopper.trailmap.analysis.gravel.prune.GravelNetworkFilter;
 import com.graphhopper.trailmap.analysis.gravel.role.EdgeRole;
@@ -57,7 +58,7 @@ public class GravelSegmentTool {
      */
     private static final String ENCODED_VALUES =
             "road_class, surface, track_type, gravel_scale, mtb_scale, predicted_highway, "
-            + "predicted_surface, osm_way_id, road_name_hash";
+            + "predicted_surface, osm_way_id, road_name_hash, bike_access";
 
     /** KVStorage key under which OSMReader stores the street ref (Parameters.Details.STREET_REF). */
     private static final String STREET_REF = "street_ref";
@@ -71,6 +72,11 @@ public class GravelSegmentTool {
         public File waysFile, roadsFile, attrsFile, segmentsFile;
         /** way id → {gravel_scale, predicted_highway, predicted_surface} for TARGET edges (styling sugar). */
         public final java.util.Map<Long, String[]> wayAttrs = new java.util.HashMap<>();
+        /** way id → "through" (case A: 2-vertex-connected to the road grid) or "island" (case B:
+         *  standalone cluster rescued by τ). A way with both is labelled "through". */
+        public final java.util.Map<Long, String> wayConnectivity = new java.util.HashMap<>();
+        /** Ways carrying both a through-route edge and an island edge (labelled "through"). */
+        public int mixedConnectivityWays;
     }
 
     public static void main(String[] args) throws Exception {
@@ -88,9 +94,7 @@ public class GravelSegmentTool {
         cfg.requireSameRef = pm.getBool("gravel.require_same_ref", cfg.requireSameRef);
         cfg.emitUnnamed = pm.getBool("gravel.emit_unnamed", cfg.emitUnnamed);
         cfg.enableConnectors = pm.getBool("gravel.enable_connectors", cfg.enableConnectors);
-        cfg.connectorMaxChainLenM = pm.getDouble("gravel.connector_max_len_m", cfg.connectorMaxChainLenM);
-        cfg.connectorMinAttachmentPoints =
-                pm.getInt("gravel.connector_min_attachments", cfg.connectorMinAttachmentPoints);
+        cfg.connectorCostBudget = pm.getDouble("gravel.connector_cost_budget", cfg.connectorCostBudget);
         cfg.validate();
 
         run(cfg, pbf, graphLocation, new File(outDir));
@@ -115,27 +119,43 @@ public class GravelSegmentTool {
             LOGGER.info("Analysis graph: {} nodes, {} working edges (TARGET ∪ ANCHOR)",
                     ag.nodeCount(), ag.edgeCount());
 
-            // Phase 2 (optional): resolve bounded connector chains before pruning, so admitted
-            // connectors are part of the connectivity the filter sees. No-op when disabled.
+            // STEP 3 (toggle): resolve bounded connector chains, so admitted connectors join the
+            // connectivity the filter sees. No-op when disabled.
             if (cfg.enableConnectors) {
-                ConnectorResolver.Result cr = new ConnectorResolver(
-                        ag, cfg.connectorMaxChainLenM, cfg.connectorMinAttachmentPoints).resolve();
-                st.connectorChainsAdmitted = cr.admittedChains;
+                ConnectorResolver.Result cr =
+                        new ConnectorResolver(ag, cfg.connectorCostBudget).resolve();
+                st.connectorChainsAdmitted = cr.corridors;
                 st.connectorEdgesAdmitted = cr.admittedEdges;
                 st.connectorEdgesRemoved = cr.removedEdges;
-                LOGGER.info("Connector pre-pass (<= {}m, >= {} attachments): admitted {} chains "
-                        + "({} edges), dropped {} edges", cfg.connectorMaxChainLenM,
-                        cfg.connectorMinAttachmentPoints, cr.admittedChains, cr.admittedEdges,
-                        cr.removedEdges);
+                LOGGER.info("Step 3 connectors (budget {}): admitted {} corridors ({} edges), "
+                        + "dropped {} edges", cfg.connectorCostBudget, cr.corridors,
+                        cr.admittedEdges, cr.removedEdges);
             }
 
-            // Phase C/D: keep gravel that is 2-edge-connected to the real-road backbone (a genuine
-            // network); drop each dead-end cluster / island as a whole unit unless its total
-            // qualifying length meets the threshold.
-            st.prunedNotNetwork = new GravelNetworkFilter(ag, cfg.effectiveIslandThresholdM()).filter();
-            LOGGER.info("Network filter: dropped {} TARGET edges (whole dead-end clusters / islands "
-                    + "below the {}m qualifying-length threshold)",
-                    st.prunedNotNetwork, cfg.effectiveIslandThresholdM());
+            // Steps 1 (+2): keep gravel 2-vertex-connected to the road grid; rescue standalone
+            // clusters by τ when Step 2 is on (τ = ∞ disables it).
+            double tau = cfg.enableStandaloneRescue ? cfg.effectiveIslandThresholdM()
+                    : Double.POSITIVE_INFINITY;
+            GravelNetworkFilter filter = new GravelNetworkFilter(ag, tau, cfg.gridMinComponentCoreLenM);
+            GravelNetworkFilter.Verdict verdict = filter.analyze();
+            st.prunedNotNetwork = filter.filter(verdict);
+            // Output-correctness: drop admitted connectors that serve no RETAINED gravel (road-to-road
+            // connectors, or connectors orphaned when their gravel was pruned) so they cannot leak into
+            // qualifying output. Runs after the filter; cannot disconnect kept gravel.
+            if (cfg.enableConnectors) {
+                int orphans = ConnectorResolver.removeConnectorsNotServingGravel(ag);
+                st.connectorEdgesRemoved += orphans;
+                LOGGER.info("Step 3 connectors: dropped {} that serve no retained gravel", orphans);
+            }
+            // Output-only: split admitted connectors into needed (bridge) vs redundant. Never mutates
+            // connectivity — it runs on the already-filtered graph.
+            boolean[] neededConnector = cfg.enableConnectors && cfg.connectorMarkRedundant
+                    ? ConnectorOutputClassifier.classify(ag) : null;
+            collectConnectivity(ag, verdict, neededConnector, st);
+            LOGGER.info("Network filter (Step 2 {}): dropped {} TARGET edges; connectivity tagged "
+                    + "({} ways carry both through & island)",
+                    cfg.enableStandaloneRescue ? "on, τ=" + cfg.effectiveIslandThresholdM() + "m" : "off",
+                    st.prunedNotNetwork, st.mixedConnectivityWays);
 
             // Phase E: contiguous same-name logical-road grouping.
             LogicalRoadGrouper.Result result =
@@ -155,7 +175,7 @@ public class GravelSegmentTool {
             st.segmentsFile = new File(outDir, "retained_segments.json");
             writer.writeQualifyingWays(st.waysFile, result);
             writer.writeLogicalRoads(st.roadsFile, result);
-            writer.writeWayAttributes(st.attrsFile, result.allWayIds, st.wayAttrs);
+            writer.writeWayAttributes(st.attrsFile, result.allWayIds, st.wayAttrs, st.wayConnectivity);
             writer.writeRetainedSegments(st.segmentsFile, collectRetainedSegments(graph, ag));
             LOGGER.info("Wrote {}, {}, {} and {}", st.waysFile.getAbsolutePath(),
                     st.roadsFile.getAbsolutePath(), st.attrsFile.getAbsolutePath(),
@@ -230,7 +250,8 @@ public class GravelSegmentTool {
         java.util.Map<Long, java.util.List<double[]>> segs =
                 new java.util.TreeMap<>();
         for (int e = 0; e < ag.edgeCount(); e++) {
-            if (ag.isRemoved(e) || ag.role(e) != EdgeRole.TARGET) continue;
+            if (ag.isRemoved(e)
+                    || (ag.role(e) != EdgeRole.TARGET && ag.role(e) != EdgeRole.CONNECTOR)) continue;
             com.graphhopper.util.PointList pts = graph.getEdgeIteratorState(ag.ghEdgeId(e), ag.nodeB(e))
                     .fetchWayGeometry(com.graphhopper.util.FetchMode.TOWER_ONLY);
             int last = pts.size() - 1;
@@ -245,6 +266,40 @@ public class GravelSegmentTool {
         return Math.round(v * 1e7) / 1e7;
     }
 
+    /**
+     * Tag each retained OSM way as {@code "through"} (has a case-A edge: 2-vertex-connected to the
+     * road grid — a through-route you can ride into and out of) or {@code "island"} (only case-B
+     * edges: a standalone gravel cluster rescued by τ — a loop reached from a single point). A way
+     * carrying both kinds is "through" (it does reach the grid); such ways are counted separately.
+     */
+    private static void collectConnectivity(AnalysisGraph ag, GravelNetworkFilter.Verdict v,
+                                            boolean[] neededConnector, Stats st) {
+        java.util.Set<Long> hasThrough = new java.util.HashSet<>();
+        java.util.Set<Long> hasIsland = new java.util.HashSet<>();
+        java.util.Set<Long> hasNeededConn = new java.util.HashSet<>();
+        java.util.Set<Long> hasRedundantConn = new java.util.HashSet<>();
+        for (int e = 0; e < ag.edgeCount(); e++) {
+            if (ag.isRemoved(e)) continue;
+            long wid = ag.osmWayId(e);
+            if (ag.role(e) == EdgeRole.TARGET) {
+                if (v.keptA[e]) hasThrough.add(wid);
+                else if (v.keptB[e]) hasIsland.add(wid);
+            } else if (ag.role(e) == EdgeRole.CONNECTOR) {
+                // surviving CONNECTOR = admitted by the resolver; needed (bridge) vs redundant (loop).
+                if (neededConnector == null || neededConnector[e]) hasNeededConn.add(wid);
+                else hasRedundantConn.add(wid);
+            }
+        }
+        // Precedence (lowest first; later puts win): redundant connector < connector < island < through.
+        for (Long wid : hasRedundantConn) st.wayConnectivity.put(wid, "connector_redundant");
+        for (Long wid : hasNeededConn) st.wayConnectivity.put(wid, "connector");
+        for (Long wid : hasIsland) {
+            if (hasThrough.contains(wid)) st.mixedConnectivityWays++;
+            else st.wayConnectivity.put(wid, "island");
+        }
+        for (Long wid : hasThrough) st.wayConnectivity.put(wid, "through");
+    }
+
     /** Phase A→B: single pass over all edges, classify, keep TARGET ∪ ANCHOR. */
     static AnalysisGraph buildAnalysisGraph(BaseGraph graph, EncodingManager em,
                                             GravelAnalysisConfig cfg, Stats st) {
@@ -255,25 +310,33 @@ public class GravelSegmentTool {
                 em.getEnumEncodedValue(RoadClass.KEY, RoadClass.class);
         EnumEncodedValue<GravelScale> gravelScaleEnc =
                 em.getEnumEncodedValue(GravelScale.KEY, GravelScale.class);
+        EnumEncodedValue<com.graphhopper.trailmap.shared.MtbScale> mtbScaleEnc =
+                em.getEnumEncodedValue(com.graphhopper.trailmap.shared.MtbScale.KEY,
+                        com.graphhopper.trailmap.shared.MtbScale.class);
         EnumEncodedValue<PredictedHighway> predictedHighwayEnc =
                 em.getEnumEncodedValue(PredictedHighway.KEY, PredictedHighway.class);
         EnumEncodedValue<PredictedSurface> predictedSurfaceEnc =
                 em.getEnumEncodedValue(PredictedSurface.KEY, PredictedSurface.class);
 
         AnalysisGraph.Builder builder = new AnalysisGraph.Builder();
+        java.util.List<Double> connectorWeights = new java.util.ArrayList<>();
         AllEdgesIterator iter = graph.getAllEdges();
         while (iter.next()) {
             EdgeRole role = classifier.classify(iter);
+            boolean backboneAnchor = role == EdgeRole.ANCHOR
+                    && cfg.backboneRoadClasses.contains(iter.get(roadClassEnc));
+            // STEP 3 candidate = a near-Target gravel way (gravel_scale just below Target, by band),
+            // that is neither Target nor real-road backbone. The connector pre-pass resolves which
+            // weighted corridors are admitted into connectivity; the rest are dropped.
+            if (cfg.enableConnectors && role != EdgeRole.TARGET && !backboneAnchor
+                    && classifier.isConnectorCandidate(iter))
+                role = EdgeRole.CONNECTOR;
             if (role == EdgeRole.IGNORED) {
-                // Phase 2: a normally-IGNORED path / gravel-4 track may be a connector candidate;
-                // admit it as a (transient) CONNECTOR for the pre-pass to resolve. Else skip.
-                if (cfg.enableConnectors && classifier.isConnectorCandidate(iter)) {
-                    role = EdgeRole.CONNECTOR;
-                } else {
-                    st.ignoredEdges++;
-                    continue;
-                }
+                st.ignoredEdges++;
+                continue;
             }
+
+            double connWeight = 0;
             if (role == EdgeRole.TARGET) {
                 st.targetEdges++;
                 // Capture styling attributes once per way (a way's edges share its OSM tags).
@@ -282,22 +345,29 @@ public class GravelSegmentTool {
                         iter.get(predictedSurfaceEnc).toString()});
             } else if (role == EdgeRole.CONNECTOR) {
                 st.connectorEdges++;
+                connWeight = cfg.connectorWeight(iter.get(gravelScaleEnc), iter.get(mtbScaleEnc));
+                // Connectors are emitted too (distinct connectivity tag) — capture their attrs.
+                st.wayAttrs.putIfAbsent((long) iter.get(osmWayIdEnc), new String[]{
+                        iter.get(gravelScaleEnc).toString(), iter.get(predictedHighwayEnc).toString(),
+                        iter.get(predictedSurfaceEnc).toString()});
             } else {
                 st.anchorEdges++;
             }
 
-            // Real-road backbone: an ANCHOR edge of a drivable/cycleway class anchors a non-dead-end
-            // (Phase C). Rough/ground ANCHOR tracks carry connectivity but are not backbone.
-            boolean backbone = role == EdgeRole.ANCHOR
-                    && cfg.backboneRoadClasses.contains(iter.get(roadClassEnc));
+            // Real-road backbone: an ANCHOR edge of a drivable/cycleway class anchors a non-dead-end.
+            boolean backbone = backboneAnchor;
             Object refVal = iter.getValue(STREET_REF);
             builder.addEdge(iter.getEdge(), iter.getBaseNode(), iter.getAdjNode(), role,
                     iter.getDistance(), iter.get(osmWayIdEnc), iter.getName(),
                     refVal == null ? null : refVal.toString(), iter.get(roadNameHashEnc), backbone);
+            connectorWeights.add(connWeight);
         }
         LOGGER.info("Role classification: {} TARGET, {} ANCHOR, {} IGNORED, {} CONNECTOR candidate",
                 st.targetEdges, st.anchorEdges, st.ignoredEdges, st.connectorEdges);
-        return builder.build(graph.getNodes());
+        AnalysisGraph ag = builder.build(graph.getNodes());
+        for (int i = 0; i < connectorWeights.size(); i++)
+            ag.setConnectorWeight(i, connectorWeights.get(i));
+        return ag;
     }
 
     private GravelSegmentTool() {

@@ -13,7 +13,9 @@ import com.graphhopper.trailmap.shared.GravelScale;
 import com.graphhopper.trailmap.shared.MtbScale;
 import com.graphhopper.trailmap.shared.PredictedSurface;
 
+import java.util.EnumMap;
 import java.util.EnumSet;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -36,15 +38,15 @@ public class GravelAnalysisConfig {
             EnumSet.of(GravelScale.ZERO, GravelScale.ZERO_PLUS, GravelScale.ONE);
 
     /**
-     * {@code predicted_surface} values a TARGET way must also have. A way qualifies as gravel only
-     * if its {@code gravel_scale} is in {@link #targetGravelScales} <b>and</b> its predicted surface
-     * is one of these — keeping genuine gravel/compacted surfaces and excluding paved/rough/ground.
-     * Defaults: {@code COMPACTED} (well-maintained), {@code FINE_GRAVEL} (outdoor paths),
-     * {@code MEDIUM_GRAVEL} (rideable but slower).
+     * {@code predicted_surface} values that DISQUALIFY a way from TARGET — i.e. "non-asphalt"
+     * surfaces only are gravel. {@code gravel_scale} already decides gravel quality (rough/sand/mud
+     * land in non-target scales), so the surface gate just rejects paved and asphalt-ambiguous
+     * surfaces. A previous whitelist {COMPACTED, FINE_GRAVEL, MEDIUM_GRAVEL} wrongly dropped
+     * gravel-quality {@code GROUND} tracks (OSM {@code surface=dirt} → GROUND) — a category-
+     * definition error the client corrected.
      */
-    public Set<PredictedSurface> targetSurfaces =
-            EnumSet.of(PredictedSurface.COMPACTED, PredictedSurface.FINE_GRAVEL,
-                    PredictedSurface.MEDIUM_GRAVEL);
+    public Set<PredictedSurface> excludedSurfaces =
+            EnumSet.of(PredictedSurface.ASPHALT, PredictedSurface.ASPHALT_OR_UNPAVED);
 
     /**
      * Road classes that are IGNORED (excluded from the graph entirely — neither output nor
@@ -99,44 +101,102 @@ public class GravelAnalysisConfig {
             RoadClass.TERTIARY, RoadClass.RESIDENTIAL, RoadClass.UNCLASSIFIED, RoadClass.SERVICE,
             RoadClass.LIVING_STREET, RoadClass.ROAD, RoadClass.CYCLEWAY);
 
-    // --- Phase 2: bounded connector chains (toggleable; default OFF) ---
+    // --- Pipeline stage toggles (each stage can be excluded independently for testing) ---
 
     /**
-     * Master switch for Phase 2 connectors. When {@code false} (default) the pipeline is pure
-     * Phase 1: paths and gravel_scale-4 tracks stay IGNORED and the run is exactly the Phase-1
-     * result — so Phase 1 and Phase 2 can be validated independently. When {@code true}, normally-
-     * IGNORED ways that match the connector criteria below are admitted as bounded connector chains
-     * (promoted to ANCHOR connectivity) so that two otherwise-separate gravel pieces count as one.
+     * STEP 2 master switch (default ON). When ON, standalone gravel clusters whose looped core
+     * totals ≥ {@link #gravelSizeThresholdM} are rescued (goal §6 case B). When OFF, only case A
+     * survives — pure Step 1.
      */
-    public boolean enableConnectors = false;
+    public boolean enableStandaloneRescue = true;
 
     /**
-     * Maximum total length (metres) of a connector chain that may be admitted. A chain longer than
-     * this is not a "short crossing" and is dropped. Per spec §3 a connector is a <i>chain</i>, not a
-     * single edge — the bound is on cumulative chain length, which is why this needs a traversal,
-     * not a stateless filter. Tunable; the starting value is a short crossing, not a route leg.
+     * STEP 3 master switch (default ON). When ON, bounded connector chains (edges that are neither
+     * road R nor gravel T — i.e. tracks and paths) that bridge otherwise-separate gravel are
+     * admitted into the connectivity used by Steps 1–2, so gravel that loops/links only through such
+     * a short crossing is recognised. When OFF, the base graph is exactly R ∪ T.
      */
-    public double connectorMaxChainLenM = 200.0;
+    public boolean enableConnectors = true;
 
     /**
-     * {@code road_class == TRACK} gravel scales eligible to act as a connector when {@link
-     * #enableConnectors}. Default {@code {FOUR}} — the hike-a-bike tracks that are IGNORED in
-     * Phase 1 but may legitimately bridge two gravel networks over a short distance.
+     * Connector candidacy + cost is <b>scored by quality</b>, not a flat length limit. A way is a
+     * connector candidate iff its {@code gravel_scale} is a key here (and it passes the same surface
+     * + bike-access gates as Target); the value is its <b>cost-per-metre weight</b>. A corridor of
+     * connectors is admitted iff the cheapest weighted path bridging two distinct attachment points
+     * costs ≤ {@link #connectorCostBudget}. So a good-but-not-Target band (e.g. {@code TWO}) is light
+     * and can stretch far, while a hike-a-bike band ({@code FOUR}) is heavy and only a few metres fit
+     * the budget — yet both may appear in the same corridor, each spending from the shared budget in
+     * proportion to how bad it is. The Target bands ({@link #targetGravelScales}) must NOT appear here
+     * (they are output, not glue). Tune per run to get "easy gravel" (lighter weights / bigger budget)
+     * vs "extreme gravel" (stricter) outputs.
      */
-    public Set<GravelScale> connectorTrackGravelScales = EnumSet.of(GravelScale.FOUR);
+    public Map<GravelScale, Double> connectorWeights = defaultConnectorWeights();
+
+    private static Map<GravelScale, Double> defaultConnectorWeights() {
+        Map<GravelScale, Double> w = new EnumMap<>(GravelScale.class);
+        w.put(GravelScale.TWO, 1.0);    // good-but-not-Target: reach = budget
+        w.put(GravelScale.THREE, 2.5);  // rougher
+        w.put(GravelScale.FOUR, 10.0);  // hike-a-bike: only a few metres fit the budget
+        return w;
+    }
 
     /**
-     * Pedestrian road classes eligible to act as a connector when {@link #enableConnectors}.
-     * Default {@code {PATH}} — a short path may bridge gravel; footway/steps stay excluded.
+     * Per-{@code mtb_scale} overrides of the connector weight, keyed by gravel band then mtb band —
+     * the connector analogue of how the gravel-routing profile lowers speed/priority for technical
+     * tracks (e.g. {@code gravel_scale==TWO && mtb_scale==ONE}). When a connector edge matches an entry
+     * here, this weight is used instead of {@link #connectorWeights}; otherwise the gravel-band weight
+     * applies. Default: a "hard gravel" {@code TWO} that is also MTB-technical ({@code mtb_scale==ONE})
+     * costs like a {@code THREE} (2.5) — it is harder to ride than a plain hard-gravel track. Candidacy
+     * is unaffected (still by {@link #connectorWeights} band); this only changes the cost.
      */
-    public Set<RoadClass> connectorPathClasses = EnumSet.of(RoadClass.PATH);
+    public Map<GravelScale, Map<MtbScale, Double>> connectorMtbWeightOverrides =
+            defaultConnectorMtbWeightOverrides();
+
+    private static Map<GravelScale, Map<MtbScale, Double>> defaultConnectorMtbWeightOverrides() {
+        Map<GravelScale, Map<MtbScale, Double>> m = new EnumMap<>(GravelScale.class);
+        Map<MtbScale, Double> two = new EnumMap<>(MtbScale.class);
+        two.put(MtbScale.ONE, 2.5);     // gs2 + mtb1 → cost like gs3
+        m.put(GravelScale.TWO, two);
+        return m;
+    }
 
     /**
-     * Minimum distinct attachment points (TARGET/ANCHOR nodes) a connector chain must touch to be
-     * admitted. Default 2: a connector must <i>bridge</i> two things; a chain that dead-ends bridges
-     * nothing and is dropped (so a rough track that merely props up a single spur is not admitted).
+     * The connector cost-per-metre weight for an edge of the given gravel/mtb bands: a
+     * {@link #connectorMtbWeightOverrides} entry if present, else the {@link #connectorWeights} band
+     * weight, else a large fallback (1000) for a band with no configured weight.
      */
-    public int connectorMinAttachmentPoints = 2;
+    public double connectorWeight(GravelScale gravel, MtbScale mtb) {
+        Map<MtbScale, Double> ov = connectorMtbWeightOverrides.get(gravel);
+        if (ov != null) {
+            Double w = ov.get(mtb);
+            if (w != null) return w;
+        }
+        Double base = connectorWeights.get(gravel);
+        return base != null ? base : 1000.0;
+    }
+
+    /**
+     * The single weighted-length budget (in weighted metres) for an admitted connector corridor — the
+     * cheapest weighted path bridging two distinct attachment points must cost ≤ this. With the default
+     * weights a pure {@code TWO} corridor reaches this many real metres; {@code THREE} ~40%, {@code
+     * FOUR} ~10%. With the default weights a pure scale-2 ("hard gravel") corridor reaches this many
+     * real metres, scale-3 ~40%, scale-4 ("real push / no ride") ~10%.
+     */
+    public double connectorCostBudget = 450.0;
+
+    /**
+     * When true (default), admitted connectors are split in the OUTPUT into "needed" vs "redundant":
+     * a connector is <b>needed</b> if it is a bridge in the kept network (removing it would disconnect
+     * some kept TARGET gravel — i.e. it actually rescues gravel), and <b>redundant</b> otherwise (a
+     * loop beside gravel that is already connected). Redundant connectors are emitted with
+     * {@code connectivity = "connector_redundant"} so they can be styled faintly or hidden.
+     *
+     * <p><b>This is purely an output label.</b> It NEVER removes a connector from the graph analysis —
+     * all within-budget connectors always provide connectivity to the filter, so the marking can never
+     * sever a needed link (the bug the old connectivity gate had). Connectivity is a MUST; the pruned
+     * output is a nicety. When false, every admitted connector is just {@code "connector"}.</p>
+     */
+    public boolean connectorMarkRedundant = true;
 
     // --- Phase C/D: network size lever ---
 
@@ -154,6 +214,23 @@ public class GravelAnalysisConfig {
 
     /** Optional separate threshold for islands. Defaults to {@link #gravelSizeThresholdM}. */
     public double islandSizeThresholdM = Double.NaN;
+
+    /**
+     * Minimum cyclic-core length (metres) a ROAD connected-component must have to count as part of the
+     * real road grid (goal §5). The road grid is the 2-edge-connected (cyclic) core of the road
+     * network; but a road component is only the real grid if its own cyclic core reaches this floor.
+     * This drops <b>isolated tiny road loops</b> — parking aisles, turning circles, yards (often a few
+     * tens of metres of service road) — that are 2-edge-connected in isolation yet are not part of the
+     * through-road grid, so they cannot hand a dead-end gravel road a false "second junction".
+     *
+     * <p>The main road network is one huge component and always clears this floor, so a normal grid is
+     * unaffected; only stray isolated road cycles are excluded. 0 disables the floor. Set high enough
+     * that an isolated service/forestry loop (which can easily run a few hundred metres) is NOT
+     * mistaken for grid; isolated small road networks below it (e.g. tiny-island lanes) lose their grid
+     * status, which is acceptable — that gravel is out of interest. The parking-lot loop that motivated
+     * this (way 1202926746 et al.) is ~63&nbsp;m of cyclic core.</p>
+     */
+    public double gridMinComponentCoreLenM = 3000.0;
 
     // --- Phase E: grouping levers ---
 
@@ -181,12 +258,35 @@ public class GravelAnalysisConfig {
                     + "(the primary size lever has no safe default; supply gravel.size_threshold_m).");
         if (!Double.isNaN(islandSizeThresholdM) && islandSizeThresholdM <= 0)
             throw new IllegalStateException("islandSizeThresholdM, if set, must be positive.");
+        if (gridMinComponentCoreLenM < 0)
+            throw new IllegalStateException("gridMinComponentCoreLenM must be >= 0 (0 disables it).");
         if (targetGravelScales.isEmpty())
             throw new IllegalStateException("targetGravelScales must not be empty.");
-        if (targetSurfaces.isEmpty())
-            throw new IllegalStateException("targetSurfaces must not be empty.");
-        if (enableConnectors && (Double.isNaN(connectorMaxChainLenM) || connectorMaxChainLenM <= 0))
-            throw new IllegalStateException("connectorMaxChainLenM must be positive when "
-                    + "enableConnectors is true.");
+        if (enableConnectors) {
+            if (Double.isNaN(connectorCostBudget) || connectorCostBudget <= 0)
+                throw new IllegalStateException("connectorCostBudget must be positive when "
+                        + "enableConnectors is true.");
+            if (connectorWeights.isEmpty())
+                throw new IllegalStateException("connectorWeights must be non-empty when "
+                        + "enableConnectors is true (it defines the connector candidate bands).");
+            for (GravelScale gs : connectorWeights.keySet())
+                if (targetGravelScales.contains(gs))
+                    throw new IllegalStateException("connectorWeights must not include a Target band: "
+                            + gs + " is in targetGravelScales (connectors are glue, not output).");
+            // Weights are used directly as Dijkstra edge costs; they must be positive and finite
+            // (a zero weight makes arbitrarily long connector chains free; negative/NaN/∞ break the
+            // cost model).
+            for (Map.Entry<GravelScale, Double> w : connectorWeights.entrySet())
+                requirePositiveFinite("connectorWeights[" + w.getKey() + "]", w.getValue());
+            for (Map.Entry<GravelScale, Map<MtbScale, Double>> g : connectorMtbWeightOverrides.entrySet())
+                for (Map.Entry<MtbScale, Double> w : g.getValue().entrySet())
+                    requirePositiveFinite("connectorMtbWeightOverrides[" + g.getKey() + "][" + w.getKey() + "]",
+                            w.getValue());
+        }
+    }
+
+    private static void requirePositiveFinite(String name, Double v) {
+        if (v == null || Double.isNaN(v) || Double.isInfinite(v) || v <= 0)
+            throw new IllegalStateException(name + " must be a positive finite weight, got " + v);
     }
 }

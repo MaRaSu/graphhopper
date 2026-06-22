@@ -5,9 +5,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -28,7 +31,10 @@ class GravelSegmentToolTampereTest {
         assumeTrue(pbf.exists(), "tampere.osm.pbf not present — skipping real-extract run");
 
         GravelAnalysisConfig cfg = new GravelAnalysisConfig();
-        cfg.gravelSizeThresholdM = 4000;  // a dead-end cluster/island needs >= 4 km qualifying gravel to survive
+        // DEBUG config: Step 1 (case A) + Step 2 (standalone τ = 2 km); Step 3 (connectors) OFF.
+        cfg.gravelSizeThresholdM = 2000;
+        cfg.enableStandaloneRescue = true;
+        cfg.enableConnectors = false;
         cfg.validate();
 
         File graphDir = new File(DATA, "tampere-analysis-gh");
@@ -49,18 +55,48 @@ class GravelSegmentToolTampereTest {
         assertTrue(st.qualifyingWays > 0, "expected a non-empty qualifying way set");
         assertTrue(st.waysFile.exists() && st.roadsFile.exists());
 
-        // --- Whole-appendage pruning regression oracles (Phase C/D, 4 km threshold) ---
+        // --- Step 1 oracles (goal §6 case A): gravel must be 2-edge-connected to the road grid. ---
         Set<Long> qualifying = readWayIds(st.waysFile);
-        // A thin dead-end spur (388 m, degree-1) off a network -> pruned whole.
-        assertFalse(qualifying.contains(41428429L), "Hirviniemenranta is a thin dead-end -> pruned");
-        // A gravel road 2-edge-connected to the real-road backbone -> kept (its terminal dead-end
-        // prunes, but the road itself stays — 'mostly kept').
-        assertTrue(qualifying.contains(27060078L), "Latohuhdantie reaches the backbone -> kept");
-        // The Varsamäentie/Salmuksentie cluster is one network kept WHOLE — the access stick is no
-        // longer dropped while its loop is kept (the half-way bug). All three stay together.
-        assertTrue(qualifying.contains(1254246199L), "Varsamäentie (access stick) kept with its cluster");
-        assertTrue(qualifying.contains(743395639L), "Salmuksentie kept with its cluster");
-        assertTrue(qualifying.contains(232474445L), "Salmuksentie loop kept with its cluster");
+        // Every reported dead-end drops: it reaches the grid only one way (often via a road stub,
+        // which is not part of the grid).
+        assertFalse(qualifying.contains(41428429L), "Hirviniemenranta dead-end -> dropped");
+        assertFalse(qualifying.contains(79735420L), "Kivivuorentie dead-end -> dropped");
+        assertFalse(qualifying.contains(986643062L), "Haulaniementie dead-end -> dropped");
+        assertFalse(qualifying.contains(211468847L), "Kirjoniementie dead-end -> dropped");
+        assertFalse(qualifying.contains(41035427L), "Junkkarintie dead-end -> dropped");
+        // Dead-end whose only "loop" is a ~10 m turnaround: cyclic core (~278 m) < τ -> dropped.
+        assertFalse(qualifying.contains(145212615L), "dead-end with tiny turnaround -> dropped");
+        // Dead-end ending at an isolated ~63 m service loop (parking/turning yard). That stray road
+        // loop is 2-edge-connected in isolation but its component core < gridMinComponentCoreLenM, so
+        // it is NOT grid and cannot anchor the dead-end as a false second junction (Option B).
+        assertFalse(qualifying.contains(329963439L), "dead-end via isolated tiny road loop -> dropped");
+        // access=private gravel service network: bike_access is false both ways (BikeAccessParser),
+        // so the access pre-gate makes it IGNORED — excluded from output AND connectivity.
+        assertFalse(qualifying.contains(670296455L), "access=private way -> not bike-traversable -> dropped");
+        // With the surface gate relaxed to "non-asphalt", the Salmuksentie loop's GROUND-surface
+        // tracks are now TARGET, so it's a native gravel loop (> τ) kept by Step 2 — no connectors.
+        assertTrue(qualifying.contains(743395639L), "Salmuksentie kept as native gravel (Step 2)");
+
+        // --- connectivity prop (through-route vs standalone island) ---
+        Map<Long, String> conn = readConnectivity(st.attrsFile);
+        long through = conn.values().stream().filter("through"::equals).count();
+        long island = conn.values().stream().filter("island"::equals).count();
+        System.out.println("connectivity: through=" + through + " island=" + island
+                + " mixed=" + st.mixedConnectivityWays);
+        assertTrue(through > 0 && island > 0, "both connectivity classes present");
+        // Salmuksentie is a standalone gravel loop rescued by Step 2 (case B) -> island.
+        assertEquals("island", conn.get(743395639L), "Salmuksentie standalone loop -> island");
+    }
+
+    private static Map<Long, String> readConnectivity(File attrsFile) throws Exception {
+        JsonNode ways = new ObjectMapper().readTree(attrsFile).get("ways");
+        Map<Long, String> out = new HashMap<>();
+        for (java.util.Iterator<String> it = ways.fieldNames(); it.hasNext(); ) {
+            String k = it.next();
+            JsonNode c = ways.get(k).get("connectivity");
+            if (c != null) out.put(Long.parseLong(k), c.asText());
+        }
+        return out;
     }
 
     private static Set<Long> readWayIds(File waysFile) throws Exception {

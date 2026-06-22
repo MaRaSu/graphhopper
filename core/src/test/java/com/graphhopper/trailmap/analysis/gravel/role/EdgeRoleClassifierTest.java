@@ -16,7 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class EdgeRoleClassifierTest {
 
     private final EdgeRoleClassifier classifier =
-            new EdgeRoleClassifier(new GravelAnalysisConfig(), null, null, null, null);
+            new EdgeRoleClassifier(new GravelAnalysisConfig(), null, null, null, null, null);
 
     /** Default surface is a qualifying gravel surface so gravel_scale assertions read cleanly. */
     private EdgeRole role(GravelScale g, RoadClass rc, MtbScale m) {
@@ -64,16 +64,18 @@ class EdgeRoleClassifierTest {
     }
 
     @Test
-    void surfaceGateRequiresGravelFamilySurface() {
-        // A qualifying gravel_scale is NOT enough: predicted_surface must also be gravel-family.
+    void surfaceGateRejectsOnlyAsphalt() {
+        // gravel_scale carries the quality judgement; the surface gate only rejects asphalt /
+        // asphalt-ambiguous surfaces. Every other (non-asphalt) surface with a qualifying scale is
+        // TARGET — including GROUND (OSM surface=dirt) and ROUGH_GRAVEL.
         assertEquals(EdgeRole.TARGET, role(GravelScale.ZERO_PLUS, RoadClass.TRACK, MtbScale.UNKNOWN, PredictedSurface.COMPACTED));
         assertEquals(EdgeRole.TARGET, role(GravelScale.ONE, RoadClass.TRACK, MtbScale.UNKNOWN, PredictedSurface.FINE_GRAVEL));
         assertEquals(EdgeRole.TARGET, role(GravelScale.ONE, RoadClass.TRACK, MtbScale.UNKNOWN, PredictedSurface.MEDIUM_GRAVEL));
-        // surfaces outside the set -> ANCHOR (not output, but still counts for connectivity)
+        assertEquals(EdgeRole.TARGET, role(GravelScale.ZERO_PLUS, RoadClass.TRACK, MtbScale.UNKNOWN, PredictedSurface.GROUND));
+        assertEquals(EdgeRole.TARGET, role(GravelScale.ONE, RoadClass.TRACK, MtbScale.UNKNOWN, PredictedSurface.ROUGH_GRAVEL));
+        // asphalt and the asphalt-ambiguous surface -> ANCHOR even with a qualifying gravel_scale.
         assertEquals(EdgeRole.ANCHOR, role(GravelScale.ZERO_PLUS, RoadClass.TRACK, MtbScale.UNKNOWN, PredictedSurface.ASPHALT));
-        assertEquals(EdgeRole.ANCHOR, role(GravelScale.ONE, RoadClass.TRACK, MtbScale.UNKNOWN, PredictedSurface.ROUGH_GRAVEL));
-        assertEquals(EdgeRole.ANCHOR, role(GravelScale.ONE, RoadClass.TRACK, MtbScale.UNKNOWN, PredictedSurface.GROUND));
-        assertEquals(EdgeRole.ANCHOR, role(GravelScale.ZERO, RoadClass.CYCLEWAY, MtbScale.UNKNOWN, PredictedSurface.UNKNOWN));
+        assertEquals(EdgeRole.ANCHOR, role(GravelScale.ONE, RoadClass.TRACK, MtbScale.UNKNOWN, PredictedSurface.ASPHALT_OR_UNPAVED));
     }
 
     @Test
