@@ -904,12 +904,26 @@ public class RouteInstructionGenerator {
     /**
      * Determine the starting node of the edge chain.
      * <p>
-     * When there are 2+ edges, we use edge connectivity: the shared node between
-     * the first and second edge is the exit node, so fromNode is the OTHER end
-     * of the first edge. This is deterministic and doesn't depend on coordinate
-     * proximity (which fails when the snapped point is closer to the wrong endpoint).
+     * When there are 2+ edges, we pick the endpoint of the first edge from which the WHOLE chain
+     * walks node-to-node without a break. This deterministically disambiguates the start direction
+     * even when the first two edges are parallel (share BOTH endpoints) — e.g. an out-and-back over
+     * a parallel-edge pair at the route start — a case the old single-step check (does edge[1] touch
+     * nodeA/nodeB?) could not resolve, falling back to proximity and sometimes picking the wrong end,
+     * which produced a disconnected synthetic path (IllegalStateException in {@link #walkEdge}).
+     * Crucially this is self-contained: it depends only on the final edge chain's internal
+     * connectivity, so it behaves identically regardless of how the chain was assembled (plain
+     * extraction, bridge-prepended, or boundary-merged).
      * <p>
-     * For a single edge, we fall back to proximity to the start coordinate.
+     * It can only change behavior in cases that previously threw (the disconnected-walk bug) or were
+     * already ambiguous; a chain with a unique connected start is resolved the same as before. We fall
+     * through to proximity (same fallback as for a single edge) only when BOTH ends connect or NEITHER
+     * does. "Both ends connect" is not exclusively a closed loop: a chain that returns to its start
+     * with no disambiguating continuation — e.g. a bare two-edge parallel out-and-back [E, E'] over the
+     * same node pair — also walks cleanly from either endpoint, so connectivity alone cannot orient it
+     * and proximity decides. That residual class does NOT cause the walkEdge 500 (it connects either
+     * way); the only risk is a possibly-reversed short out-and-back. Fully removing that orientation
+     * ambiguity needs travel direction (oriented edge_key threaded through the build); see
+     * docs/gh_tbt_resolve_from_node_parallel_out_and_back.md (Option B).
      */
     private int resolveFromNode(List<Integer> edgeIds, TrailmapInstructionRequest.Coordinates startCoord) {
         EdgeIteratorState firstEdge = baseGraph.getEdgeIteratorState(edgeIds.get(0), Integer.MIN_VALUE);
@@ -929,20 +943,17 @@ public class RouteInstructionGenerator {
         }
 
         if (edgeIds.size() >= 2) {
-            EdgeIteratorState secondEdge = baseGraph.getEdgeIteratorState(edgeIds.get(1), Integer.MIN_VALUE);
-            boolean aConnects = secondEdge.getBaseNode() == nodeA || secondEdge.getAdjNode() == nodeA;
-            boolean bConnects = secondEdge.getBaseNode() == nodeB || secondEdge.getAdjNode() == nodeB;
-
+            boolean aConnects = chainConnectsFrom(edgeIds, nodeA);
+            boolean bConnects = chainConnectsFrom(edgeIds, nodeB);
             if (aConnects && !bConnects) {
-                // nodeA is the shared/exit node → fromNode is nodeB
-                return nodeB;
-            } else if (bConnects && !aConnects) {
-                // nodeB is the shared/exit node → fromNode is nodeA
                 return nodeA;
+            } else if (bConnects && !aConnects) {
+                return nodeB;
             }
-            // Both connect (parallel edges) or neither — fall through to proximity
-            LOGGER.warn("Ambiguous edge connectivity for edges {} and {}, falling back to proximity",
-                    edgeIds.get(0), edgeIds.get(1));
+            // Both connect (closed loop OR a symmetric out-and-back that returns to start, e.g. a bare
+            // two-edge parallel pair) or neither (broken chain) — connectivity can't orient it; use proximity.
+            LOGGER.warn("Ambiguous edge connectivity for chain [{}, {}, ...] ({} edges), falling back to proximity",
+                    edgeIds.get(0), edgeIds.get(1), edgeIds.size());
         }
 
         // Single edge or ambiguous: use proximity to start coordinate
@@ -953,6 +964,25 @@ public class RouteInstructionGenerator {
         double distB = distCalc.calcDist(startCoord.getLat(), startCoord.getLng(),
                 nodeAccess.getLat(nodeB), nodeAccess.getLon(nodeB));
         return distA <= distB ? nodeA : nodeB;
+    }
+
+    /**
+     * Whether the edge chain walks node-to-node without a break when started from {@code fromNode}.
+     * Same traversal as {@link #walkEdge} but returns a boolean instead of throwing.
+     */
+    private boolean chainConnectsFrom(List<Integer> edgeIds, int fromNode) {
+        int cur = fromNode;
+        for (int edgeId : edgeIds) {
+            EdgeIteratorState edge = baseGraph.getEdgeIteratorState(edgeId, Integer.MIN_VALUE);
+            if (edge.getBaseNode() == cur) {
+                cur = edge.getAdjNode();
+            } else if (edge.getAdjNode() == cur) {
+                cur = edge.getBaseNode();
+            } else {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

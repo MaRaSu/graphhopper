@@ -3553,4 +3553,122 @@ public class InstructionValidationTest {
         for (int i = 0; i < p.size(); i++) c.add(p.getLat(i), p.getLon(i));
         return c;
     }
+
+    // ===================================================================================
+    // resolveFromNode: parallel-edge out-and-back at a segment start.
+    // A trailmap_foot Joensuu loop whose segment 9 (FXDI… → K8xo…, initial_heading 202°) begins
+    // with an out-and-back over a PARALLEL edge pair (two edges between the same node pair). The old
+    // single-step connectivity check in resolveFromNode was ambiguous there, fell back to proximity,
+    // picked the wrong start node, and threw "Edge … is not connected to node …" (HTTP 500) in
+    // walkEdge. See docs/gh_tbt_resolve_from_node_parallel_out_and_back.md.
+    // ===================================================================================
+
+    /** Regression: the route must generate a valid, connected instruction list (previously HTTP 500). */
+    @Test
+    void parallelOutAndBackAtSegmentStart_doesNotThrow() throws Exception {
+        Assumptions.assumeTrue(hopper != null, "graph cache required");
+        TrailmapInstructionRequest request = new ObjectMapper()
+                .readValue(RouteInstructionGeneratorTest.JOENSUU_500_JSON, TrailmapInstructionRequest.class);
+
+        RouteInstructionGenerator.Result result =
+                assertDoesNotThrow(() -> generator.generate(request),
+                        "parallel-edge out-and-back at a segment start must not break synthetic-path assembly");
+        assertValidInstructionList(result);
+        // Sanity on scale so an accidental empty/degenerate route can't pass silently.
+        assertTrue(result.instructions.size() > 100,
+                "expected a long instruction list; was " + result.instructions.size()
+                        + "\n" + summarizeInstructions(result));
+    }
+
+    /**
+     * Ground-truth direction check (independent of the production mechanism): for EVERY routable
+     * segment, the start node resolveFromNode chooses (connectivity walk) must equal the node implied
+     * by GraphHopper's oriented edge_key (the authoritative travel direction). resolveFromNode uses
+     * undirected connectivity; edge_key is a separate, orientation-carrying source — so agreement on
+     * all segments confirms the fix builds each synthetic path in the correct direction, not merely a
+     * connected one. Replicates generate()'s heading + start-continuity loop.
+     */
+    @Test
+    void resolveFromNode_matchesOrientedEdgeKeyOracle_everySegment() throws Exception {
+        Assumptions.assumeTrue(hopper != null, "graph cache required");
+        TrailmapInstructionRequest request = new ObjectMapper()
+                .readValue(RouteInstructionGeneratorTest.JOENSUU_500_JSON, TrailmapInstructionRequest.class);
+
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        java.util.Map<String, TrailmapInstructionRequest.Coordinates> waypointMap = new java.util.HashMap<>();
+        for (TrailmapInstructionRequest.Waypoint wp : request.getWaypoints())
+            waypointMap.put(wp.getId(), wp.getCoordinates());
+        List<RouteInstructionGenerator.Chunk> chunks = generator.buildChunks(request.getSegments(), waypointMap);
+
+        java.lang.reflect.Method extractEdgeIds = RouteInstructionGenerator.class
+                .getDeclaredMethod("extractEdgeIds", ResponsePath.class);
+        extractEdgeIds.setAccessible(true);
+        java.lang.reflect.Method resolveFromNode = RouteInstructionGenerator.class
+                .getDeclaredMethod("resolveFromNode", List.class, TrailmapInstructionRequest.Coordinates.class);
+        resolveFromNode.setAccessible(true);
+        java.lang.reflect.Field rsField = RouteInstructionGenerator.Chunk.class.getDeclaredField("routableSection");
+        rsField.setAccessible(true);
+
+        List<String> snapPreventions = request.getSnapPreventions();
+        TrailmapInstructionRequest.Coordinates nextStartOverride = null;
+        int checked = 0;
+        int idx = -1;
+        for (RouteInstructionGenerator.Chunk chunk : chunks) {
+            idx++;
+            RouteInstructionGenerator.Section section =
+                    (RouteInstructionGenerator.Section) rsField.get(chunk);
+            if (section == null) { nextStartOverride = null; continue; }
+
+            Double heading = section.initialHeading;
+            if (nextStartOverride != null) section.points.set(0, nextStartOverride);
+
+            GHRequest req = new GHRequest();
+            for (TrailmapInstructionRequest.Coordinates c : section.points)
+                req.addPoint(new com.graphhopper.util.shapes.GHPoint(c.getLat(), c.getLng()));
+            req.setProfile(section.profile);
+            req.setPathDetails(List.of("edge_id", "edge_key"));
+            req.putHint("instructions", false);
+            req.putHint("calc_points", true);
+            if (section.customModel != null) req.setCustomModel(section.customModel);
+            if (snapPreventions != null && !snapPreventions.isEmpty()) req.setSnapPreventions(snapPreventions);
+            if (section.headingPenalty != null) req.putHint("heading_penalty", section.headingPenalty);
+            if (heading != null && !heading.isNaN()) {
+                List<Double> hs = new java.util.ArrayList<>();
+                hs.add(heading);
+                for (int i = 1; i < section.points.size(); i++) hs.add(Double.NaN);
+                req.setHeadings(hs);
+            }
+
+            GHResponse rsp = hopper.route(req);
+            assertFalse(rsp.hasErrors(), "segment " + idx + " routing failed: " + rsp.getErrors());
+            ResponsePath path = rsp.getBest();
+
+            @SuppressWarnings("unchecked")
+            List<Integer> dedup = (List<Integer>) extractEdgeIds.invoke(generator, path);
+            List<PathDetail> keyDets = path.getPathDetails().get("edge_key");
+
+            if (!dedup.isEmpty() && keyDets != null && !keyDets.isEmpty()) {
+                int firstKey = ((Number) keyDets.get(0).getValue()).intValue();
+                int oracleFromNode = baseGraph.getEdgeIteratorStateForKey(firstKey).getBaseNode();
+                int prodFromNode = (int) resolveFromNode.invoke(generator, dedup, section.points.get(0));
+                assertEquals(oracleFromNode, prodFromNode,
+                        "segment " + idx + ": resolveFromNode chose " + prodFromNode
+                                + " but oriented edge_key implies " + oracleFromNode
+                                + " (edges=" + dedup + ")");
+                checked++;
+            }
+
+            PointList pts = path.getPoints();
+            nextStartOverride = pts.size() >= 1
+                    ? makeCoord(pts.getLat(pts.size() - 1), pts.getLon(pts.size() - 1)) : null;
+        }
+        assertTrue(checked > 50, "expected to cross-check many segments; checked " + checked);
+    }
+
+    private static TrailmapInstructionRequest.Coordinates makeCoord(double lat, double lng) {
+        TrailmapInstructionRequest.Coordinates c = new TrailmapInstructionRequest.Coordinates();
+        c.setLat(lat);
+        c.setLng(lng);
+        return c;
+    }
 }
