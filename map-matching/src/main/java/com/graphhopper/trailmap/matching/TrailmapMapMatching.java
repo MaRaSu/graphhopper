@@ -427,20 +427,46 @@ public class TrailmapMapMatching {
             for (int k = 0; k < sigmaPerTimeStep.length; k++) sigmaPerTimeStep[k] = sigmaPerObs[f2o[k]];
         }
 
-        // Compute the most likely sequence of map matching candidates:
+        // Compute the most likely sequence of map matching candidates. Gap-tolerant: the result is
+        // one or more matched runs (§ gh_convert_track_matcher_gap_splitting.md); unmatchable
+        // stretches are gaps rather than a whole-track failure.
         long tViterbiStart = System.nanoTime();
-        List<SequenceState<State, Observation, Path>> seq = computeViterbiSequence(timeSteps, sigmaPerTimeStep);
+        ViterbiResult vr = computeViterbiSequence(timeSteps, sigmaPerTimeStep);
         long tViterbiEnd = System.nanoTime();
+
+        // Flat placed sequence in track order, with its timestep alignment. Iterating
+        // stateByTimeStep yields exactly the runs concatenated in order (runs are non-overlapping
+        // and increasing), so `seq` matches the pre-gap `seq` when the track is one run.
+        List<SequenceState<State, Observation, Path>> seq = new ArrayList<>();
+        int[] seqTimeStepTmp = new int[timeSteps.size()];
+        int placed = 0;
+        for (int t = 0; t < vr.stateByTimeStep.size(); t++) {
+            SequenceState<State, Observation, Path> ss = vr.stateByTimeStep.get(t);
+            if (ss != null) {
+                seq.add(ss);
+                seqTimeStepTmp[placed++] = t;
+            }
+        }
+        final int[] seqTimeStep = Arrays.copyOf(seqTimeStepTmp, placed);
+
         statistics.put("viterbiNs", tViterbiEnd - tViterbiStart);
         statistics.put("transitionDistances", seq.stream().filter(s -> s.transitionDescriptor != null).mapToLong(s -> Math.round(s.transitionDescriptor.getDistance())).toArray());
         statistics.put("visitedNodes", router.getVisitedNodes());
-        statistics.put("snapDistanceRanks", IntStream.range(0, seq.size()).map(i -> snapsPerObservation.get(i).indexOf(seq.get(i).state.getSnap())).toArray());
+        statistics.put("snapDistanceRanks", IntStream.range(0, seq.size()).map(i -> snapsPerObservation.get(seqTimeStep[i]).indexOf(seq.get(i).state.getSnap())).toArray());
         statistics.put("snapDistances", seq.stream().mapToDouble(s -> s.state.getSnap().getQueryDistance()).toArray());
-        statistics.put("maxSnapDistances", IntStream.range(0, seq.size()).mapToDouble(i -> snapsPerObservation.get(i).stream().mapToDouble(Snap::getQueryDistance).max().orElse(-1.0)).toArray());
+        statistics.put("maxSnapDistances", IntStream.range(0, seq.size()).mapToDouble(i -> snapsPerObservation.get(seqTimeStep[i]).stream().mapToDouble(Snap::getQueryDistance).max().orElse(-1.0)).toArray());
 
         List<EdgeIteratorState> path = seq.stream().filter(s1 -> s1.transitionDescriptor != null).flatMap(s1 -> s1.transitionDescriptor.calcEdges().stream()).collect(Collectors.toList());
 
-        MatchResult result = new MatchResult(prepareEdgeMatches(seq));
+        // EdgeMatches: build per run and concatenate, so no edge/state is attributed across a gap
+        // (prepareEdgeMatches would otherwise glue the last edge of one run to the first of the
+        // next). With a single run this equals prepareEdgeMatches(seq) exactly.
+        List<EdgeMatch> edgeMatches = new ArrayList<>();
+        for (List<SequenceState<State, Observation, Path>> run : vr.runs) {
+            edgeMatches.addAll(prepareEdgeMatches(run));
+        }
+
+        MatchResult result = new MatchResult(edgeMatches);
         Weighting queryGraphWeighting = queryGraph.wrapWeighting(router.getWeighting());
         result.setMergedPath(new MapMatchedPath(queryGraph, queryGraphWeighting, path));
         result.setMatchMillis(seq.stream().filter(s -> s.transitionDescriptor != null).mapToLong(s -> s.transitionDescriptor.getTime()).sum());
@@ -449,8 +475,9 @@ public class TrailmapMapMatching {
         result.setGraph(queryGraph);
         result.setWeighting(queryGraphWeighting);
 
-        // Build tracepoints with 1:1 correspondence to input observations
-        List<Tracepoint> tracepoints = buildTracepoints(observations, filterResult, seq);
+        // Build tracepoints with 1:1 correspondence to input observations. Gap timesteps
+        // (null in stateByTimeStep) become unmatched tracepoints → coordinates downstream.
+        List<Tracepoint> tracepoints = buildTracepoints(observations, filterResult, vr.stateByTimeStep);
         result.setTracepoints(tracepoints);
 
         return result;
@@ -465,7 +492,7 @@ public class TrailmapMapMatching {
      */
     private List<Tracepoint> buildTracepoints(List<Observation> originalObservations,
                                                FilterResult filterResult,
-                                               List<SequenceState<State, Observation, Path>> seq) {
+                                               List<SequenceState<State, Observation, Path>> stateByTimeStep) {
         List<Tracepoint> tracepoints = new ArrayList<>(originalObservations.size());
 
         for (int i = 0; i < originalObservations.size(); i++) {
@@ -492,10 +519,14 @@ public class TrailmapMapMatching {
                     tracepoints.add(new Tracepoint(i, originalPoint, true));
                 }
             } else {
-                // This observation went through Viterbi matching
+                // This observation was a Viterbi timestep. It is either PLACED (in a matched run)
+                // or a GAP (no candidates / unreachable) — the latter is an unmatched tracepoint,
+                // which the segmenter renders as part of a coordinates section.
                 Integer filteredIndex = filterResult.originalToFilteredIndex.get(i);
-                if (filteredIndex != null && filteredIndex < seq.size()) {
-                    SequenceState<State, Observation, Path> seqState = seq.get(filteredIndex);
+                SequenceState<State, Observation, Path> seqState =
+                        (filteredIndex != null && filteredIndex < stateByTimeStep.size())
+                                ? stateByTimeStep.get(filteredIndex) : null;
+                if (seqState != null) {
                     Snap snap = seqState.state.getSnap();
                     GHPoint snappedPoint = new GHPoint(
                             snap.getSnappedPoint().getLat(),
@@ -504,14 +535,14 @@ public class TrailmapMapMatching {
                     double distance = snap.getQueryDistance();
                     int edgeId = snap.getClosestEdge().getEdge();
                     // Pull the matcher's HMM transition distance from the previous Viterbi
-                    // state. transitionDescriptor is null for the first Viterbi state
-                    // (no incoming transition); for subsequent states it is the routing
-                    // Path the HMM chose between the previous and current candidate.
+                    // state. transitionDescriptor is null for the first state of each run
+                    // (no incoming transition — the previous timestep is a gap or track start);
+                    // for subsequent states it is the routing Path the HMM chose.
                     Double distanceFromPrevious = (seqState.transitionDescriptor != null)
                             ? seqState.transitionDescriptor.getDistance() : null;
                     tracepoints.add(new Tracepoint(i, originalPoint, false, snappedPoint, distance, edgeId, distanceFromPrevious));
                 } else {
-                    // Shouldn't happen, but handle gracefully
+                    // GAP timestep: unmatched (no acceptable placement on the network).
                     tracepoints.add(new Tracepoint(i, originalPoint, false));
                 }
             }
@@ -785,105 +816,180 @@ public class TrailmapMapMatching {
                 : p.emissionLogProbability(distance, sigmaPerTimeStep[timeStep]);
     }
 
-    private List<SequenceState<State, Observation, Path>> computeViterbiSequence(
+    /**
+     * Result of the gap-tolerant Viterbi. See {@code docs/gh_convert_track_matcher_gap_splitting.md}.
+     *
+     * <ul>
+     *   <li>{@code runs} — one matched sub-sequence per maximal placeable+bridgeable run, in track
+     *       order. Each run's first {@link SequenceState} has a {@code null} transitionDescriptor
+     *       (fresh start). Consumed for the EdgeMatch list (built per run, then concatenated, so no
+     *       edges/states are attributed across a gap).</li>
+     *   <li>{@code stateByTimeStep} — the chosen state for each timestep, or {@code null} for a GAP
+     *       timestep (no candidates, or unreachable from the frontier). Length ==
+     *       {@code timeSteps.size()}. Drives the 1:1 tracepoints: a {@code null} entry becomes an
+     *       unmatched tracepoint, which the segmenter renders as a coordinates section.</li>
+     * </ul>
+     */
+    private static final class ViterbiResult {
+        final List<List<SequenceState<State, Observation, Path>>> runs;
+        final List<SequenceState<State, Observation, Path>> stateByTimeStep;
+
+        ViterbiResult(List<List<SequenceState<State, Observation, Path>>> runs,
+                      List<SequenceState<State, Observation, Path>> stateByTimeStep) {
+            this.runs = runs;
+            this.stateByTimeStep = stateByTimeStep;
+        }
+    }
+
+    /** First timestep index at or after {@code from} that has at least one candidate, or -1. A
+     *  timestep with no candidates can neither seed a run nor be reached, so it is always a gap. */
+    private static int firstSeedableTimeStep(List<ObservationWithCandidateStates> timeSteps, int from) {
+        for (int i = from; i < timeSteps.size(); i++) {
+            if (!timeSteps.get(i).candidates.isEmpty()) return i;
+        }
+        return -1;
+    }
+
+    /** Deepest reachable label in {@code labels} (max timeStep; ties broken by lower cost). Used to
+     *  end a run when the frontier stalled before the last timestep. */
+    private static Label deepestTerminal(Map<State, Label> labels) {
+        Label best = null;
+        for (Label l : labels.values()) {
+            if (best == null || l.timeStep > best.timeStep
+                    || (l.timeStep == best.timeStep && l.minusLogProbability < best.minusLogProbability)) {
+                best = l;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Gap-tolerant HMM/Viterbi that splits the track into matched runs instead of failing the whole
+     * track when a stretch cannot be matched (restores the OSRM predecessor's section behaviour; see
+     * {@code docs/gh_convert_track_matcher_gap_splitting.md}). Seed at the first placeable timestep,
+     * expand as far as transitions allow, record that run, then reseed after the stall. The
+     * timesteps skipped between runs (no candidates, or unreachable) are gaps — represented as
+     * {@code null} entries in {@link ViterbiResult#stateByTimeStep} and rendered downstream as a
+     * coordinates section. With a track that matches end-to-end this produces exactly one run and no
+     * gaps — byte-identical to the previous single-sequence behaviour.
+     */
+    private ViterbiResult computeViterbiSequence(
             List<ObservationWithCandidateStates> timeSteps, double[] sigmaPerTimeStep) {
-        if (timeSteps.isEmpty()) {
-            return Collections.emptyList();
+        final int T = timeSteps.size();
+        List<List<SequenceState<State, Observation, Path>>> runs = new ArrayList<>();
+        List<SequenceState<State, Observation, Path>> stateByTimeStep =
+                new ArrayList<>(Collections.nCopies(T, null));
+        if (T == 0) {
+            return new ViterbiResult(runs, stateByTimeStep);
         }
 
         final TrailmapHmmProbabilities probabilities = new TrailmapHmmProbabilities(measurementErrorSigma, transitionProbabilityBeta);
-        final Map<State, Label> labels = new HashMap<>();
-        Map<Transition<State>, Path> roadPaths = new HashMap<>();
+        final Map<Transition<State>, Path> roadPaths = new HashMap<>();
         // Diagnostics only (MatcherConfig.debugCandidateCosts); no effect on the match.
         final Map<State, CandidateCost> debugCosts = config.debugCandidateCosts ? new HashMap<>() : null;
         // Phase 2 (M2a): per-candidate desirability penalty (cost units). null when off.
         final Map<State, Double> emPenalty = computeDesirabilityPenalties(timeSteps);
 
-        PriorityQueue<Label> q = new PriorityQueue<>(Comparator.comparing(qe -> qe.minusLogProbability));
-        for (State candidate : timeSteps.get(0).candidates) {
-            // distance from observation to road in meters
-            final double distance = candidate.getSnap().getQueryDistance();
-            Label label = new Label();
-            label.state = candidate;
-            label.minusLogProbability = emissionLog(probabilities, sigmaPerTimeStep, 0, distance) * -1.0
-                    + penaltyOf(emPenalty, candidate);
-            q.add(label);
-            labels.put(candidate, label);
-            if (debugCosts != null) {
-                GHPoint p = candidate.getEntry().getPoint();
-                debugCosts.put(candidate, new CandidateCost(p.lat, p.lon,
-                        candidate.getSnap().getClosestEdge().getEdge(), distance,
-                        -emissionLog(probabilities, sigmaPerTimeStep, 0, distance), null, null,
-                        label.minusLogProbability));
+        int start = firstSeedableTimeStep(timeSteps, 0);
+        while (start >= 0) {
+            final Map<State, Label> labels = new HashMap<>();
+            PriorityQueue<Label> q = new PriorityQueue<>(Comparator.comparing(qe0 -> qe0.minusLogProbability));
+            for (State candidate : timeSteps.get(start).candidates) {
+                // distance from observation to road in meters
+                final double distance = candidate.getSnap().getQueryDistance();
+                Label label = new Label();
+                label.state = candidate;
+                label.timeStep = start;
+                label.minusLogProbability = emissionLog(probabilities, sigmaPerTimeStep, start, distance) * -1.0
+                        + penaltyOf(emPenalty, candidate);
+                q.add(label);
+                labels.put(candidate, label);
+                if (debugCosts != null) {
+                    GHPoint p = candidate.getEntry().getPoint();
+                    debugCosts.put(candidate, new CandidateCost(p.lat, p.lon,
+                            candidate.getSnap().getClosestEdge().getEdge(), distance,
+                            -emissionLog(probabilities, sigmaPerTimeStep, start, distance), null, null,
+                            label.minusLogProbability));
+                }
             }
-        }
-        Label qe = null;
-        while (!q.isEmpty()) {
-            qe = q.poll();
-            if (qe.isDeleted)
-                continue;
-            if (qe.timeStep == timeSteps.size() - 1)
-                break;
-            State from = qe.state;
-            ObservationWithCandidateStates timeStep = timeSteps.get(qe.timeStep);
-            ObservationWithCandidateStates nextTimeStep = timeSteps.get(qe.timeStep + 1);
-            final double linearDistance = distanceCalc.calcDist(timeStep.observation.getPoint().lat, timeStep.observation.getPoint().lon,
-                    nextTimeStep.observation.getPoint().lat, nextTimeStep.observation.getPoint().lon)
-                    + nextTimeStep.observation.getAccumulatedLinearDistanceToPrevious();
-            int fromNode = from.getSnap().getClosestNode();
-            int fromOutEdge = from.isOnDirectedEdge() ? from.getOutgoingVirtualEdge().getEdge() : EdgeIterator.ANY_EDGE;
-            int[] toNodes = nextTimeStep.candidates.stream().mapToInt(c -> c.getSnap().getClosestNode()).toArray();
-            int[] toInEdges = nextTimeStep.candidates.stream().mapToInt(to -> to.isOnDirectedEdge() ? to.getIncomingVirtualEdge().getEdge() : EdgeIterator.ANY_EDGE).toArray();
-            List<Path> paths = router.calcPaths(queryGraph, fromNode, fromOutEdge, toNodes, toInEdges);
-            for (int i = 0; i < nextTimeStep.candidates.size(); i++) {
-                State to = nextTimeStep.candidates.get(i);
-                Path path = paths.get(i);
-                if (path.isFound()) {
-                    double transitionLogProbability = probabilities.transitionLogProbability(path.getDistance(), linearDistance);
-                    Transition<State> transition = new Transition<>(from, to);
-                    roadPaths.put(transition, path);
-                    double minusLogProbability = qe.minusLogProbability - emissionLog(probabilities, sigmaPerTimeStep, qe.timeStep + 1, to.getSnap().getQueryDistance()) + penaltyOf(emPenalty, to) - transitionLogProbability;
-                    Label label1 = labels.get(to);
-                    if (label1 == null || minusLogProbability < label1.minusLogProbability) {
-                        q.stream().filter(oldQe -> !oldQe.isDeleted && oldQe.state == to).findFirst().ifPresent(oldQe -> oldQe.isDeleted = true);
-                        Label label = new Label();
-                        label.state = to;
-                        label.timeStep = qe.timeStep + 1;
-                        label.back = qe;
-                        label.minusLogProbability = minusLogProbability;
-                        q.add(label);
-                        labels.put(to, label);
-                        if (debugCosts != null) {
-                            GHPoint p = to.getEntry().getPoint();
-                            debugCosts.put(to, new CandidateCost(p.lat, p.lon,
-                                    to.getSnap().getClosestEdge().getEdge(),
-                                    to.getSnap().getQueryDistance(),
-                                    -emissionLog(probabilities, sigmaPerTimeStep, qe.timeStep + 1, to.getSnap().getQueryDistance()),
-                                    -transitionLogProbability, path.getDistance(),
-                                    minusLogProbability));
+            Label qe = null;
+            boolean reachedEnd = false;
+            while (!q.isEmpty()) {
+                qe = q.poll();
+                if (qe.isDeleted)
+                    continue;
+                if (qe.timeStep == T - 1) {
+                    reachedEnd = true;
+                    break;
+                }
+                State from = qe.state;
+                ObservationWithCandidateStates timeStep = timeSteps.get(qe.timeStep);
+                ObservationWithCandidateStates nextTimeStep = timeSteps.get(qe.timeStep + 1);
+                final double linearDistance = distanceCalc.calcDist(timeStep.observation.getPoint().lat, timeStep.observation.getPoint().lon,
+                        nextTimeStep.observation.getPoint().lat, nextTimeStep.observation.getPoint().lon)
+                        + nextTimeStep.observation.getAccumulatedLinearDistanceToPrevious();
+                int fromNode = from.getSnap().getClosestNode();
+                int fromOutEdge = from.isOnDirectedEdge() ? from.getOutgoingVirtualEdge().getEdge() : EdgeIterator.ANY_EDGE;
+                int[] toNodes = nextTimeStep.candidates.stream().mapToInt(c -> c.getSnap().getClosestNode()).toArray();
+                int[] toInEdges = nextTimeStep.candidates.stream().mapToInt(to -> to.isOnDirectedEdge() ? to.getIncomingVirtualEdge().getEdge() : EdgeIterator.ANY_EDGE).toArray();
+                List<Path> paths = router.calcPaths(queryGraph, fromNode, fromOutEdge, toNodes, toInEdges);
+                for (int i = 0; i < nextTimeStep.candidates.size(); i++) {
+                    State to = nextTimeStep.candidates.get(i);
+                    Path path = paths.get(i);
+                    if (path.isFound()) {
+                        double transitionLogProbability = probabilities.transitionLogProbability(path.getDistance(), linearDistance);
+                        Transition<State> transition = new Transition<>(from, to);
+                        roadPaths.put(transition, path);
+                        double minusLogProbability = qe.minusLogProbability - emissionLog(probabilities, sigmaPerTimeStep, qe.timeStep + 1, to.getSnap().getQueryDistance()) + penaltyOf(emPenalty, to) - transitionLogProbability;
+                        Label label1 = labels.get(to);
+                        if (label1 == null || minusLogProbability < label1.minusLogProbability) {
+                            q.stream().filter(oldQe -> !oldQe.isDeleted && oldQe.state == to).findFirst().ifPresent(oldQe -> oldQe.isDeleted = true);
+                            Label label = new Label();
+                            label.state = to;
+                            label.timeStep = qe.timeStep + 1;
+                            label.back = qe;
+                            label.minusLogProbability = minusLogProbability;
+                            q.add(label);
+                            labels.put(to, label);
+                            if (debugCosts != null) {
+                                GHPoint p = to.getEntry().getPoint();
+                                debugCosts.put(to, new CandidateCost(p.lat, p.lon,
+                                        to.getSnap().getClosestEdge().getEdge(),
+                                        to.getSnap().getQueryDistance(),
+                                        -emissionLog(probabilities, sigmaPerTimeStep, qe.timeStep + 1, to.getSnap().getQueryDistance()),
+                                        -transitionLogProbability, path.getDistance(),
+                                        minusLogProbability));
+                            }
                         }
                     }
                 }
             }
+
+            // End of this run: the frontier reached the last timestep, or stalled at its deepest
+            // reachable timestep. Back-trace it into a run and record its per-timestep states.
+            Label terminal = reachedEnd ? qe : deepestTerminal(labels);
+            ArrayList<SequenceState<State, Observation, Path>> run = new ArrayList<>();
+            for (Label t = terminal; t != null; t = t.back) {
+                final SequenceState<State, Observation, Path> ss = new SequenceState<>(t.state, t.state.getEntry(),
+                        t.back == null ? null : roadPaths.get(new Transition<>(t.back.state, t.state)));
+                run.add(ss);
+                stateByTimeStep.set(t.timeStep, ss);
+            }
+            Collections.reverse(run);
+            runs.add(run);
+
+            int reached = terminal.timeStep;
+            if (reached >= T - 1) break;
+            // Reseed after the gap. firstSeedableTimeStep skips no-candidate timesteps (mode A);
+            // when the very next timestep has candidates but was unreachable (disconnection),
+            // the next run starts there (adjacent runs, zero interior gap).
+            start = firstSeedableTimeStep(timeSteps, reached + 1);
         }
-        if (qe == null) {
-            throw new IllegalArgumentException("Sequence is broken for submitted track at initial time step.");
-        }
-        if (qe.timeStep != timeSteps.size() - 1) {
-            throw new IllegalArgumentException("Sequence is broken for submitted track at time step "
-                    + qe.timeStep + ". observation:" + qe.state.getEntry());
-        }
-        ArrayList<SequenceState<State, Observation, Path>> result = new ArrayList<>();
-        while (qe != null) {
-            final SequenceState<State, Observation, Path> ss = new SequenceState<>(qe.state, qe.state.getEntry(), qe.back == null ? null : roadPaths.get(new Transition<>(qe.back.state, qe.state)));
-            result.add(ss);
-            qe = qe.back;
-        }
-        Collections.reverse(result);
+
         if (debugCosts != null) {
             statistics.put("candidateCosts", new ArrayList<>(debugCosts.values()));
         }
-        return result;
+        return new ViterbiResult(runs, stateByTimeStep);
     }
 
     /**
