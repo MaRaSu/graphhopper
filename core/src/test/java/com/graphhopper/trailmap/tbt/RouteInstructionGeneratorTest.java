@@ -703,6 +703,52 @@ public class RouteInstructionGeneratorTest {
         probeJunctions(baseGraph, em, wp1Lat, wp1Lng, wp2Lat, wp2Lng);
     }
 
+    // ===================================================================================
+    // Diagnostic: "slight right" emitted at a junction that also has ANOTHER confusable
+    // right-hand alternative. The user reports the "slight right" (loivasti oikealle) is
+    // ambiguous because there are two right branches the rider could take.
+    // Payload (verbatim from /instructions API):
+    //   waypoints: (68.451541,27.353463) -> (68.450621,27.354399)
+    //   single followRoads gravel segment, instruction_profile=gravel, locale=fi,
+    //   snap_preventions=[ferry]
+    // ===================================================================================
+    @Test
+    void diagnoseSlightRightWithConfusableRightAlt() {
+        final double wp1Lat = 68.451541, wp1Lng = 27.353463;
+        final double wp2Lat = 68.450621, wp2Lng = 27.354399;
+
+        TrailmapInstructionRequest req = new TrailmapInstructionRequest();
+        req.setWaypoints(List.of(
+                makeWaypoint("UByjsVEEzih4N33O0tQsa", wp1Lat, wp1Lng),
+                makeWaypoint("vWCOc64OgUMUejQp_nQw5", wp2Lat, wp2Lng)));
+        req.setSnapPreventions(List.of("ferry"));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("UByjsVEEzih4N33O0tQsa");
+        seg.setEnd("vWCOc64OgUMUejQp_nQw5");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+        req.setSegments(List.of(seg));
+        req.setInstructionProfile("gravel");
+        req.setLocale("fi");
+
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        EncodingManager em = hopper.getEncodingManager();
+        TranslationMap tm = hopper.getTranslationMap();
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(hopper, baseGraph, em, tm);
+
+        RouteInstructionGenerator.Result result = generator.generate(req);
+        assertNotNull(result);
+        new InstructionPostProcessor().process(result.instructions, req.getInstructionProfile());
+
+        System.out.println("\n===== SLIGHT-RIGHT-WITH-CONFUSABLE-RIGHT-ALT DIAGNOSTIC =====");
+        System.out.println("Instructions: " + result.instructions.size()
+                + ", polyline points: " + result.polyline.size());
+        printInstructionsDetailed(result);
+
+        probeJunctions(baseGraph, em, wp1Lat, wp1Lng, wp2Lat, wp2Lng);
+    }
+
     /**
      * Replays the route at node granularity and, at every interior junction, reproduces
      * the reframer's visual-alt collection (unfiltered explorer + surface filter + 75°/115°
@@ -11272,4 +11318,121 @@ public class RouteInstructionGeneratorTest {
     static final String JOENSUU_500_JSON = """
 {"waypoints":[{"id":"YneX4HkiShqAaDwcHxe0T","coordinates":{"lat":62.642671,"lng":29.549659}},{"id":"Da8_uwpiC811s5JY5C8jy","coordinates":{"lat":62.641179,"lng":29.539555}},{"id":"oSqYTAIzCw9GgEv8K3mys","coordinates":{"lat":62.64485,"lng":29.531598}},{"id":"CeZ9016p6v6aJ06SPikhe","coordinates":{"lat":62.642629,"lng":29.52716}},{"id":"XqpNPH8FgF2oF2_kFoDhv","coordinates":{"lat":62.638279,"lng":29.530712}},{"id":"T26l__AjG2N0TyJxVc60g","coordinates":{"lat":62.632419,"lng":29.525762}},{"id":"n-nbpJoiHKUiccZdE9w_J","coordinates":{"lat":62.62651,"lng":29.530542}},{"id":"juFUD0Zn1Q4-DKoWvGGcp","coordinates":{"lat":62.619805,"lng":29.527174}},{"id":"SF-BZ59l42R5vgZz1aBRs","coordinates":{"lat":62.616619,"lng":29.517944}},{"id":"FXDI1JhMfbxnnc5EeKX0Z","coordinates":{"lat":62.615669,"lng":29.493219}},{"id":"K8xo-TSQPupXNdunZQHuf","coordinates":{"lat":62.618832,"lng":29.495906}},{"id":"-b6U9GGCGiV362q-0Hzb8","coordinates":{"lat":62.622775,"lng":29.486305}},{"id":"_ImYrjmveF0LWydomB0jW","coordinates":{"lat":62.623731,"lng":29.46735}},{"id":"IKpursaSeMK9td32F7R-m","coordinates":{"lat":62.626946,"lng":29.460204}},{"id":"qoR-FPWPz24YX95htTn2Q","coordinates":{"lat":62.635681,"lng":29.445107}},{"id":"clcrBNIW86xcFr7CTNgm8","coordinates":{"lat":62.638358,"lng":29.412213}},{"id":"RrEEMGyqk8gKMoviWAVMS","coordinates":{"lat":62.639301,"lng":29.398142}},{"id":"7V-lCpbrz9SFqGmucNTm6","coordinates":{"lat":62.639687,"lng":29.390094}},{"id":"Mjmpx2JYqhIl3w9Ebg9Cd","coordinates":{"lat":62.640304,"lng":29.384186}},{"id":"4-OjGVaZWcSZqB-DA7ZXX","coordinates":{"lat":62.639368,"lng":29.376508}},{"id":"GUSLAUN4vtE_wABngGoU9","coordinates":{"lat":62.639267,"lng":29.376109}},{"id":"4A1UaiM1kWBe7I9y6Ttx5","coordinates":{"lat":62.637602,"lng":29.381085}},{"id":"3XWa2hh43XLLwoR-0gFT2","coordinates":{"lat":62.636205,"lng":29.380214}},{"id":"t1ExFY6suzRQwj3q6Fipy","coordinates":{"lat":62.637362,"lng":29.394785}},{"id":"Adf8uZ_YZ6E6peXeC4a-u","coordinates":{"lat":62.637819,"lng":29.406727}},{"id":"V37xsu9XLqfrMg0LaFG0T","coordinates":{"lat":62.631224,"lng":29.42185}},{"id":"3EaltcMJ_H4uAZ54aveRl","coordinates":{"lat":62.631458,"lng":29.432673}},{"id":"PwUphvqtmW-KdeTTsy2BZ","coordinates":{"lat":62.627638,"lng":29.4347}},{"id":"zxtMbcRLVrWBgt3LumHJg","coordinates":{"lat":62.626672,"lng":29.44978}},{"id":"D3xDaXM9jpC1JcPLCQ2YA","coordinates":{"lat":62.637831,"lng":29.457941}},{"id":"SSI15YE02_qqagdBABC6A","coordinates":{"lat":62.640856,"lng":29.464781}},{"id":"tAiTkZNL3u8Av1lYUu8AX","coordinates":{"lat":62.63934,"lng":29.485846}},{"id":"2ST-QgE9CHHHpBZTV-6Wf","coordinates":{"lat":62.628259,"lng":29.511617}},{"id":"jzT1W26CtSdoOxjjRAwIa","coordinates":{"lat":62.623024,"lng":29.517543}},{"id":"YG6fKiCqsVj1uixShoOdh","coordinates":{"lat":62.620916,"lng":29.520071}},{"id":"AhBtdkHX5oD0GcBD0kwTt","coordinates":{"lat":62.618001,"lng":29.53294}},{"id":"3_yw3pN-2QnucrIQydpsy","coordinates":{"lat":62.616415,"lng":29.542253}},{"id":"dmu-Exracy3yk0Ilj0V0s","coordinates":{"lat":62.61912,"lng":29.544651}},{"id":"7ks_Tmw6-j0im2dp54gFK","coordinates":{"lat":62.622019,"lng":29.544674}},{"id":"tuFhOJbjY7gsDEtvt9ucm","coordinates":{"lat":62.625187,"lng":29.546002}},{"id":"gmn6oPOAfWjQBl7odyNdh","coordinates":{"lat":62.622689,"lng":29.554895}},{"id":"yrVJE97IJ5u82yaSP1hdg","coordinates":{"lat":62.623321,"lng":29.567766}},{"id":"urUGvrqxJZF2M7iO1LBpE","coordinates":{"lat":62.624653,"lng":29.576965}},{"id":"T87-SK9kympvVh0nqnQRd","coordinates":{"lat":62.625277,"lng":29.580883}},{"id":"JZkxNzNfg6iOc1Eslf60e","coordinates":{"lat":62.636706,"lng":29.584627}},{"id":"7b8AJlExQVG_-o2hBOhYa","coordinates":{"lat":62.642747,"lng":29.567346}},{"id":"HOfw89dAPE207XREgEhjw","coordinates":{"lat":62.645789,"lng":29.558136}},{"id":"tJ21lJ0761PaQs8WhgzRu","coordinates":{"lat":62.644993,"lng":29.550925}},{"id":"LV0IdraEbxr2wWtS-Ml7X","coordinates":{"lat":62.64587120580731,"lng":29.549378152789416}},{"id":"IX0BTmrCDzZRAQhpWzuB5","coordinates":{"lat":62.645906,"lng":29.548877}},{"id":"DAnrDmlLoHlJJ8miqAASX","coordinates":{"lat":62.64589,"lng":29.547997}},{"id":"4YWDFlOp98cSq07RLVhN0","coordinates":{"lat":62.646384125143726,"lng":29.546132122109498}},{"id":"PqCbslBn0fE8n2rADNlq9","coordinates":{"lat":62.646592,"lng":29.544632}},{"id":"AgK3Q7lvQJd5wRZrt_efY","coordinates":{"lat":62.650706,"lng":29.539236}},{"id":"j6JK3PtG-D36uuweahmx-","coordinates":{"lat":62.650984,"lng":29.541337}},{"id":"TsYyByyrBOWwaLNjlgUAP","coordinates":{"lat":62.653752,"lng":29.54888}},{"id":"o0YukMVhPvYxzGKPJOhHr","coordinates":{"lat":62.656293,"lng":29.558056}},{"id":"ZR8ICH2DlNhM8NiWq6HvK","coordinates":{"lat":62.658499,"lng":29.564502}},{"id":"F0k_TKp0t88YVb6AIFbt7","coordinates":{"lat":62.661146,"lng":29.559066}},{"id":"fSeXO2c5LEVNynOF1XFQj","coordinates":{"lat":62.662461,"lng":29.556085}},{"id":"G2vow6DjQZyaWRhRrpri_","coordinates":{"lat":62.659869,"lng":29.551375}},{"id":"MlGs6z5wGP1gbcEWyVbwY","coordinates":{"lat":62.664887,"lng":29.541892}},{"id":"9bbre0PT0TqKDNfMcPEuK","coordinates":{"lat":62.666958,"lng":29.538075}},{"id":"pgyUuWLPC9wUtpEcKwDB2","coordinates":{"lat":62.665389,"lng":29.535633}},{"id":"cCMvvqQu6LIOZIxIwhCbl","coordinates":{"lat":62.666044,"lng":29.532361}},{"id":"L3MgZ_tfo83DWp3xqVeO3","coordinates":{"lat":62.671408,"lng":29.518624}},{"id":"VmkfjvEYiCMt1Mt_FswGv","coordinates":{"lat":62.671523,"lng":29.497528}},{"id":"TfDQsnAnYQ7_UbRHnjl2a","coordinates":{"lat":62.67618,"lng":29.484672}},{"id":"Xl2JUPa5oGR1GfnDY22-q","coordinates":{"lat":62.668102,"lng":29.5187}},{"id":"mzE7Cy7dPiZgmJBM4ntrI","coordinates":{"lat":62.665663,"lng":29.523256}},{"id":"f0c5XyeXaLNixY-c6IxbA","coordinates":{"lat":62.661908,"lng":29.531551}},{"id":"QGM41yPSplQCHORM1vsMQ","coordinates":{"lat":62.657537,"lng":29.542104}},{"id":"vulWvIlX4bwaDDxyZKGbd","coordinates":{"lat":62.656723,"lng":29.53686}},{"id":"SXH3JiecIs86oigBdmyTV","coordinates":{"lat":62.655324,"lng":29.537352}},{"id":"1fzONZYsxsWyg_toFA8DA","coordinates":{"lat":62.655169,"lng":29.534745}},{"id":"yeG0xIYQnPudc-DxruT1U","coordinates":{"lat":62.654691,"lng":29.532491}},{"id":"daGPEvlhUQkk72BHvrQwc","coordinates":{"lat":62.648873,"lng":29.531857}},{"id":"djSe4eVUC6Xsn8wFKclTt","coordinates":{"lat":62.647072,"lng":29.529429}},{"id":"F5SkkctZGZ8RNJyVqgqa0","coordinates":{"lat":62.646007,"lng":29.530583}},{"id":"e29GO5aH6yqjGRBhXwSja","coordinates":{"lat":62.645978,"lng":29.531988}},{"id":"ebQjZVu_gtPO8iE8pg-_A","coordinates":{"lat":62.645958,"lng":29.536398}},{"id":"NHBUP--um68jQP54CWDyD","coordinates":{"lat":62.645429,"lng":29.539727}},{"id":"dBvFo2o_1KrkfNXeGlWSa","coordinates":{"lat":62.645819,"lng":29.542528}},{"id":"NvtWRNRV6z1MSciIv4WhE","coordinates":{"lat":62.645218,"lng":29.543626}},{"id":"NFvpySH-KI3UpoBsBt1BN","coordinates":{"lat":62.645072,"lng":29.541602}},{"id":"Bspfp3ZeR1J3T8BqeuTM9","coordinates":{"lat":62.64486,"lng":29.540892}},{"id":"4r49rcAieMmT8SLeP0MiK","coordinates":{"lat":62.643902,"lng":29.5387}},{"id":"owYlJPvUqBH_xK1c682t2","coordinates":{"lat":62.642513,"lng":29.54082}},{"id":"P8F4HvD8wAVqrgyqrkxiu","coordinates":{"lat":62.641982,"lng":29.544865}},{"id":"tJE0_N_bc2FF-gAbh5TJ6","coordinates":{"lat":62.641611,"lng":29.546298}},{"id":"5XQiF21cexxq1zeONhqRt","coordinates":{"lat":62.641867,"lng":29.5474}},{"id":"1FGkfWP7Ksre493Mc-yQK","coordinates":{"lat":62.642865,"lng":29.547941}},{"id":"A9p9mC4x0XZ_rmwDKnLWO","coordinates":{"lat":62.642748,"lng":29.549293}}],"segments":[{"start":"YneX4HkiShqAaDwcHxe0T","end":"Da8_uwpiC811s5JY5C8jy","type":"followRoads","profile":"trailmap_foot"},{"start":"Da8_uwpiC811s5JY5C8jy","end":"oSqYTAIzCw9GgEv8K3mys","type":"followRoads","profile":"trailmap_foot","initial_heading":298.4342090749613,"heading_penalty":60},{"start":"oSqYTAIzCw9GgEv8K3mys","end":"CeZ9016p6v6aJ06SPikhe","type":"followRoads","profile":"trailmap_foot","initial_heading":273.57203327951413,"heading_penalty":60},{"start":"CeZ9016p6v6aJ06SPikhe","end":"XqpNPH8FgF2oF2_kFoDhv","type":"followRoads","profile":"trailmap_foot","initial_heading":132.30472818337927,"heading_penalty":60},{"start":"XqpNPH8FgF2oF2_kFoDhv","end":"T26l__AjG2N0TyJxVc60g","type":"followRoads","profile":"trailmap_foot","initial_heading":197.03529354788503,"heading_penalty":60},{"start":"T26l__AjG2N0TyJxVc60g","end":"n-nbpJoiHKUiccZdE9w_J","type":"followRoads","profile":"trailmap_foot","initial_heading":167.17098308101652,"heading_penalty":60},{"start":"n-nbpJoiHKUiccZdE9w_J","end":"juFUD0Zn1Q4-DKoWvGGcp","type":"followRoads","profile":"trailmap_foot","initial_heading":210.63201950537862,"heading_penalty":60},{"start":"juFUD0Zn1Q4-DKoWvGGcp","end":"SF-BZ59l42R5vgZz1aBRs","type":"followRoads","profile":"trailmap_foot","initial_heading":230.36335610906846,"heading_penalty":60},{"start":"SF-BZ59l42R5vgZz1aBRs","end":"FXDI1JhMfbxnnc5EeKX0Z","type":"followRoads","profile":"trailmap_foot","initial_heading":293.58464146397057,"heading_penalty":60},{"start":"FXDI1JhMfbxnnc5EeKX0Z","end":"K8xo-TSQPupXNdunZQHuf","type":"followRoads","profile":"trailmap_foot","initial_heading":202.04609286009003,"heading_penalty":60},{"start":"K8xo-TSQPupXNdunZQHuf","end":"-b6U9GGCGiV362q-0Hzb8","type":"followRoads","profile":"trailmap_foot","initial_heading":214.69942495221775,"heading_penalty":60},{"start":"-b6U9GGCGiV362q-0Hzb8","end":"_ImYrjmveF0LWydomB0jW","type":"followRoads","profile":"trailmap_foot","initial_heading":301.9349683457643,"heading_penalty":60},{"start":"_ImYrjmveF0LWydomB0jW","end":"IKpursaSeMK9td32F7R-m","type":"followRoads","profile":"trailmap_foot","initial_heading":353.7094718124463,"heading_penalty":60},{"start":"IKpursaSeMK9td32F7R-m","end":"qoR-FPWPz24YX95htTn2Q","type":"followRoads","profile":"trailmap_foot","initial_heading":283.91683743165095,"heading_penalty":60},{"start":"qoR-FPWPz24YX95htTn2Q","end":"clcrBNIW86xcFr7CTNgm8","type":"followRoads","profile":"trailmap_foot","initial_heading":291.9062283251037,"heading_penalty":60},{"start":"clcrBNIW86xcFr7CTNgm8","end":"RrEEMGyqk8gKMoviWAVMS","type":"followRoads","profile":"trailmap_foot","initial_heading":239.93871509800394,"heading_penalty":60},{"start":"RrEEMGyqk8gKMoviWAVMS","end":"7V-lCpbrz9SFqGmucNTm6","type":"followRoads","profile":"trailmap_foot","initial_heading":277.6103709163243,"heading_penalty":60},{"start":"7V-lCpbrz9SFqGmucNTm6","end":"Mjmpx2JYqhIl3w9Ebg9Cd","type":"followRoads","profile":"trailmap_foot","initial_heading":281.5406117137508,"heading_penalty":60},{"start":"Mjmpx2JYqhIl3w9Ebg9Cd","end":"4-OjGVaZWcSZqB-DA7ZXX","type":"followRoads","profile":"trailmap_foot","initial_heading":268.6305306713456,"heading_penalty":60},{"start":"4-OjGVaZWcSZqB-DA7ZXX","end":"GUSLAUN4vtE_wABngGoU9","type":"direct"},{"start":"GUSLAUN4vtE_wABngGoU9","end":"4A1UaiM1kWBe7I9y6Ttx5","type":"followRoads","profile":"trailmap_foot","initial_heading":244.5471308748978,"heading_penalty":60},{"start":"4A1UaiM1kWBe7I9y6Ttx5","end":"3XWa2hh43XLLwoR-0gFT2","type":"followRoads","profile":"trailmap_foot","initial_heading":68.13936346177888,"heading_penalty":60},{"start":"3XWa2hh43XLLwoR-0gFT2","end":"t1ExFY6suzRQwj3q6Fipy","type":"followRoads","profile":"trailmap_foot","initial_heading":129.98048762263227,"heading_penalty":60},{"start":"t1ExFY6suzRQwj3q6Fipy","end":"Adf8uZ_YZ6E6peXeC4a-u","type":"followRoads","profile":"trailmap_foot","initial_heading":57.99198413703152,"heading_penalty":60},{"start":"Adf8uZ_YZ6E6peXeC4a-u","end":"V37xsu9XLqfrMg0LaFG0T","type":"followRoads","profile":"trailmap_foot","initial_heading":133.08246540074708,"heading_penalty":60},{"start":"V37xsu9XLqfrMg0LaFG0T","end":"3EaltcMJ_H4uAZ54aveRl","type":"followRoads","profile":"trailmap_foot","initial_heading":121.86101276188163,"heading_penalty":60},{"start":"3EaltcMJ_H4uAZ54aveRl","end":"PwUphvqtmW-KdeTTsy2BZ","type":"followRoads","profile":"trailmap_foot","initial_heading":135.49932404822027,"heading_penalty":60},{"start":"PwUphvqtmW-KdeTTsy2BZ","end":"zxtMbcRLVrWBgt3LumHJg","type":"followRoads","profile":"trailmap_foot","initial_heading":144.99586730711314,"heading_penalty":60},{"start":"zxtMbcRLVrWBgt3LumHJg","end":"D3xDaXM9jpC1JcPLCQ2YA","type":"followRoads","profile":"trailmap_foot","initial_heading":80.12963616596494,"heading_penalty":60},{"start":"D3xDaXM9jpC1JcPLCQ2YA","end":"SSI15YE02_qqagdBABC6A","type":"followRoads","profile":"trailmap_foot","initial_heading":356.3305258175453,"heading_penalty":60},{"start":"SSI15YE02_qqagdBABC6A","end":"tAiTkZNL3u8Av1lYUu8AX","type":"followRoads","profile":"trailmap_foot","initial_heading":88.77785078906913,"heading_penalty":60},{"start":"tAiTkZNL3u8Av1lYUu8AX","end":"2ST-QgE9CHHHpBZTV-6Wf","type":"followRoads","profile":"trailmap_foot","initial_heading":112.91751632728835,"heading_penalty":60},{"start":"2ST-QgE9CHHHpBZTV-6Wf","end":"jzT1W26CtSdoOxjjRAwIa","type":"followRoads","profile":"trailmap_foot","initial_heading":180.02035735104104,"heading_penalty":60},{"start":"jzT1W26CtSdoOxjjRAwIa","end":"YG6fKiCqsVj1uixShoOdh","type":"followRoads","profile":"trailmap_foot","initial_heading":146.4462362870795,"heading_penalty":60},{"start":"YG6fKiCqsVj1uixShoOdh","end":"AhBtdkHX5oD0GcBD0kwTt","type":"followRoads","profile":"trailmap_foot","initial_heading":183.51994471931474,"heading_penalty":60},{"start":"AhBtdkHX5oD0GcBD0kwTt","end":"3_yw3pN-2QnucrIQydpsy","type":"followRoads","profile":"trailmap_foot","initial_heading":107.00143942354526,"heading_penalty":60},{"start":"3_yw3pN-2QnucrIQydpsy","end":"dmu-Exracy3yk0Ilj0V0s","type":"followRoads","profile":"trailmap_foot","initial_heading":72.84994019014738,"heading_penalty":60},{"start":"dmu-Exracy3yk0Ilj0V0s","end":"7ks_Tmw6-j0im2dp54gFK","type":"followRoads","profile":"trailmap_foot","initial_heading":10.905116682749394,"heading_penalty":60},{"start":"7ks_Tmw6-j0im2dp54gFK","end":"tuFhOJbjY7gsDEtvt9ucm","type":"followRoads","profile":"trailmap_foot","initial_heading":358.29740160643377,"heading_penalty":60},{"start":"tuFhOJbjY7gsDEtvt9ucm","end":"gmn6oPOAfWjQBl7odyNdh","type":"followRoads","profile":"trailmap_foot","initial_heading":112.78060060363123,"heading_penalty":60},{"start":"gmn6oPOAfWjQBl7odyNdh","end":"yrVJE97IJ5u82yaSP1hdg","type":"followRoads","profile":"trailmap_foot","initial_heading":159.14229441933594,"heading_penalty":60},{"start":"yrVJE97IJ5u82yaSP1hdg","end":"urUGvrqxJZF2M7iO1LBpE","type":"followRoads","profile":"trailmap_foot","initial_heading":82.48089403123015,"heading_penalty":60},{"start":"urUGvrqxJZF2M7iO1LBpE","end":"T87-SK9kympvVh0nqnQRd","type":"followRoads","profile":"trailmap_foot","initial_heading":83.47019631644531,"heading_penalty":60},{"start":"T87-SK9kympvVh0nqnQRd","end":"JZkxNzNfg6iOc1Eslf60e","type":"followRoads","profile":"trailmap_foot","initial_heading":49.66367983881224,"heading_penalty":60},{"start":"JZkxNzNfg6iOc1Eslf60e","end":"7b8AJlExQVG_-o2hBOhYa","type":"followRoads","profile":"trailmap_foot","initial_heading":277.31685071578994,"heading_penalty":60},{"start":"7b8AJlExQVG_-o2hBOhYa","end":"HOfw89dAPE207XREgEhjw","type":"followRoads","profile":"trailmap_foot","initial_heading":307.8697049131599,"heading_penalty":60},{"start":"HOfw89dAPE207XREgEhjw","end":"tJ21lJ0761PaQs8WhgzRu","type":"followRoads","profile":"trailmap_foot","initial_heading":274.88694198186147,"heading_penalty":60},{"start":"tJ21lJ0761PaQs8WhgzRu","end":"LV0IdraEbxr2wWtS-Ml7X","type":"followRoads","profile":"trailmap_foot","initial_heading":296.7308679697639,"heading_penalty":60},{"start":"LV0IdraEbxr2wWtS-Ml7X","end":"IX0BTmrCDzZRAQhpWzuB5","type":"direct"},{"start":"IX0BTmrCDzZRAQhpWzuB5","end":"DAnrDmlLoHlJJ8miqAASX","type":"direct"},{"start":"DAnrDmlLoHlJJ8miqAASX","end":"4YWDFlOp98cSq07RLVhN0","type":"direct"},{"start":"4YWDFlOp98cSq07RLVhN0","end":"PqCbslBn0fE8n2rADNlq9","type":"followRoads","profile":"trailmap_foot"},{"start":"PqCbslBn0fE8n2rADNlq9","end":"AgK3Q7lvQJd5wRZrt_efY","type":"followRoads","profile":"trailmap_foot","initial_heading":288.3070574305393,"heading_penalty":60},{"start":"AgK3Q7lvQJd5wRZrt_efY","end":"j6JK3PtG-D36uuweahmx-","type":"followRoads","profile":"trailmap_foot","initial_heading":299.69416525437276,"heading_penalty":60},{"start":"j6JK3PtG-D36uuweahmx-","end":"TsYyByyrBOWwaLNjlgUAP","type":"followRoads","profile":"trailmap_foot","initial_heading":342.71318268058434,"heading_penalty":60},{"start":"TsYyByyrBOWwaLNjlgUAP","end":"o0YukMVhPvYxzGKPJOhHr","type":"followRoads","profile":"trailmap_foot","initial_heading":66.83707841617365,"heading_penalty":60},{"start":"o0YukMVhPvYxzGKPJOhHr","end":"ZR8ICH2DlNhM8NiWq6HvK","type":"followRoads","profile":"trailmap_foot","initial_heading":91.8892623971164,"heading_penalty":60},{"start":"ZR8ICH2DlNhM8NiWq6HvK","end":"F0k_TKp0t88YVb6AIFbt7","type":"followRoads","profile":"trailmap_foot","initial_heading":51.60648152548936,"heading_penalty":60},{"start":"F0k_TKp0t88YVb6AIFbt7","end":"fSeXO2c5LEVNynOF1XFQj","type":"followRoads","profile":"trailmap_foot","initial_heading":289.028350134544,"heading_penalty":60},{"start":"fSeXO2c5LEVNynOF1XFQj","end":"G2vow6DjQZyaWRhRrpri_","type":"followRoads","profile":"trailmap_foot","initial_heading":218.78730343462803,"heading_penalty":60},{"start":"G2vow6DjQZyaWRhRrpri_","end":"MlGs6z5wGP1gbcEWyVbwY","type":"followRoads","profile":"trailmap_foot","initial_heading":268.1071314292814,"heading_penalty":60},{"start":"MlGs6z5wGP1gbcEWyVbwY","end":"9bbre0PT0TqKDNfMcPEuK","type":"followRoads","profile":"trailmap_foot","initial_heading":324.5408067040139,"heading_penalty":60},{"start":"9bbre0PT0TqKDNfMcPEuK","end":"pgyUuWLPC9wUtpEcKwDB2","type":"followRoads","profile":"trailmap_foot","initial_heading":255.62891429747688,"heading_penalty":60},{"start":"pgyUuWLPC9wUtpEcKwDB2","end":"cCMvvqQu6LIOZIxIwhCbl","type":"followRoads","profile":"trailmap_foot","initial_heading":185.38093119698195,"heading_penalty":60},{"start":"cCMvvqQu6LIOZIxIwhCbl","end":"L3MgZ_tfo83DWp3xqVeO3","type":"followRoads","profile":"trailmap_foot","initial_heading":317.48027109955666,"heading_penalty":60},{"start":"L3MgZ_tfo83DWp3xqVeO3","end":"VmkfjvEYiCMt1Mt_FswGv","type":"followRoads","profile":"trailmap_foot","initial_heading":294.29310606547796,"heading_penalty":60},{"start":"VmkfjvEYiCMt1Mt_FswGv","end":"TfDQsnAnYQ7_UbRHnjl2a","type":"followRoads","profile":"trailmap_foot","initial_heading":285.2757870976621,"heading_penalty":60},{"start":"TfDQsnAnYQ7_UbRHnjl2a","end":"Xl2JUPa5oGR1GfnDY22-q","type":"followRoads","profile":"trailmap_foot","initial_heading":244.55404341226068,"heading_penalty":60},{"start":"Xl2JUPa5oGR1GfnDY22-q","end":"mzE7Cy7dPiZgmJBM4ntrI","type":"followRoads","profile":"trailmap_foot","initial_heading":129.59408919044762,"heading_penalty":60},{"start":"mzE7Cy7dPiZgmJBM4ntrI","end":"f0c5XyeXaLNixY-c6IxbA","type":"followRoads","profile":"trailmap_foot","initial_heading":175.72505878646393,"heading_penalty":60},{"start":"f0c5XyeXaLNixY-c6IxbA","end":"QGM41yPSplQCHORM1vsMQ","type":"followRoads","profile":"trailmap_foot","initial_heading":200.4621954486551,"heading_penalty":60},{"start":"QGM41yPSplQCHORM1vsMQ","end":"vulWvIlX4bwaDDxyZKGbd","type":"followRoads","profile":"trailmap_foot","initial_heading":211.3351577850017,"heading_penalty":60},{"start":"vulWvIlX4bwaDDxyZKGbd","end":"SXH3JiecIs86oigBdmyTV","type":"followRoads","profile":"trailmap_foot","initial_heading":233.56985737334182,"heading_penalty":60},{"start":"SXH3JiecIs86oigBdmyTV","end":"1fzONZYsxsWyg_toFA8DA","type":"followRoads","profile":"trailmap_foot","initial_heading":152.50700080502315,"heading_penalty":60},{"start":"1fzONZYsxsWyg_toFA8DA","end":"yeG0xIYQnPudc-DxruT1U","type":"followRoads","profile":"trailmap_foot","initial_heading":201.4647124952662,"heading_penalty":60},{"start":"yeG0xIYQnPudc-DxruT1U","end":"daGPEvlhUQkk72BHvrQwc","type":"followRoads","profile":"trailmap_foot","initial_heading":196.13101742821402,"heading_penalty":60},{"start":"daGPEvlhUQkk72BHvrQwc","end":"djSe4eVUC6Xsn8wFKclTt","type":"followRoads","profile":"trailmap_foot","initial_heading":202.99638757423105,"heading_penalty":60},{"start":"djSe4eVUC6Xsn8wFKclTt","end":"F5SkkctZGZ8RNJyVqgqa0","type":"followRoads","profile":"trailmap_foot","initial_heading":225.62880256767912,"heading_penalty":60},{"start":"F5SkkctZGZ8RNJyVqgqa0","end":"e29GO5aH6yqjGRBhXwSja","type":"direct"},{"start":"e29GO5aH6yqjGRBhXwSja","end":"ebQjZVu_gtPO8iE8pg-_A","type":"followRoads","profile":"trailmap_foot"},{"start":"ebQjZVu_gtPO8iE8pg-_A","end":"NHBUP--um68jQP54CWDyD","type":"followRoads","profile":"trailmap_foot","initial_heading":88.70916576588178,"heading_penalty":60},{"start":"NHBUP--um68jQP54CWDyD","end":"dBvFo2o_1KrkfNXeGlWSa","type":"followRoads","profile":"trailmap_foot","initial_heading":116.31748205461446,"heading_penalty":60},{"start":"dBvFo2o_1KrkfNXeGlWSa","end":"NvtWRNRV6z1MSciIv4WhE","type":"followRoads","profile":"trailmap_foot","initial_heading":102.08251054196018,"heading_penalty":60},{"start":"NvtWRNRV6z1MSciIv4WhE","end":"NFvpySH-KI3UpoBsBt1BN","type":"followRoads","profile":"trailmap_foot","initial_heading":155.8172550860728,"heading_penalty":60},{"start":"NFvpySH-KI3UpoBsBt1BN","end":"Bspfp3ZeR1J3T8BqeuTM9","type":"followRoads","profile":"trailmap_foot","initial_heading":265.9353903602594,"heading_penalty":60},{"start":"Bspfp3ZeR1J3T8BqeuTM9","end":"4r49rcAieMmT8SLeP0MiK","type":"followRoads","profile":"trailmap_foot","initial_heading":165.32864804732571,"heading_penalty":60},{"start":"4r49rcAieMmT8SLeP0MiK","end":"owYlJPvUqBH_xK1c682t2","type":"followRoads","profile":"trailmap_foot","initial_heading":146.24154778379625,"heading_penalty":60},{"start":"owYlJPvUqBH_xK1c682t2","end":"P8F4HvD8wAVqrgyqrkxiu","type":"followRoads","profile":"trailmap_foot","initial_heading":137.4143802676599,"heading_penalty":60},{"start":"P8F4HvD8wAVqrgyqrkxiu","end":"tJE0_N_bc2FF-gAbh5TJ6","type":"followRoads","profile":"trailmap_foot","initial_heading":129.30456519389048,"heading_penalty":60},{"start":"tJE0_N_bc2FF-gAbh5TJ6","end":"5XQiF21cexxq1zeONhqRt","type":"followRoads","profile":"trailmap_foot","initial_heading":110.24472519949546,"heading_penalty":60},{"start":"5XQiF21cexxq1zeONhqRt","end":"1FGkfWP7Ksre493Mc-yQK","type":"followRoads","profile":"trailmap_foot","initial_heading":0.16055036164573266,"heading_penalty":60},{"start":"1FGkfWP7Ksre493Mc-yQK","end":"A9p9mC4x0XZ_rmwDKnLWO","type":"followRoads","profile":"trailmap_foot","initial_heading":56.223428351071675,"heading_penalty":60}],"instruction_profile":"trailmap_foot","locale":"fi","snap_preventions":["ferry"]}
 """;
+
+    // ===================================================================================
+    // Saariselkä placement diagnostic (2026-07-09): why does matchInstructionStarts put the
+    // 20.4 km KEEP_RIGHT on the RETURN pass of the ~2.2 km out-and-back (interval +4462 m)?
+    // Hypothesis under test: the outbound junction vertex was Douglas-Peucker-simplified out
+    // of the shipped polyline, so the return-pass vertex is the ONLY near-exact candidate and
+    // the "unique match is never second-guessed" rule takes it despite _cum_route_m pointing
+    // 4.5 km earlier. See InstructionPlacementValidationTest + the placement design doc §12.
+    // ===================================================================================
+
+    @Test
+    void saariselkaPlacementDiag_occurrenceVertexAnalysis() throws Exception {
+        Assumptions.assumeTrue(hopper != null, "graph cache required");
+        TrailmapInstructionRequest request;
+        try (java.io.InputStream in = RouteInstructionGeneratorTest.class.getResourceAsStream(
+                "placement/saariselka_misplaced_left_uturn.json")) {
+            assertNotNull(in, "payload resource missing");
+            request = InstructionPlacementValidationTest.parsePayload(new String(in.readAllBytes()));
+        }
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, hopper.getBaseGraph(), hopper.getEncodingManager(), hopper.getTranslationMap());
+
+        RouteInstructionGenerator.REMAP_DIAG_LOG.clear();
+        RouteInstructionGenerator.REMAP_DIAG = true;
+        RouteInstructionGenerator.PLACEMENT_TRACE_LOG.clear();
+        RouteInstructionGenerator.PLACEMENT_TRACE = true;
+        RouteInstructionGenerator.Result result;
+        List<RouteInstructionGenerator.PlacementTraceRecord> traceRecords;
+        try {
+            result = generator.generate(request);
+            traceRecords = new ArrayList<>(RouteInstructionGenerator.PLACEMENT_TRACE_LOG);
+        } finally {
+            RouteInstructionGenerator.REMAP_DIAG = false;
+            RouteInstructionGenerator.PLACEMENT_TRACE = false;
+            RouteInstructionGenerator.PLACEMENT_TRACE_LOG.clear();
+        }
+        new InstructionPostProcessor().process(result.instructions, request.getInstructionProfile());
+        List<Integer> starts = RouteInstructionGenerator.matchInstructionStarts(result.instructions, result.polyline);
+
+        PointList poly = result.polyline;
+        double[] polyCum = new double[poly.size()];
+        for (int k = 1; k < poly.size(); k++)
+            polyCum[k] = polyCum[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    poly.getLat(k - 1), poly.getLon(k - 1), poly.getLat(k), poly.getLon(k));
+
+        System.out.println("=== final instructions 30..45: stamps, matched interval, occurrence census ===");
+        for (int i = 30; i <= Math.min(45, result.instructions.size() - 1); i++) {
+            Instruction instr = result.instructions.get(i);
+            Object cum = instr.getExtraInfoJSON().get("_cum_route_m");
+            Object genNode = instr.getExtraInfoJSON().get("_gen_node_id");
+            PointList pts = instr.getPoints();
+            double tLat = pts.size() > 0 ? pts.getLat(0) : Double.NaN;
+            double tLon = pts.size() > 0 ? pts.getLon(0) : Double.NaN;
+            int idx = starts.get(i);
+            System.out.printf(java.util.Locale.ROOT,
+                    "instr %2d sign=%3d node=%s _cum_route_m=%9.1f  start=%5d (polyCum %9.1f)  firstPt=(%.7f, %.7f)%n",
+                    i, instr.getSign(), genNode, cum instanceof Number ? ((Number) cum).doubleValue() : Double.NaN,
+                    idx, polyCum[idx], tLat, tLon);
+            // Census: every polyline vertex within the matcher's 5e-6 manhattan-deg threshold of
+            // this instruction's first coordinate, over the WHOLE polyline.
+            if (pts.size() > 0) {
+                for (int pi = 0; pi < poly.size(); pi++) {
+                    double cd = Math.abs(poly.getLat(pi) - tLat) + Math.abs(poly.getLon(pi) - tLon);
+                    if (cd < 5e-6) {
+                        System.out.printf(java.util.Locale.ROOT,
+                                "        near-exact vertex: idx=%5d polyCum=%9.1f cd=%.2e%n", pi, polyCum[pi], cd);
+                    }
+                }
+            }
+        }
+
+        // Double-count census: at every same-direction stitch boundary (record N's last edge ==
+        // record N+1's first edge), appendInstructions' strip-merge re-adds the full shared edge
+        // that the previous instruction's distance already covered. Sum vs observed _cum_route_m
+        // inflation (~9.9 km by route end) is the verdict on the hypothesis.
+        System.out.println("=== same-direction boundary shared edges (double-count candidates) ===");
+        double dblSum = 0;
+        RouteInstructionGenerator.PlacementTraceRecord prevRouted = null;
+        for (RouteInstructionGenerator.PlacementTraceRecord rec : traceRecords) {
+            if (rec.type != RouteInstructionGenerator.PlacementTraceRecord.ROUTED) {
+                if (rec.type == RouteInstructionGenerator.PlacementTraceRecord.GAP) prevRouted = null;
+                continue;
+            }
+            if (prevRouted != null && !prevRouted.edgeIds.isEmpty() && !rec.edgeIds.isEmpty()
+                    && prevRouted.edgeIds.get(prevRouted.edgeIds.size() - 1).equals(rec.edgeIds.get(0))) {
+                int sharedEdge = rec.edgeIds.get(0);
+                double len = hopper.getBaseGraph()
+                        .getEdgeIteratorState(sharedEdge, Integer.MIN_VALUE).getDistance();
+                // Same-direction vs U-turn boundary: U-turn boundaries keep the patched U_TURN
+                // instruction (not stripped), so only same-direction boundaries strip-merge.
+                boolean secondCopyToo = rec.edgeIds.size() > 1 && rec.edgeIds.get(1).equals((Integer) sharedEdge);
+                System.out.printf(java.util.Locale.ROOT,
+                        "boundary before polyIdx %d: shared edge %d len=%.1f m%s%n",
+                        rec.polyBefore, sharedEdge, len, secondCopyToo ? " (duplicated in chain: U-turn keep-both)" : "");
+                dblSum += len;
+            }
+            prevRouted = rec;
+        }
+        System.out.printf(java.util.Locale.ROOT, "sum of boundary shared-edge lengths: %.1f m%n", dblSum);
+
+        System.out.println("=== REMAP_DIAG coordMatch rows landing in the spur region (19..30 km) ===");
+        System.out.println("    (branch: 0=first 1=FINISH 2=hint 3=emptyPts 4=coordMatch)");
+        for (double[] r : RouteInstructionGenerator.REMAP_DIAG_LOG) {
+            int branch = (int) r[1];
+            int chosen = (int) r[4];
+            if (branch == 4 && chosen >= 0 && polyCum[Math.min(chosen, polyCum.length - 1)] > 19000
+                    && polyCum[Math.min(chosen, polyCum.length - 1)] < 30000) {
+                System.out.printf(java.util.Locale.ROOT,
+                        "prePP %3d sign=%3d searchFrom=%5d chosen=%5d (polyCum %9.1f, bestDist %.2e) "
+                                + "globalBest=%5d (polyCum %9.1f, dist %.2e) target=(%.7f, %.7f)%n",
+                        (int) r[0], (int) r[2], (int) r[3], chosen,
+                        polyCum[Math.min(chosen, polyCum.length - 1)],
+                        r[5], (int) r[6], polyCum[Math.min((int) r[6], polyCum.length - 1)], r[7], r[8], r[9]);
+            }
+        }
+        assertTrue(result.instructions.size() > 60);
+    }
 }

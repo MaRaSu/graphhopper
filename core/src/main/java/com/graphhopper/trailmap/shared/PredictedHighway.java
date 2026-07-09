@@ -62,4 +62,29 @@ public enum PredictedHighway {
             return UNKNOWN;
         }
     }
+
+    // =====================================================================
+    // Internal -> external projection
+    // =====================================================================
+    //
+    // Some PredictedHighway values may be internal-only refinements: stored on the
+    // edge for routing weight / analysis, but never exposed to API clients and not
+    // distinguished by consumers that intentionally reason at the coarser level
+    // (e.g. TbT instruction classification). There are none at present, so this is
+    // the identity. When an internal-only value is introduced (e.g. a
+    // service=driveway split of SERVICE_ROAD), project it to its coarse parent here.
+
+    /**
+     * Project this (possibly internal-only) value to the coarser value that crosses
+     * the API wire and that classification consumers should reason about. Identity for
+     * values that are already client-facing (currently all of them).
+     *
+     * <p>Called at every boundary that must not leak an internal refinement: response
+     * serialization to clients, and road/trail classification that should treat a
+     * refinement like its coarse parent. Routing weight (custom models) and analysis
+     * read the raw enum directly and would still see the fine-grained value.
+     */
+    public PredictedHighway toExternal() {
+        return this;
+    }
 }

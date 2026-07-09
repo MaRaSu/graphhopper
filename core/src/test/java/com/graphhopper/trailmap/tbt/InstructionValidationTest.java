@@ -3128,6 +3128,80 @@ public class InstructionValidationTest {
                 + "instructions. Instructions: " + summarizeInstructions(result));
     }
 
+    // ========== Test 24: Shape 3b — same-side confusable fork at a type change → KEEP ==========
+
+    /**
+     * Rider on a GOOD_TRACK reaches a fork where BOTH branches turn right: the route bends
+     * ~12° right onto a PATH, while the same-type GOOD_TRACK continues ~47° right. F1 emits
+     * the absolute-angle TURN_SLIGHT_RIGHT for the PH change (GOOD_TRACK→PATH), but "slightly
+     * right" is ambiguous — it points at the same side as the more-extreme, same-family track
+     * the rider could take by mistake.
+     *
+     * The reframer's Shape 3b must recognise the same-side confusable fork partner and relabel
+     * to the fork-relative KEEP_LEFT (bear left onto the path, away from the right-hand track),
+     * even though (a) there is a type change at the junction — the alt-blind type-change guard
+     * must be neutralised by the confusable partner — and (b) the geometric route/alt spread
+     * (~35°) exceeds the default same-side spread cap (33°).
+     *
+     * Regression guards the reframer PH-comparison fix: type info stays in extraInfo
+     * (predicted_highway=PATH); only the ambiguous direction word changes.
+     *
+     * Origin: diagnoseSlightRightWithConfusableRightAlt in RouteInstructionGeneratorTest
+     */
+    @Test
+    void sameSideConfusableForkAtTypeChange_reframesToKeep() {
+        TrailmapInstructionRequest request = new TrailmapInstructionRequest();
+        request.setWaypoints(List.of(
+                makeWaypoint("wp1", 68.451541, 27.353463),
+                makeWaypoint("wp2", 68.450621, 27.354399)));
+
+        TrailmapInstructionRequest.Segment seg = new TrailmapInstructionRequest.Segment();
+        seg.setStart("wp1");
+        seg.setEnd("wp2");
+        seg.setType(TrailmapInstructionRequest.TYPE_FOLLOW_ROADS);
+        seg.setProfile("gravel");
+
+        request.setSegments(List.of(seg));
+        request.setInstructionProfile("gravel");
+        request.setLocale("fi");
+        request.setSnapPreventions(List.of("ferry"));
+
+        RouteInstructionGenerator.Result result = generator.generate(request);
+        assertValidInstructionList(result);
+
+        // Locate the GOOD_TRACK→PATH transition instruction.
+        Instruction transitionInstr = null;
+        for (Instruction instr : result.instructions) {
+            Map<String, Object> extra = instr.getExtraInfoJSON();
+            if ("GOOD_TRACK".equals(extra.get("prev_predicted_highway"))
+                    && "PATH".equals(extra.get("predicted_highway"))) {
+                transitionInstr = instr;
+                break;
+            }
+        }
+        assertNotNull(transitionInstr,
+                "Must have a GOOD_TRACK→PATH transition instruction at the confusable fork. "
+                + "Instructions: " + summarizeInstructions(result));
+
+        // Reframer must relabel the ambiguous slight-right to fork-relative KEEP_LEFT.
+        assertEquals(Instruction.KEEP_LEFT, transitionInstr.getSign(),
+                "Same-side confusable fork at a type change must reframe to KEEP_LEFT (not "
+                + signName(transitionInstr.getSign()) + "). Instructions: "
+                + summarizeInstructions(result));
+
+        Map<String, Object> extra = transitionInstr.getExtraInfoJSON();
+        assertEquals("shape_3b_sameside_fork", extra.get("reframer_shape"),
+                "Must be reframed by Shape 3b (same-side confusable fork). Instructions: "
+                + summarizeInstructions(result));
+        assertNotNull(extra.get("reframed_from"),
+                "Reframed instruction must record the original sign. Instructions: "
+                + summarizeInstructions(result));
+        assertEquals(Instruction.TURN_SLIGHT_RIGHT,
+                ((Number) extra.get("reframed_from")).intValue(),
+                "Original (pre-reframe) sign must be TURN_SLIGHT_RIGHT. Instructions: "
+                + summarizeInstructions(result));
+    }
+
     // ==================== Shared assertion helpers ====================
 
     /**
@@ -3431,9 +3505,11 @@ public class InstructionValidationTest {
     /**
      * The client-facing interval index must be derived from each instruction's coordinate-matched
      * polyline position (matchInstructionStarts), run on the FINAL post-processed list — not from
-     * cumulative getLength(). On the reported 152 km route this proves (a) the legacy getLength
-     * accounting drifted by a polyline point = hundreds of metres, and (b) the new interval start
-     * lands exactly on each instruction's turn vertex. Reuses the diagnostic payload.
+     * cumulative getLength(). On the reported 152 km route this proves (a) the getLength point-count
+     * accounting agrees with the coordinate-matched starts (the +1 phantom-point injection at the
+     * coordinates-gap resume was eliminated at source by the dedup-aware _polyline_start_hint,
+     * 2026-07-09 — before that fix this route drifted hundreds of metres), and (b) the interval
+     * start lands exactly on each instruction's turn vertex. Reuses the diagnostic payload.
      */
     @Test
     void intervalStartsLandOnTurns_152kmRoute() throws Exception {
@@ -3460,15 +3536,19 @@ public class InstructionValidationTest {
             cum[k] = cum[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
                     poly.getLat(k - 1), poly.getLon(k - 1), poly.getLat(k), poly.getLon(k));
 
-        // (a) the legacy getLength()-based interval drifted significantly here.
+        // (a) point-count accounting agrees with the coordinate-matched starts. This route used to
+        // inject a +1 phantom point at its coordinates-gap resume (empty hint slice), drifting the
+        // point-count interval by hundreds of metres; the dedup-aware _polyline_start_hint removed
+        // the injection at source. Drift growing again means phantom points are back.
         int acc = 0; double worstLegacyM = 0;
         for (int i = 0; i < result.instructions.size(); i++) {
             int legacyStart = Math.min(acc, N - 1);
             worstLegacyM = Math.max(worstLegacyM, Math.abs(cum[legacyStart] - cum[starts.get(i)]));
             acc += result.instructions.get(i).getLength();
         }
-        assertTrue(worstLegacyM > 100.0,
-                "expected the legacy getLength interval to drift >100m on this route; was " + worstLegacyM);
+        assertTrue(worstLegacyM < 5.0,
+                "point-count interval accounting must agree with coordinate-matched starts "
+                        + "(phantom-point regression); worst drift was " + worstLegacyM + "m");
 
         // (b) the new interval start sits on each instruction's own turn vertex.
         double worstNewM = 0; int worstI = -1;

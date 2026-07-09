@@ -84,6 +84,14 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     // Reset at the start of each reframeSign() call. Read by next() to tag extraInfo.
     private String lastReframerShape = null;
 
+    // --- Placement-validation stamps (internal, `_`-prefixed → stripped by serializer) ---
+    // Cumulative synthetic-path distance walked BEFORE the current edge, i.e. the distance
+    // to the current junction (baseNode). Stamped together with the junction node id at every
+    // instruction CREATION site (never on the U-turn reuse path, whose anchor stays at its
+    // creation junction). Set before and independently of geometry remapping / coordinate
+    // matching, so the placement-validation oracle may consume them non-circularly.
+    private double cumSynthM = 0;
+
     private static final int MAX_U_TURN_DISTANCE = 35;
 
     public TrailmapInstructionsFromEdges(Graph graph, Weighting weighting, EncodedValueLookup evLookup,
@@ -205,6 +213,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
 
             lastOutgoingEdges = null;
             enrichExtraInfo(prevInstruction, edge, null);
+            stampCreationPoint(prevInstruction, baseNode);
 
             ways.add(prevInstruction);
             prevName = name;
@@ -245,6 +254,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                     prevBikeNetwork = currentBN;
                 }
                 prevInstruction = roundaboutInstruction;
+                stampCreationPoint(prevInstruction, baseNode);
                 ways.add(prevInstruction);
             }
 
@@ -342,6 +352,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                     prevInstruction = new Instruction(sign, name, new PointList(10, nodeAccess.is3D()));
                     prevInstructionPrevOrientation = prevOrientation;
                     prevInstructionName = prevName;
+                    stampCreationPoint(prevInstruction, baseNode);
                     ways.add(prevInstruction);
                 }
                 prevInstruction.setExtraInfo(STREET_REF, ref);
@@ -401,6 +412,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         prevLat = adjLat;
         prevLon = adjLon;
         prevEdge = edge;
+        cumSynthM += edge.getDistance();
     }
 
     @Override
@@ -413,7 +425,19 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         }
         Instruction finishInstruction = new FinishInstruction(nodeAccess, prevEdge.getAdjNode());
         finishInstruction.setExtraInfo("last_heading", AngleCalc.ANGLE_CALC.calcAzimuth(doublePrevLat, doublePrevLon, prevLat, prevLon));
+        stampCreationPoint(finishInstruction, prevEdge.getAdjNode());
         ways.add(finishInstruction);
+    }
+
+    /**
+     * Stamp the creation-time placement anchor: the junction node the instruction is emitted at
+     * and the synthetic-path distance to it. Called ONLY where a new Instruction object joins
+     * {@code ways} (first instruction, roundabout entry, normal turn, FINISH) — never on the
+     * U-turn conversion path, which reuses the previous instruction and keeps its original anchor.
+     */
+    private void stampCreationPoint(Instruction instruction, int nodeId) {
+        instruction.setExtraInfo("_gen_node_id", nodeId);
+        instruction.setExtraInfo("_gen_cum_synth_m", cumSynthM);
     }
 
     // ========================================================================
@@ -1351,6 +1375,10 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
      * getting wider). From a wide cycleway, a narrow path is obviously different.
      */
     private static boolean isConfusableFrom(PredictedHighway current, PredictedHighway alt) {
+        // Classify on the external (coarse) value: internal-only refinements such as
+        // SERVICE_DRIVEWAY must behave exactly like their coarse parent (SERVICE_ROAD).
+        current = current.toExternal();
+        alt = alt.toExternal();
         switch (current) {
             case PATH:
             case OUTDOOR_PATH:
@@ -1404,6 +1432,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
      * Excludes CYCLEWAY — unpaved Finnish cycleways are visually similar to outdoor paths/tracks.
      */
     private static boolean isRoadInfrastructure(PredictedHighway ph) {
+        ph = ph.toExternal();   // SERVICE_DRIVEWAY -> SERVICE_ROAD, etc.
         return ph == PredictedHighway.MOTORWAY
                 || ph == PredictedHighway.MAJOR_ROAD
                 || ph == PredictedHighway.MINOR_ROAD
@@ -1429,6 +1458,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
      * competing-alt guard). Only {@link #bothNonRoadAtJunction} uses this variant.
      */
     private static boolean isReframerHardRoad(PredictedHighway ph) {
+        ph = ph.toExternal();   // collapse internal-only refinements onto their coarse parent
         return ph == PredictedHighway.MOTORWAY
                 || ph == PredictedHighway.MAJOR_ROAD
                 || ph == PredictedHighway.MINOR_ROAD;
@@ -1440,6 +1470,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
      * addition if real-world data shows other non-road types need the same hint.
      */
     private static boolean isNonRoadTarget(PredictedHighway ph) {
+        ph = ph.toExternal();   // collapse internal-only refinements onto their coarse parent
         return ph == PredictedHighway.CYCLEWAY
                 || ph == PredictedHighway.FOOTWAY
                 || ph == PredictedHighway.PATH;
@@ -1451,6 +1482,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
      */
     private static int phProminence(PredictedHighway ph) {
         if (ph == null) return 0;
+        ph = ph.toExternal();   // SERVICE_DRIVEWAY ranks as SERVICE_ROAD, etc.
         switch (ph) {
             case MOTORWAY:     return 10;
             case MAJOR_ROAD:   return 9;
@@ -1691,6 +1723,34 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         boolean straightAheadReference =
                 hasStraightAheadReferenceIgnoringSurface(baseNode, routeEdge, routeDelta);
 
+        // Shape 3b confusable same-side fork partner (PH-comparison fix). A visible alt on
+        // the route's OWN side, in the same visual family (type bucket + surface) as the route
+        // or incoming way and more extreme than the route, is a branch the rider could take by
+        // mistake — the route's slight-turn direction word points at the same side as this
+        // alt. Its presence means the junction IS a same-side fork to disambiguate, so it
+        // (a) neutralises the alt-blind type-change guard and (b) relaxes the same-side spread
+        // cap. Scoped to non-road junctions (hard-road forks keep reliable F1/RC/name cues).
+        //
+        // Deliberately same-side only: an OPPOSITE-side confusable alt (the Shape 3a straddle)
+        // does not create this collision — the route's slight-turn word points away from it —
+        // so F1's angular type-cue is unambiguous there and is preserved (see the
+        // cyclewayToPathFork straddle case). The type-change guard is alt-blind in both
+        // shapes, but only harmful in the same-side one.
+        boolean confusableSameSidePartner = false;
+        if (bothNonRoadAtJunction(routeEdge)) {
+            for (double altDelta : collectConfusableAltDeltas(baseNode, routeEdge, routeSurface)) {
+                boolean sameSideMoreExtremeAlt = (routeDelta < 0
+                        && altDelta < routeDelta - REFRAMER_ROUTE_NOISE_MARGIN)
+                        || (routeDelta > 0
+                        && altDelta > routeDelta + REFRAMER_ROUTE_NOISE_MARGIN);
+                if (sameSideMoreExtremeAlt
+                        && Math.abs(altDelta) <= REFRAMER_SHAPE1_ALT_CLEARLY_OFF) {
+                    confusableSameSidePartner = true;
+                    break;
+                }
+            }
+        }
+
         // Shape 4 (sandwich) past-slight branch — the route is past the slight bucket
         // but sits in the middle of a fan with at least one same-side alt that is more
         // extreme. The rule chain emitted KEEP_LEFT/RIGHT (fork-handler interpretation
@@ -1902,11 +1962,13 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             maxSpread = Math.max(maxSpread, Math.abs(altDelta - routeDelta));
         }
 
-        // Shape 3b — same-side Y-fork (small spread, route in slight zone).
-        // Same upgrade restriction as Shape 3a.
-        if (maxSpread <= REFRAMER_SAMESIDE_SPREAD
+        // Shape 3b — same-side Y-fork (route in slight zone). A small geometric spread marks
+        // the fork; a confusable same-side partner also marks it (and, like Shape 3a, then
+        // neutralises the type-change guard) even when the OSM spread runs a little past the
+        // cap — a same-family branch reads as a fork despite the wider geometric angle (E.6).
+        if ((maxSpread <= REFRAMER_SAMESIDE_SPREAD || confusableSameSidePartner)
                 && Math.abs(routeDelta) <= REFRAMER_SHAPE3B_ROUTE_CLAMP
-                && shape3InputCanUpgrade(decidedSign, typeChange)) {
+                && shape3InputCanUpgrade(decidedSign, typeChange && !confusableSameSidePartner)) {
             lastReframerShape = "shape_3b_sameside_fork";
             return leftOfRoute ? Instruction.KEEP_RIGHT : Instruction.KEEP_LEFT;
         }
@@ -2170,6 +2232,66 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         return deltas;
     }
 
+    /**
+     * Confusable fork-partner deltas at the junction: the subset of visible alts whose
+     * PredictedHighway is confusable (per {@link #isConfusableFrom}) with the route's OR
+     * the incoming edge's PH — the same dual-anchor idea the surface gate uses. These are
+     * the alts the rider could take by mistake at a fork: same visual family (type bucket +
+     * surface) as the way they are on or turning onto.
+     *
+     * <p>Used only by Shape 3b (same-side fork). The type-change guard
+     * ({@link #shape3InputCanUpgrade}) exists to preserve F1's angular type-transition cue,
+     * but that reasoning is alt-blind — it keys off incoming→route PH difference alone. When a
+     * confusable same-side fork partner is present the junction IS a fork to disambiguate
+     * (often the confusable branch continues the rider's incoming type while the route peels
+     * onto a new one — the type change then argues FOR the fork cue, not against it). Such a
+     * partner therefore neutralises the guard and relaxes the {@link #REFRAMER_SAMESIDE_SPREAD}
+     * cap — the same "confusable alts read as forward branches despite OSM angle" logic behind
+     * the extended cone in {@link #collectVisualAltDeltas} (E.6).
+     *
+     * <p>Callers scope this to non-road junctions (hard-road forks keep reliable name/RC/F1
+     * cues); the confusability premise is a trail/track phenomenon.
+     */
+    private List<Double> collectConfusableAltDeltas(int baseNode, EdgeIteratorState routeEdge,
+                                                    PredictedSurface routeSurface) {
+        List<Double> deltas = new ArrayList<>();
+        if (predictedHighwayEnc == null) return deltas;
+        PredictedHighway routePH = routeEdge.get(predictedHighwayEnc);
+        PredictedHighway prevPH = prevEdge != null ? prevEdge.get(predictedHighwayEnc) : null;
+        PredictedSurface prevSurface = (prevEdge != null && predictedSurfaceEnc != null)
+                ? prevEdge.get(predictedSurfaceEnc) : null;
+        EdgeIterator iter = allExplorer.setBaseNode(baseNode);
+        while (iter.next()) {
+            if (iter.getEdge() == routeEdge.getEdge()) continue;
+            if (prevEdge != null && iter.getEdge() == prevEdge.getEdge()) continue;
+
+            // PH-confusable against either anchor (route or incoming).
+            PredictedHighway altPH = iter.get(predictedHighwayEnc);
+            boolean phConfusable = (routePH != null && isConfusableFrom(routePH, altPH))
+                    || (prevPH != null && isConfusableFrom(prevPH, altPH));
+            if (!phConfusable) continue;
+
+            // Dual-anchor surface visibility (same gate as collectVisualAltDeltas).
+            if (predictedSurfaceEnc != null) {
+                PredictedSurface altSurface = iter.get(predictedSurfaceEnc);
+                if (surfacesClearlyDiffer(altSurface, prevSurface)
+                        && surfacesClearlyDiffer(altSurface, routeSurface)) {
+                    continue;
+                }
+            }
+
+            GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(iter, nodeAccess);
+            double altDelta = InstructionsHelper.calculateOrientationDelta(
+                    prevLat, prevLon, altPoint.getLat(), altPoint.getLon(), prevOrientation);
+            // Confusable alts get the extended visual-similar cone (E.6); the same-side
+            // fork-partner bound at the call site (60°) is tighter still.
+            if (Math.abs(altDelta) > REFRAMER_VISUAL_SIMILAR_CONE) continue;
+
+            deltas.add(altDelta);
+        }
+        return deltas;
+    }
+
     // ========================================================================
     // Extra info enrichment
     // ========================================================================
@@ -2188,13 +2310,15 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             instruction.setExtraInfo("road_class_changed", roadClass != prevRoadClass);
         }
 
-        // PredictedHighway
+        // PredictedHighway. Emit the external (coarse) value: this string is both the
+        // client-facing wire value and the channel InstructionPostProcessor reads, neither
+        // of which distinguishes internal-only refinements (e.g. SERVICE_DRIVEWAY).
         if (predictedHighwayEnc != null) {
             PredictedHighway ph = edge.get(predictedHighwayEnc);
-            instruction.setExtraInfo("predicted_highway", ph.name());
+            instruction.setExtraInfo("predicted_highway", ph.toExternal().name());
             if (prevEdge != null) {
                 PredictedHighway prevPh = prevEdge.get(predictedHighwayEnc);
-                instruction.setExtraInfo("prev_predicted_highway", prevPh.name());
+                instruction.setExtraInfo("prev_predicted_highway", prevPh.toExternal().name());
             }
         }
 
@@ -2244,7 +2368,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                 for (int i = 0; i < alts.size(); i++) {
                     PredictedHighway altPH = alts.get(i).get(predictedHighwayEnc);
                     if (i > 0) altPHs.append(",");
-                    altPHs.append(altPH.name());
+                    altPHs.append(altPH.toExternal().name());   // coarse value over the wire
                     if (phProminence(altPH) > phProminence(currentPH)) {
                         hasHigherRoad = true;
                     }

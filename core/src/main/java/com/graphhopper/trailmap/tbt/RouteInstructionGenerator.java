@@ -139,9 +139,11 @@ public class RouteInstructionGenerator {
 
                 // Stitch edge chains at boundary between consecutive routable chunks
                 boolean uturnAtBoundary = false;
+                double stripOverlapM = 0;
                 if (prevEdgeIds != null && !prevEdgeIds.isEmpty() && !edgeIds.isEmpty()) {
                     uturnAtBoundary = stitchEdgeChains(prevEdgeIds, edgeIds, prevRoutePolyline, routePolyline,
                             fullPolyline, section.profile, snapPreventions);
+                    stripOverlapM = lastStitchOverlapM;
                 }
 
                 if (!edgeIds.isEmpty()) {
@@ -178,23 +180,32 @@ public class RouteInstructionGenerator {
 
                     boolean isLastRoutableChunk = isLastRoutableChunk(chunks, ci);
                     int instrCountBefore = allInstructions.size();
+                    boolean resumingAfterGap = pendingResumeType != null;
                     appendInstructions(allInstructions, sectionInstructions, fullPolyline.size(),
-                            isLastRoutableChunk, pendingResumeType != null);
+                            isLastRoutableChunk, resumingAfterGap, stripOverlapM);
+
+                    // Append the route response polyline. sectionStartIdx is where the section
+                    // physically starts in the full polyline (the seam vertex when the boundary
+                    // point was deduplicated — NOT the pre-append size, which would then point
+                    // one vertex into the section).
+                    int tracePolyBefore = fullPolyline.size();
+                    int sectionStartIdx = appendRoutePolyline(fullPolyline, routePolyline);
+                    if (PLACEMENT_TRACE) {
+                        PLACEMENT_TRACE_LOG.add(new PlacementTraceRecord(PlacementTraceRecord.ROUTED,
+                                edgeIds, tracePolyBefore, fullPolyline.size(), routePolyline));
+                    }
 
                     // Mark the first new instruction as resuming TbT after a direct/coordinates gap.
-                    // Store the current polyline size as a hint for remapInstructionGeometry():
+                    // Store the section start index as a hint for remapInstructionGeometry():
                     // the synthetic path's first graph node may not be in the route response
                     // polyline (it's before the snapped start), so coordinate matching would fail.
-                    if (pendingResumeType != null && allInstructions.size() > instrCountBefore) {
+                    if (resumingAfterGap && allInstructions.size() > instrCountBefore) {
                         Instruction firstNew = allInstructions.get(instrCountBefore);
                         firstNew.setExtraInfo("tbt_resumed", true);
                         firstNew.setExtraInfo("prev_segment_type", pendingResumeType);
-                        firstNew.setExtraInfo("_polyline_start_hint", fullPolyline.size());
+                        firstNew.setExtraInfo("_polyline_start_hint", sectionStartIdx);
                         pendingResumeType = null;
                     }
-
-                    // Append the route response polyline
-                    appendRoutePolyline(fullPolyline, routePolyline);
                 }
 
                 // Track for next stitching
@@ -291,6 +302,7 @@ public class RouteInstructionGenerator {
         boolean resumingAfterGap;
         String resumeType;
         boolean needsUturnHint;   // long boundary U-turn: stamp anchor hint at commit
+        double stitchOverlapM;    // same-direction shared boundary edge length (strip-merge exclusion)
     }
 
     /** A detected short same-edge boundary U-turn (snap artifact eligible for erasure). */
@@ -364,9 +376,11 @@ public class RouteInstructionGenerator {
                     }
 
                     boolean uturnAtBoundary = false;
+                    double stripOverlapM = 0;
                     if (prevEdgeIds != null && !prevEdgeIds.isEmpty() && !edgeIds.isEmpty()) {
                         uturnAtBoundary = stitchEdgeChains(prevEdgeIds, edgeIds, prevRoutePolyline, routePolyline,
                                 fullPolyline, section.profile, snapPreventions);
+                        stripOverlapM = lastStitchOverlapM;
                     }
 
                     PendingSection ps = new PendingSection();
@@ -375,6 +389,7 @@ public class RouteInstructionGenerator {
                     ps.startCoord = section.points.get(0);
                     ps.resumingAfterGap = pendingResumeType != null;
                     ps.resumeType = pendingResumeType;
+                    ps.stitchOverlapM = stripOverlapM;
                     if (!edgeIds.isEmpty()) {
                         Path syntheticPath = buildSyntheticPath(edgeIds, section.points.get(0));
                         ps.sectionInstructions = TrailmapInstructionsFromEdges.calcInstructions(
@@ -460,14 +475,22 @@ public class RouteInstructionGenerator {
         }
         int instrCountBefore = allInstructions.size();
         appendInstructions(allInstructions, pending.sectionInstructions, fullPolyline.size(),
-                isLastRoutableChunk, pending.resumingAfterGap);
+                isLastRoutableChunk, pending.resumingAfterGap, pending.stitchOverlapM);
+        int tracePolyBefore = fullPolyline.size();
+        int sectionStartIdx = appendRoutePolyline(fullPolyline, pending.routePolyline);
+        if (PLACEMENT_TRACE) {
+            PLACEMENT_TRACE_LOG.add(new PlacementTraceRecord(PlacementTraceRecord.ROUTED,
+                    pending.edgeIds, tracePolyBefore, fullPolyline.size(), pending.routePolyline));
+        }
+        // Anchor the resume marker at the section's PHYSICAL start (the seam vertex when the
+        // boundary point was deduplicated) — the pre-append polyline size would point one vertex
+        // into the section, shifting the "TbT resumes" anchor by the first polyline leg.
         if (pending.resumingAfterGap && allInstructions.size() > instrCountBefore) {
             Instruction firstNew = allInstructions.get(instrCountBefore);
             firstNew.setExtraInfo("tbt_resumed", true);
             firstNew.setExtraInfo("prev_segment_type", pending.resumeType);
-            firstNew.setExtraInfo("_polyline_start_hint", fullPolyline.size());
+            firstNew.setExtraInfo("_polyline_start_hint", sectionStartIdx);
         }
-        appendRoutePolyline(fullPolyline, pending.routePolyline);
     }
 
     /**
@@ -566,6 +589,9 @@ public class RouteInstructionGenerator {
         ps.resumingAfterGap = pending.resumingAfterGap;
         ps.resumeType = pending.resumeType;
         ps.needsUturnHint = false;
+        // The merged chain still starts with the held section's edges, including any stitched
+        // shared context edge — the strip-merge exclusion carries over.
+        ps.stitchOverlapM = pending.stitchOverlapM;
         return ps;
     }
 
@@ -755,6 +781,15 @@ public class RouteInstructionGenerator {
     // ---- Edge chain stitching ----
 
     /**
+     * Length (m) of the same-direction shared boundary edge kept in the CURRENT section's chain
+     * by the last {@link #stitchEdgeChains} call (0 when the seam was not a case-1 share). The
+     * previous instruction's synthetic distance already covers that edge, so when the current
+     * section's initial CONTINUE is stripped, its merged-in distance must exclude this overlap.
+     * Reset at the start of every stitchEdgeChains call; consumed by the caller right after.
+     */
+    private double lastStitchOverlapM = 0;
+
+    /**
      * Stitch edge chains at segment boundaries between two consecutive routable chunks.
      * Three cases:
      * 1. Same edge at boundary → deduplicate (remove last edge of prev or first of current)
@@ -767,6 +802,7 @@ public class RouteInstructionGenerator {
                                    PointList prevPolyline, PointList currentPolyline,
                                    PointList fullPolyline, String profile,
                                    List<String> snapPreventions) {
+        lastStitchOverlapM = 0;
         if (prevEdgeIds.isEmpty() || currentEdgeIds.isEmpty()) return false;
 
         int lastPrevEdge = prevEdgeIds.get(prevEdgeIds.size() - 1);
@@ -814,6 +850,11 @@ public class RouteInstructionGenerator {
                 // at the transition from the shared edge to seg2's next edge.
                 // The resulting first CONTINUE_ON_STREET is stripped by appendInstructions(),
                 // and remapInstructionGeometry() corrects any distance overlap.
+                // Record the overlap: the previous instruction's synthetic distance already
+                // covers this edge, so the strip-merge must exclude it — otherwise every such
+                // boundary inflates _cum_route_m by one shared-edge length (in Lapland, up to
+                // kilometres), corrupting the matcher's occurrence disambiguation.
+                lastStitchOverlapM = baseGraph.getEdgeIteratorState(lastPrevEdge, Integer.MIN_VALUE).getDistance();
                 LOGGER.debug("Shared boundary edge {} between segments — keeping for instruction context", lastPrevEdge);
             }
             return false;
@@ -873,7 +914,12 @@ public class RouteInstructionGenerator {
             currentEdgeIds.addAll(0, bridgeEdgeIds);
 
             // Insert bridging polyline into the full polyline
+            int tracePolyBefore = fullPolyline.size();
             appendRoutePolyline(fullPolyline, bridgePolyline);
+            if (PLACEMENT_TRACE) {
+                PLACEMENT_TRACE_LOG.add(new PlacementTraceRecord(PlacementTraceRecord.BRIDGE,
+                        bridgeEdgeIds, tracePolyBefore, fullPolyline.size(), bridgePolyline));
+            }
 
             LOGGER.debug("Inserted {} bridging edges between segments", bridgeEdgeIds.size());
         }
@@ -1012,7 +1058,7 @@ public class RouteInstructionGenerator {
      */
     private void appendInstructions(InstructionList target, InstructionList sectionInstructions,
                                     int polylineOffset, boolean isLastRoutableChunk,
-                                    boolean resumingAfterGap) {
+                                    boolean resumingAfterGap, double stripOverlapM) {
         boolean isFirstSection = target.isEmpty();
 
         for (int i = 0; i < sectionInstructions.size(); i++) {
@@ -1028,11 +1074,19 @@ public class RouteInstructionGenerator {
             // But keep it when resuming after a direct/coordinates gap — it marks where TbT resumes.
             if (!isFirstSection && !resumingAfterGap
                     && i == 0 && instr.getSign() == Instruction.CONTINUE_ON_STREET) {
-                // Merge this instruction's distance/time into the previous instruction
+                // Merge this instruction's distance/time into the previous instruction —
+                // MINUS the stitched shared-edge overlap, which the previous instruction's
+                // distance already covers. Without the subtraction, every same-direction
+                // boundary double-counts the shared edge into the pre-remap distance sums,
+                // corrupting _cum_route_m (the matcher's occurrence-disambiguation key) by
+                // one shared-edge length per boundary (Saariselkä: 14.2 km over 26 boundaries,
+                // flipping the 20.4 km KEEP_RIGHT onto the wrong pass of an out-and-back).
                 if (!target.isEmpty()) {
                     Instruction prev = target.get(target.size() - 1);
-                    prev.setDistance(prev.getDistance() + instr.getDistance());
-                    prev.setTime(prev.getTime() + instr.getTime());
+                    double mergeDist = Math.max(0, instr.getDistance() - stripOverlapM);
+                    double mergeRatio = instr.getDistance() > 0 ? mergeDist / instr.getDistance() : 0;
+                    prev.setDistance(prev.getDistance() + mergeDist);
+                    prev.setTime(prev.getTime() + Math.round(instr.getTime() * mergeRatio));
                 }
                 continue;
             }
@@ -1077,6 +1131,47 @@ public class RouteInstructionGenerator {
      */
     static boolean REMAP_DIAG = false;
     static final List<double[]> REMAP_DIAG_LOG = new ArrayList<>();
+
+    /**
+     * Test-support placement trace (same gated-hook pattern as {@link #REMAP_DIAG}; off by default,
+     * no behavior change). When enabled, records — in consumption order — one record per committed
+     * routed section, per stitching bridge, and per non-routable gap, each with the exact index range
+     * it contributed to the full response polyline and (for routed/bridge records) the final edge
+     * chain actually walked. These are append-time facts, captured before and independently of
+     * {@link #remapInstructionGeometry} / {@link #matchInstructionStarts}, so the placement-validation
+     * oracle (test tree) may rebuild ground-truth route geometry from them non-circularly.
+     * Not thread-safe; test-only.
+     */
+    static boolean PLACEMENT_TRACE = false;
+    static final List<PlacementTraceRecord> PLACEMENT_TRACE_LOG = new ArrayList<>();
+
+    static final class PlacementTraceRecord {
+        static final int ROUTED = 0, BRIDGE = 1, GAP = 2;
+        final int type;
+        /** ROUTED: final edge chain passed to buildSyntheticPath (incl. bridge-prepended edges).
+         *  BRIDGE: bridge edges after boundary dedup (the ones prepended to the next ROUTED chain). */
+        final List<Integer> edgeIds;
+        /** fullPolyline size before/after this record's geometry was appended. */
+        final int polyBefore, polyAfter;
+        /** ROUTED only: the section's response-polyline endpoints (snap points). */
+        final double snapStartLat, snapStartLon, snapEndLat, snapEndLon;
+
+        PlacementTraceRecord(int type, List<Integer> edgeIds, int polyBefore, int polyAfter,
+                             PointList sectionPolyline) {
+            this.type = type;
+            this.edgeIds = edgeIds == null ? List.of() : List.copyOf(edgeIds);
+            this.polyBefore = polyBefore;
+            this.polyAfter = polyAfter;
+            if (sectionPolyline != null && sectionPolyline.size() > 0) {
+                this.snapStartLat = sectionPolyline.getLat(0);
+                this.snapStartLon = sectionPolyline.getLon(0);
+                this.snapEndLat = sectionPolyline.getLat(sectionPolyline.size() - 1);
+                this.snapEndLon = sectionPolyline.getLon(sectionPolyline.size() - 1);
+            } else {
+                this.snapStartLat = this.snapStartLon = this.snapEndLat = this.snapEndLon = Double.NaN;
+            }
+        }
+    }
 
     private void remapInstructionGeometry(InstructionList instructions, PointList fullPolyline) {
         if (instructions.isEmpty() || fullPolyline.isEmpty()) return;
@@ -1273,6 +1368,15 @@ public class RouteInstructionGenerator {
         // does NOT advance the anchor, so a single bad match cannot cascade down the rest of the route.
         int anchorIdx = 0;
         double anchorRouteM = readCumRouteM(instructions.get(0));
+        // The anchor is CALIBRATED when its polyline position corresponds to its synthetic route
+        // distance — true for a normal turn (matched vertex IS its junction node). It is NOT true
+        // for seam-anchored instructions (route start, gap markers, gap resumes): their polyline
+        // anchor is the seam while their synthetic distance sits at the section chain start, so
+        // the next leg's expected distance carries the pre-snap span (unbounded — 862 m on the
+        // Saariselkä 2-segment case, where the start snapped deep into a very long edge). The
+        // sanity rejection below is applied only from a calibrated anchor; from an uncalibrated
+        // one a coordinate match is accepted as-is (the pre-sanity-band rule, correct there).
+        boolean anchorCalibrated = false;
 
         for (int i = 0; i < instructions.size(); i++) {
             Instruction instr = instructions.get(i);
@@ -1298,7 +1402,9 @@ public class RouteInstructionGenerator {
             double cumThis = readCumRouteM(instr);
             boolean haveKey = !Double.isNaN(cumThis) && !Double.isNaN(anchorRouteM);
             // Expected polyline distance = the last confident position plus this leg's synthetic length.
-            // Only used to choose AMONG multiple occurrences — never to second-guess a unique match.
+            // Chooses among multiple occurrences, and sanity-checks even a UNIQUE match: a coordinate
+            // can be unique-but-wrong when simplification dropped the true occurrence's vertex on an
+            // out-and-back — trusting it unvalidated pins the instruction to the other pass.
             double expectedCum = haveKey ? polyCum[anchorIdx] + (cumThis - anchorRouteM) : Double.NaN;
 
             // Scan from the anchor: count near-exact occurrences of this turn, remember the first and
@@ -1320,11 +1426,24 @@ public class RouteInstructionGenerator {
 
             int idx;
             boolean confident;
-            if (exactCount >= 1) {
-                // Unique match → take it (identical to the exact fix-1 behavior, no distance second-guessing).
-                // Multiple matches (a self-crossing) → take the occurrence nearest the expected route distance.
+            if (exactCount >= 1 && (!haveKey || !anchorCalibrated || distBestErr <= MATCH_SANITY_M)) {
+                // Take the occurrence nearest the expected route distance (the only occurrence,
+                // when unique) — but only while it agrees with the distance key within the sanity
+                // band. Legs adjacent to seams carry inherent synthetic-vs-polyline error (snap
+                // trims, gap jumps), so the band is generous; a real wrong-occurrence signal is
+                // 2 x spur and the observed bugs were 191 m and 4.5 km.
                 idx = haveKey ? distBest : firstExact;
                 confident = true;
+            } else if (exactCount >= 1) {
+                // Near-exact coordinate found, but every occurrence is far from where the route
+                // distance says this instruction lives — the true occurrence's vertex was most
+                // likely simplified away. Place by expected distance (contained, non-anchoring).
+                idx = indexNearestCum(polyCum, expectedCum, anchorIdx);
+                confident = false;
+                LOGGER.warn("TbT interval: instruction #{} ('{}') coordinate matches only {} m from its "
+                        + "expected route distance (suspected wrong occurrence); best-effort placing at "
+                        + "idx {} (single-instruction recovery)",
+                        i, instr.getName(), Math.round(distBestErr), idx);
             } else {
                 // No near-exact match anywhere ahead (e.g. the point was simplified away, or a poisoned
                 // anchor put the true occurrence behind us). Place by expected distance so the error is
@@ -1341,13 +1460,34 @@ public class RouteInstructionGenerator {
             if (idx < prev) idx = prev;
             starts.add(idx);
 
-            if (confident) { anchorIdx = idx; anchorRouteM = cumThis; }
+            if (confident) {
+                anchorIdx = idx;
+                anchorRouteM = cumThis;
+                // Seam-anchored instructions (gap marker / gap resume) match at the seam vertex
+                // while their synthetic distance sits elsewhere — they must not calibrate the
+                // expectation for the next leg. Everything else anchors at its own junction node.
+                Map<String, Object> extra = instr.getExtraInfoJSON();
+                anchorCalibrated = !Boolean.TRUE.equals(extra.get("tbt_resumed"))
+                        && !Boolean.FALSE.equals(extra.get("tbt_available"));
+            }
         }
         return starts;
     }
 
     /** ~manhattan-degrees→metres near lat 61, for human-readable log messages only. */
     private static final double DIAG_DEG_TO_M = 90000.0;
+
+    /**
+     * Sanity band (m) for accepting a coordinate match against the expected route distance in
+     * {@link #matchInstructionStarts}. Applied only from a CALIBRATED anchor (one whose polyline
+     * position corresponds to its synthetic route distance) — from seam-anchored positions
+     * (route start, gap markers/resumes) the expectation carries an unbounded pre-snap offset and
+     * must not veto a coordinate match. From a calibrated anchor the leg error is snap-trim scale
+     * (metres), far below the wrong-occurrence signal (2 x out-and-back spur; observed bugs:
+     * 191 m and 4462 m). A rejected match degrades to the contained, non-anchoring
+     * distance-based recovery placement.
+     */
+    private static final double MATCH_SANITY_M = 300.0;
 
     private static double readCumRouteM(Instruction instr) {
         Object v = instr.getExtraInfoJSON().get("_cum_route_m");
@@ -1373,8 +1513,15 @@ public class RouteInstructionGenerator {
     /**
      * Append route response polyline to the full polyline, skipping the first point
      * if it duplicates the last point of the existing polyline (at segment boundaries).
+     *
+     * @return the index in {@code fullPolyline} where the appended section physically starts —
+     *         i.e. where {@code routePolyline}'s first point lives: the pre-existing seam vertex
+     *         when the duplicate was skipped, the first appended index otherwise. Callers that
+     *         anchor a "section starts here" hint must use this rather than the pre-append size,
+     *         which points one vertex INTO the section whenever the dedup fires.
      */
-    private void appendRoutePolyline(PointList fullPolyline, PointList routePolyline) {
+    private int appendRoutePolyline(PointList fullPolyline, PointList routePolyline) {
+        int preSize = fullPolyline.size();
         int startIdx = 0;
         if (fullPolyline.size() > 0 && routePolyline.size() > 0) {
             double lastLat = fullPolyline.getLat(fullPolyline.size() - 1);
@@ -1390,6 +1537,7 @@ public class RouteInstructionGenerator {
             fullPolyline.add(routePolyline.getLat(i), routePolyline.getLon(i),
                     routePolyline.is3D() ? routePolyline.getEle(i) : Double.NaN);
         }
+        return startIdx == 1 ? preSize - 1 : preSize;
     }
 
     /**
@@ -1427,6 +1575,7 @@ public class RouteInstructionGenerator {
      * if it duplicates the polyline's last point.
      */
     private void appendGapPolyline(PointList fullPolyline, PointList gapPoints) {
+        int tracePolyBefore = fullPolyline.size();
         for (int i = 0; i < gapPoints.size(); i++) {
             // Skip first point if it matches last point of polyline (avoid duplicate at junction)
             if (i == 0 && fullPolyline.size() > 0) {
@@ -1439,6 +1588,10 @@ public class RouteInstructionGenerator {
             }
             fullPolyline.add(gapPoints.getLat(i), gapPoints.getLon(i),
                     gapPoints.is3D() ? gapPoints.getEle(i) : Double.NaN);
+        }
+        if (PLACEMENT_TRACE) {
+            PLACEMENT_TRACE_LOG.add(new PlacementTraceRecord(PlacementTraceRecord.GAP,
+                    null, tracePolyBefore, fullPolyline.size(), gapPoints));
         }
     }
 
