@@ -59,8 +59,8 @@ public class TrailmapConvertResource {
      * observations from the HMM and tolerates looser snaps in the emission model.
      */
     private static final double DEFAULT_GPS_ACCURACY_M = 10.0;
-    private static final int MAX_TRACK_POINTS = 20_000;
-    private static final int MAX_DENSIFIED_POINTS = 20_000;
+    private static final int MAX_TRACK_POINTS = 30_000;
+    private static final int MAX_DENSIFIED_POINTS = 35_000;
 
     private final GraphHopper graphHopper;
     private final ProfileResolver profileResolver;
