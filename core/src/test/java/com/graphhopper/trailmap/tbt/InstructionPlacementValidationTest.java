@@ -17,7 +17,9 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -169,6 +171,72 @@ public class InstructionPlacementValidationTest {
         TrailmapInstructionRequest request = loadPayloadResource("saariselka_2seg_presnap_sanity_band.json");
         InstructionPlacementOracle.Report report = run(request);
         assertPlacementMatchesOracle(report, "saariselka2seg");
+    }
+
+    /**
+     * Hämeenlinna 50.6 km gravel loop (reported 2026-08-26): the U-turn at 17.0 km and every one of
+     * the 37 instructions after it were placed too far along, drifting from +729 m to +3.5 km.
+     * <p>
+     * Root cause: at a boundary U-turn the waypoint snapped 530 m into a 1204.9 m shared edge, so
+     * the synthetic path charged the 674.8 m UNTRAVERSED remainder to {@code _cum_route_m} twice
+     * (once on the leg in, once on the leg out). The U-turn instruction's own correct, unique
+     * coordinate match was then vetoed by {@code MATCH_SANITY_M} as a suspected wrong occurrence,
+     * and — because a recovered placement does not advance the anchor — every later instruction
+     * inherited the same 1361 m of key inflation and was vetoed too.
+     * <p>
+     * The route carries 7 boundary-U-turn seams with untraversed remainders of 16.7–674.8 m, so it
+     * covers the whole shape class, not just the one that tripped. Fixed 2026-08-26 by marking the
+     * boundary U-turn seam-anchored ({@code _seam_anchored}) so the sanity band does not apply to
+     * it, plus clearing anchor calibration after any recovered placement so a single bad match can
+     * no longer cascade. See gh_tbt_instruction_placement_validation_design.md §15.
+     */
+    @Test
+    void hameenlinna_boundaryUturnOnLongEdge_placementMatchesOracle() throws Exception {
+        Assumptions.assumeTrue(hopper != null, "graph cache required");
+        TrailmapInstructionRequest request =
+                loadPayloadResource("hameenlinna_boundary_uturn_long_edge.json");
+        InstructionPlacementOracle.Report report = run(request);
+        assertTrue(report.rows.size() > 50, "expected a long instruction list\n" + report.table());
+        assertPlacementMatchesOracle(report, "hameenlinna50");
+    }
+
+    // ==================== margin regression ====================
+
+    /**
+     * Placement must not depend on the exact value of {@code MATCH_SANITY_M}.
+     * <p>
+     * The band vetoes a coordinate match that disagrees with the instruction's synthetic route
+     * distance. That distance is comparable to the polyline only WITHIN a routed section: a
+     * section's first and last edges are charged whole but only partly ridden, so a leg crossing a
+     * section seam carries an offset of up to a whole OSM edge — 100–900 m measured across these
+     * payloads. Those legs are exempt, so every leg the band still judges should have an error of
+     * metres. Tightening the band 3x must therefore change nothing.
+     * <p>
+     * This is the early warning. Before the seam exemption, the margin between real key error and
+     * the band was 17.6 m on the Hämeenlinna route and already NEGATIVE (−579 m) on
+     * saariselka2seg, which survived only because the route-start seam had its own hard-coded
+     * exemption — and neither was visible until a user reported misplaced instructions. A failure
+     * here means a new key-error source appeared on a non-seam leg; find it before it ships.
+     */
+    @Test
+    void allPayloads_placeCorrectlyAtATightenedSanityBand() throws Exception {
+        Assumptions.assumeTrue(hopper != null, "graph cache required");
+        Map<String, TrailmapInstructionRequest> payloads = new LinkedHashMap<>();
+        payloads.put("hameenlinna50", loadPayloadResource("hameenlinna_boundary_uturn_long_edge.json"));
+        payloads.put("saariselka30wp", loadPayloadResource("saariselka_misplaced_left_uturn.json"));
+        payloads.put("saariselka2seg", loadPayloadResource("saariselka_2seg_presnap_sanity_band.json"));
+        payloads.put("joensuu500", parsePayload(RouteInstructionGeneratorTest.JOENSUU_500_JSON));
+        payloads.put("drift152km", parsePayload(RouteInstructionGeneratorTest.DRIFT_JSON));
+
+        double saved = RouteInstructionGenerator.MATCH_SANITY_M;
+        try {
+            RouteInstructionGenerator.MATCH_SANITY_M = 100.0;   // 3x tighter than production
+            for (Map.Entry<String, TrailmapInstructionRequest> e : payloads.entrySet()) {
+                assertPlacementMatchesOracle(run(e.getValue()), e.getKey() + " @ band=100");
+            }
+        } finally {
+            RouteInstructionGenerator.MATCH_SANITY_M = saved;
+        }
     }
 
     // ==================== drop-in corpus ====================

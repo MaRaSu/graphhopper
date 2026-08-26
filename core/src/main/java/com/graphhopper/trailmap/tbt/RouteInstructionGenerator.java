@@ -61,10 +61,24 @@ public class RouteInstructionGenerator {
     public static class Result {
         public final InstructionList instructions;
         public final PointList polyline;
+        /**
+         * Polyline indices at which a separately-derived geometry begins — one per routed section,
+         * stitching bridge and non-routable gap. These are the route's SEAMS: the only places where
+         * the synthetic route-distance scale (whole graph edges) and the polyline scale (snapped,
+         * trimmed) can disagree, because a section's first and last edges are charged whole but
+         * only partly ridden. {@link #matchInstructionStarts} uses them to know when its expected
+         * distance is not comparable. Empty list = "no seam information" (legacy callers).
+         */
+        public final List<Integer> seamIndices;
 
         public Result(InstructionList instructions, PointList polyline) {
+            this(instructions, polyline, List.of());
+        }
+
+        public Result(InstructionList instructions, PointList polyline, List<Integer> seamIndices) {
             this.instructions = instructions;
             this.polyline = polyline;
+            this.seamIndices = seamIndices == null ? List.of() : List.copyOf(seamIndices);
         }
     }
 
@@ -103,6 +117,8 @@ public class RouteInstructionGenerator {
         // produce geometry only. The full polyline is built by concatenation.
         InstructionList allInstructions = new InstructionList(tr);
         PointList fullPolyline = new PointList(128, true);
+        // Request-local (this generator instance is shared across requests — never make this a field).
+        List<Integer> seamIndices = new ArrayList<>();
 
         TrailmapInstructionRequest.Coordinates nextStartOverride = null;
         // Track the last routable chunk's edge chain for stitching
@@ -142,7 +158,7 @@ public class RouteInstructionGenerator {
                 double stripOverlapM = 0;
                 if (prevEdgeIds != null && !prevEdgeIds.isEmpty() && !edgeIds.isEmpty()) {
                     uturnAtBoundary = stitchEdgeChains(prevEdgeIds, edgeIds, prevRoutePolyline, routePolyline,
-                            fullPolyline, section.profile, snapPreventions);
+                            fullPolyline, section.profile, snapPreventions, seamIndices);
                     stripOverlapM = lastStitchOverlapM;
                 }
 
@@ -166,6 +182,7 @@ public class RouteInstructionGenerator {
                     if (uturnAtBoundary && !sectionInstructions.isEmpty()
                             && sectionInstructions.get(0).getSign() == Instruction.CONTINUE_ON_STREET) {
                         sectionInstructions.get(0).setSign(Instruction.U_TURN_UNKNOWN);
+                        sectionInstructions.get(0).setExtraInfo(SEAM_ANCHORED, true);
                         // Anchor the U-turn at the snap point — the last polyline point of the
                         // previous segment, which is the physical location where the rider
                         // reverses direction. Index is fullPolyline.size() - 1 because the next
@@ -190,6 +207,7 @@ public class RouteInstructionGenerator {
                     // one vertex into the section).
                     int tracePolyBefore = fullPolyline.size();
                     int sectionStartIdx = appendRoutePolyline(fullPolyline, routePolyline);
+                    seamIndices.add(sectionStartIdx);
                     if (PLACEMENT_TRACE) {
                         PLACEMENT_TRACE_LOG.add(new PlacementTraceRecord(PlacementTraceRecord.ROUTED,
                                 edgeIds, tracePolyBefore, fullPolyline.size(), routePolyline));
@@ -238,6 +256,7 @@ public class RouteInstructionGenerator {
                 allInstructions.add(directInstr);
 
                 // Append geometry to polyline
+                seamIndices.add(Math.max(0, fullPolyline.size() - 1));
                 appendGapPolyline(fullPolyline, gapGeometry);
 
                 // Track that the next routable chunk should be marked as resuming TbT
@@ -272,7 +291,7 @@ public class RouteInstructionGenerator {
         remapInstructionGeometry(allInstructions, fullPolyline);
 
         LOGGER.info("Generated {} instructions, polyline has {} points", allInstructions.size(), fullPolyline.size());
-        return new Result(allInstructions, fullPolyline);
+        return new Result(allInstructions, fullPolyline, seamIndices);
     }
 
     // ============================================================================
@@ -328,6 +347,8 @@ public class RouteInstructionGenerator {
 
         InstructionList allInstructions = new InstructionList(tr);
         PointList fullPolyline = new PointList(128, true);
+        // Request-local (this generator instance is shared across requests — never make this a field).
+        List<Integer> seamIndices = new ArrayList<>();
 
         TrailmapInstructionRequest.Coordinates nextStartOverride = null;
         String pendingResumeType = null;
@@ -370,7 +391,7 @@ public class RouteInstructionGenerator {
                     List<Integer> prevEdgeIds = null;
                     PointList prevRoutePolyline = null;
                     if (pending != null) {
-                        commitPending(allInstructions, fullPolyline, pending, false);
+                        commitPending(allInstructions, fullPolyline, pending, false, seamIndices);
                         prevEdgeIds = pending.edgeIds;
                         prevRoutePolyline = pending.routePolyline;
                     }
@@ -379,7 +400,7 @@ public class RouteInstructionGenerator {
                     double stripOverlapM = 0;
                     if (prevEdgeIds != null && !prevEdgeIds.isEmpty() && !edgeIds.isEmpty()) {
                         uturnAtBoundary = stitchEdgeChains(prevEdgeIds, edgeIds, prevRoutePolyline, routePolyline,
-                                fullPolyline, section.profile, snapPreventions);
+                                fullPolyline, section.profile, snapPreventions, seamIndices);
                         stripOverlapM = lastStitchOverlapM;
                     }
 
@@ -397,6 +418,7 @@ public class RouteInstructionGenerator {
                         if (uturnAtBoundary && !ps.sectionInstructions.isEmpty()
                                 && ps.sectionInstructions.get(0).getSign() == Instruction.CONTINUE_ON_STREET) {
                             ps.sectionInstructions.get(0).setSign(Instruction.U_TURN_UNKNOWN);
+                            ps.sectionInstructions.get(0).setExtraInfo(SEAM_ANCHORED, true);
                             ps.needsUturnHint = true;
                         }
                     } else {
@@ -415,7 +437,7 @@ public class RouteInstructionGenerator {
             } else {
                 // Non-routable chunk: flush the held section first, then emit the gap.
                 if (pending != null) {
-                    commitPending(allInstructions, fullPolyline, pending, false);
+                    commitPending(allInstructions, fullPolyline, pending, false, seamIndices);
                     pending = null;
                 }
                 if (!allInstructions.isEmpty()) {
@@ -429,6 +451,7 @@ public class RouteInstructionGenerator {
                 directInstr.setExtraInfo("tbt_available", false);
                 directInstr.setExtraInfo("confirm_reason", "entering_direct_segment");
                 allInstructions.add(directInstr);
+                seamIndices.add(Math.max(0, fullPolyline.size() - 1));
                 appendGapPolyline(fullPolyline, gapGeometry);
 
                 pendingResumeType = chunk.segmentType;
@@ -438,7 +461,7 @@ public class RouteInstructionGenerator {
 
         // Commit the final held section (it is the last chunk → keep its FINISH).
         if (pending != null) {
-            commitPending(allInstructions, fullPolyline, pending, true);
+            commitPending(allInstructions, fullPolyline, pending, true, seamIndices);
         }
 
         if (!allInstructions.isEmpty()
@@ -455,7 +478,7 @@ public class RouteInstructionGenerator {
         remapInstructionGeometry(allInstructions, fullPolyline);
         LOGGER.info("Generated {} instructions (boundary-uturn-suppression path), polyline has {} points",
                 allInstructions.size(), fullPolyline.size());
-        return new Result(allInstructions, fullPolyline);
+        return new Result(allInstructions, fullPolyline, seamIndices);
     }
 
     /**
@@ -464,7 +487,8 @@ public class RouteInstructionGenerator {
      * using the commit-time polyline size so geometry remapping anchors correctly.
      */
     private void commitPending(InstructionList allInstructions, PointList fullPolyline,
-                               PendingSection pending, boolean isLastRoutableChunk) {
+                               PendingSection pending, boolean isLastRoutableChunk,
+                               List<Integer> seamIndices) {
         if (pending.edgeIds == null || pending.edgeIds.isEmpty()
                 || pending.sectionInstructions == null || pending.sectionInstructions.isEmpty()) {
             return; // degenerate / empty section — nothing to commit (matches production skip)
@@ -478,6 +502,7 @@ public class RouteInstructionGenerator {
                 isLastRoutableChunk, pending.resumingAfterGap, pending.stitchOverlapM);
         int tracePolyBefore = fullPolyline.size();
         int sectionStartIdx = appendRoutePolyline(fullPolyline, pending.routePolyline);
+        seamIndices.add(sectionStartIdx);
         if (PLACEMENT_TRACE) {
             PLACEMENT_TRACE_LOG.add(new PlacementTraceRecord(PlacementTraceRecord.ROUTED,
                     pending.edgeIds, tracePolyBefore, fullPolyline.size(), pending.routePolyline));
@@ -801,7 +826,7 @@ public class RouteInstructionGenerator {
     private boolean stitchEdgeChains(List<Integer> prevEdgeIds, List<Integer> currentEdgeIds,
                                    PointList prevPolyline, PointList currentPolyline,
                                    PointList fullPolyline, String profile,
-                                   List<String> snapPreventions) {
+                                   List<String> snapPreventions, List<Integer> seamIndices) {
         lastStitchOverlapM = 0;
         if (prevEdgeIds.isEmpty() || currentEdgeIds.isEmpty()) return false;
 
@@ -915,7 +940,7 @@ public class RouteInstructionGenerator {
 
             // Insert bridging polyline into the full polyline
             int tracePolyBefore = fullPolyline.size();
-            appendRoutePolyline(fullPolyline, bridgePolyline);
+            seamIndices.add(appendRoutePolyline(fullPolyline, bridgePolyline));
             if (PLACEMENT_TRACE) {
                 PLACEMENT_TRACE_LOG.add(new PlacementTraceRecord(PlacementTraceRecord.BRIDGE,
                         bridgeEdgeIds, tracePolyBefore, fullPolyline.size(), bridgePolyline));
@@ -1348,6 +1373,24 @@ public class RouteInstructionGenerator {
      *         for instruction {@code i} is {@code [starts.get(i), i+1<n ? starts.get(i+1) : polyline.size()-1]}.
      */
     public static List<Integer> matchInstructionStarts(InstructionList instructions, PointList polyline) {
+        return matchInstructionStarts(instructions, polyline, List.of());
+    }
+
+    /**
+     * @param seamIndices polyline indices where a separately-derived geometry begins (routed section,
+     *                    stitching bridge, non-routable gap) — {@link Result#seamIndices}. The
+     *                    {@link #MATCH_SANITY_M} veto compares two positions on the SYNTHETIC route
+     *                    distance scale, and that scale is only comparable to the polyline WITHIN one
+     *                    section: a section's first and last edges are charged to {@code _cum_route_m}
+     *                    whole, but the route only rides the part on the snapped side of the waypoint.
+     *                    A leg that crosses a seam therefore carries an offset of up to a whole OSM
+     *                    edge (100–900 m measured on real routes), which the veto cannot tell apart
+     *                    from a wrong-occurrence match. So the veto is applied only to legs that stay
+     *                    inside one section. Pass an empty list to disable the exemption (legacy
+     *                    behaviour; the seam-anchored instruction markers still apply).
+     */
+    public static List<Integer> matchInstructionStarts(InstructionList instructions, PointList polyline,
+                                                       List<Integer> seamIndices) {
         List<Integer> starts = new ArrayList<>(instructions.size());
         if (instructions.isEmpty()) return starts;
         // Degenerate (no geometry): still return one entry per instruction so callers can index 1:1.
@@ -1356,6 +1399,11 @@ public class RouteInstructionGenerator {
             return starts;
         }
         int n = polyline.size();
+
+        // Sorted seam positions, for the "does this leg leave its section?" test below.
+        int[] seams = new int[seamIndices == null ? 0 : seamIndices.size()];
+        for (int k = 0; k < seams.length; k++) seams[k] = seamIndices.get(k);
+        Arrays.sort(seams);
 
         // Cumulative polyline distance per vertex — the scale against which each instruction's
         // independent route-distance key (_cum_route_m) is compared to disambiguate repeated coordinates.
@@ -1401,6 +1449,13 @@ public class RouteInstructionGenerator {
             double targetLat = pts.getLat(0), targetLon = pts.getLon(0);
             double cumThis = readCumRouteM(instr);
             boolean haveKey = !Double.isNaN(cumThis) && !Double.isNaN(anchorRouteM);
+            // The expected distance is only meaningful between two CALIBRATED positions. It is
+            // unreliable if EITHER end is seam-anchored, because a seam-anchored instruction sits
+            // at the seam on the polyline while its synthetic distance sits at its section chain's
+            // start — an offset of the whole pre-snap span of the section's first edge, which is
+            // unbounded (1.2 km boundary edge on the Hämeenlinna route). The anchor side was
+            // handled in 2026-07-09 (anchorCalibrated); this is the target side.
+            boolean targetSeamAnchored = isSeamAnchored(instr);
             // Expected polyline distance = the last confident position plus this leg's synthetic length.
             // Chooses among multiple occurrences, and sanity-checks even a UNIQUE match: a coordinate
             // can be unique-but-wrong when simplification dropped the true occurrence's vertex on an
@@ -1424,9 +1479,16 @@ public class RouteInstructionGenerator {
                 }
             }
 
+            // Does the leg from the anchor to the candidate leave the routed section it started in?
+            // If so, its expected distance carries the section boundary's whole-edge-vs-ridden offset
+            // and the veto below cannot judge it.
+            boolean legCrossesSeam = crossesSeam(seams, anchorIdx, distBest);
+
             int idx;
             boolean confident;
-            if (exactCount >= 1 && (!haveKey || !anchorCalibrated || distBestErr <= MATCH_SANITY_M)) {
+            if (exactCount >= 1
+                    && (!haveKey || !anchorCalibrated || targetSeamAnchored || legCrossesSeam
+                        || distBestErr <= MATCH_SANITY_M)) {
                 // Take the occurrence nearest the expected route distance (the only occurrence,
                 // when unique) — but only while it agrees with the distance key within the sanity
                 // band. Legs adjacent to seams carry inherent synthetic-vs-polyline error (snap
@@ -1463,12 +1525,22 @@ public class RouteInstructionGenerator {
             if (confident) {
                 anchorIdx = idx;
                 anchorRouteM = cumThis;
-                // Seam-anchored instructions (gap marker / gap resume) match at the seam vertex
-                // while their synthetic distance sits elsewhere — they must not calibrate the
-                // expectation for the next leg. Everything else anchors at its own junction node.
-                Map<String, Object> extra = instr.getExtraInfoJSON();
-                anchorCalibrated = !Boolean.TRUE.equals(extra.get("tbt_resumed"))
-                        && !Boolean.FALSE.equals(extra.get("tbt_available"));
+                // Seam-anchored instructions (gap marker / gap resume / boundary U-turn) match at
+                // the seam vertex while their synthetic distance sits elsewhere — they must not
+                // calibrate the expectation for the next leg. Everything else anchors at its own
+                // junction node.
+                anchorCalibrated = !targetSeamAnchored;
+            } else {
+                // A recovered placement means the distance key and the polyline have already
+                // disagreed by more than the sanity band. Keeping the (stale) anchor CALIBRATED
+                // makes the next leg's expectation inherit that same disagreement, so it is
+                // rejected too — and the "damage is contained to this one instruction" promise
+                // above turns into a whole-route cascade (37 instructions / 3.5 km observed on
+                // the Hämeenlinna route). Dropping calibration lets the next instruction take its
+                // own coordinate match and re-calibrate from it, which is what actually contains
+                // the damage. Occurrence SELECTION still uses the key, so a genuine repeated
+                // coordinate is still resolved by distance; only the veto is relaxed.
+                anchorCalibrated = false;
             }
         }
         return starts;
@@ -1486,8 +1558,54 @@ public class RouteInstructionGenerator {
      * (metres), far below the wrong-occurrence signal (2 x out-and-back spur; observed bugs:
      * 191 m and 4462 m). A rejected match degrades to the contained, non-anchoring
      * distance-based recovery placement.
+     * <p>
+     * Legs that CROSS a section seam are exempt (see the {@code seamIndices} overload) — their
+     * expected distance carries a whole-edge offset the band cannot judge. Because of that
+     * exemption, placement no longer depends on this value: the margin regression
+     * {@code allPayloads_placeCorrectlyAtATightenedSanityBand} tightens it 3x and asserts nothing
+     * changes. Package-private and non-final only so that test can tighten it (same pattern as
+     * {@link #SUPPRESS_BOUNDARY_UTURN}); production never changes it.
      */
-    private static final double MATCH_SANITY_M = 300.0;
+    static double MATCH_SANITY_M = 300.0;
+
+    /**
+     * Internal marker (stripped at serialization like every {@code _}-prefixed key): this
+     * instruction's polyline position is a section SEAM, not its own creation node. Set on the
+     * boundary-U-turn instruction, whose synthetic path starts at the FAR endpoint of the shared
+     * boundary edge — a node the route never reaches, because the waypoint snapped part-way into
+     * that edge. {@code _polyline_start_hint} already anchors it correctly for geometry remapping;
+     * this marker carries the same fact through to {@link #matchInstructionStarts}, which runs
+     * after the hint has been stripped.
+     */
+    static final String SEAM_ANCHORED = "_seam_anchored";
+
+    /**
+     * Whether an instruction's polyline position is a section seam rather than its own creation
+     * node. For these, the gap between its polyline position and its {@code _cum_route_m} is the
+     * section's pre-snap span — unbounded, and unrelated to the wrong-occurrence signal the sanity
+     * band looks for. Covers all three seam kinds: gap marker, gap resume, boundary U-turn.
+     */
+    private static boolean isSeamAnchored(Instruction instr) {
+        Map<String, Object> extra = instr.getExtraInfoJSON();
+        return Boolean.TRUE.equals(extra.get(SEAM_ANCHORED))
+                || Boolean.TRUE.equals(extra.get("tbt_resumed"))
+                || Boolean.FALSE.equals(extra.get("tbt_available"));
+    }
+
+    /**
+     * Whether a seam lies strictly after {@code fromIdx} and at or before {@code toIdx} — i.e. the
+     * leg between those two polyline positions leaves the routed section it started in.
+     * Returns false when there is no seam information or no candidate index.
+     */
+    private static boolean crossesSeam(int[] seams, int fromIdx, int toIdx) {
+        if (seams.length == 0 || toIdx < 0 || toIdx <= fromIdx) return false;
+        int lo = 0, hi = seams.length - 1, firstAfter = -1;
+        while (lo <= hi) {                       // lowest seam > fromIdx
+            int mid = (lo + hi) >>> 1;
+            if (seams[mid] > fromIdx) { firstAfter = mid; hi = mid - 1; } else lo = mid + 1;
+        }
+        return firstAfter >= 0 && seams[firstAfter] <= toIdx;
+    }
 
     private static double readCumRouteM(Instruction instr) {
         Object v = instr.getExtraInfoJSON().get("_cum_route_m");

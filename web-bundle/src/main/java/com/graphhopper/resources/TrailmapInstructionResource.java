@@ -67,8 +67,8 @@ public class TrailmapInstructionResource {
             // point wherever an instruction's point count differs from its polyline span (e.g. a
             // coordinates-gap resume coinciding with the next turn), which on a simplified polyline
             // shows up as the turn marker drifting tens-to-hundreds of metres past the real turn.
-            List<Integer> intervalStarts =
-                    RouteInstructionGenerator.matchInstructionStarts(result.instructions, result.polyline);
+            List<Integer> intervalStarts = RouteInstructionGenerator.matchInstructionStarts(
+                    result.instructions, result.polyline, result.seamIndices);
 
             TrailmapInstructionResponse response = new TrailmapInstructionResponse();
             response.setInstructions(serializeInstructions(result.instructions, result.polyline, intervalStarts));

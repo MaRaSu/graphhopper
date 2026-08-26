@@ -11435,4 +11435,848 @@ public class RouteInstructionGeneratorTest {
         }
         assertTrue(result.instructions.size() > 60);
     }
+
+    // =====================================================================================
+    // DIAGNOSTIC (2026-08-26 field report): 50.6 km gravel route, 14 waypoints, Hämeenlinna
+    // area. Instructions are correct up to ~17 km, where a U-turn instruction and EVERY
+    // instruction after it are placed too far along the polyline (drift grows 0.7 -> 3.5 km).
+    //
+    // why_instruction.sh already gives the verdict (instr 19 first FAIL, +729 m). This test
+    // opens the box on the 16.5-17.6 km window: the boundary U-turn's creation anchor, the
+    // synthetic vs polyline leg lengths that feed _cum_route_m, and a faithful replay of
+    // matchInstructionStarts' decision for each instruction there.
+    // =====================================================================================
+    @Test
+    void diagUturnMisplacedFrom17km_hameenlinna() throws Exception {
+        Assumptions.assumeTrue(hopper != null, "graph cache required");
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        NodeAccess na = baseGraph.getNodeAccess();
+
+        TrailmapInstructionRequest request =
+                InstructionPlacementValidationTest.parsePayload(UTURN_17KM_JSON);
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, baseGraph, hopper.getEncodingManager(), hopper.getTranslationMap());
+
+        RouteInstructionGenerator.PLACEMENT_TRACE_LOG.clear();
+        RouteInstructionGenerator.PLACEMENT_TRACE = true;
+        RouteInstructionGenerator.REMAP_DIAG_LOG.clear();
+        RouteInstructionGenerator.REMAP_DIAG = true;
+        RouteInstructionGenerator.Result result;
+        List<RouteInstructionGenerator.PlacementTraceRecord> trace;
+        List<double[]> remapLog;
+        try {
+            result = generator.generate(request);
+            trace = new ArrayList<>(RouteInstructionGenerator.PLACEMENT_TRACE_LOG);
+            remapLog = new ArrayList<>(RouteInstructionGenerator.REMAP_DIAG_LOG);
+        } finally {
+            RouteInstructionGenerator.PLACEMENT_TRACE = false;
+            RouteInstructionGenerator.PLACEMENT_TRACE_LOG.clear();
+            RouteInstructionGenerator.REMAP_DIAG = false;
+            RouteInstructionGenerator.REMAP_DIAG_LOG.clear();
+        }
+
+        PointList poly = result.polyline;
+        int n = poly.size();
+        double[] polyCum = new double[n];
+        for (int k = 1; k < n; k++)
+            polyCum[k] = polyCum[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    poly.getLat(k - 1), poly.getLon(k - 1), poly.getLat(k), poly.getLon(k));
+
+        System.out.printf(Locale.ROOT, "%n=== route %.1f km, %d polyline pts, %d instructions (pre-PP) ===%n",
+                polyCum[n - 1] / 1000.0, n, result.instructions.size());
+
+        // ---------- (1) trace records: where each routed section seams into the polyline ----------
+        System.out.println("\n--- placement trace records (seams) ---");
+        System.out.printf(Locale.ROOT, "%-4s %-7s %8s %8s %10s %10s  %s%n",
+                "rec", "type", "polyBef", "polyAft", "sBefore", "sAfter", "chain ends (node@edge len)");
+        String[] typeName = {"ROUTED", "BRIDGE", "GAP"};
+        for (int r = 0; r < trace.size(); r++) {
+            RouteInstructionGenerator.PlacementTraceRecord rec = trace.get(r);
+            double sB = polyCum[Math.min(Math.max(rec.polyBefore, 0), n - 1)];
+            double sA = polyCum[Math.min(Math.max(rec.polyAfter - 1, 0), n - 1)];
+            StringBuilder ends = new StringBuilder();
+            if (!rec.edgeIds.isEmpty()) {
+                int e0 = rec.edgeIds.get(0), eN = rec.edgeIds.get(rec.edgeIds.size() - 1);
+                EdgeIteratorState s0 = baseGraph.getEdgeIteratorState(e0, Integer.MIN_VALUE);
+                EdgeIteratorState sN = baseGraph.getEdgeIteratorState(eN, Integer.MIN_VALUE);
+                ends.append(String.format(Locale.ROOT, "first e%d (%d-%d, %.1fm)  last e%d (%d-%d, %.1fm)  [%d edges]",
+                        e0, s0.getBaseNode(), s0.getAdjNode(), s0.getDistance(),
+                        eN, sN.getBaseNode(), sN.getAdjNode(), sN.getDistance(), rec.edgeIds.size()));
+            }
+            // Only print records around the failure window plus the first few, to keep output readable.
+            if (sB > 14000 && sB < 21000 || r < 4) {
+                System.out.printf(Locale.ROOT, "%-4d %-7s %8d %8d %10.1f %10.1f  %s%n",
+                        r, typeName[rec.type], rec.polyBefore, rec.polyAfter, sB, sA, ends);
+                if (rec.type == RouteInstructionGenerator.PlacementTraceRecord.ROUTED) {
+                    System.out.printf(Locale.ROOT,
+                            "        snapStart=(%.7f,%.7f) snapEnd=(%.7f,%.7f)%n",
+                            rec.snapStartLat, rec.snapStartLon, rec.snapEndLat, rec.snapEndLon);
+                }
+            }
+        }
+
+        // ---------- (2) pre-post-processing instructions in the window ----------
+        // _cum_route_m is stamped by remapInstructionGeometry BEFORE distances are overwritten,
+        // so it is exactly the key matchInstructionStarts later uses.
+        System.out.println("\n--- pre-PP instructions 14..24: creation anchor vs distance key ---");
+        System.out.printf(Locale.ROOT, "%-4s %-18s %9s %12s %11s %11s %11s  %s%n",
+                "i", "sign", "genNode", "genCumSynth", "cumRouteM", "synthLeg", "distPostRemap", "remap: chosen(sChosen) coordErr");
+        InstructionList pre = result.instructions;
+        for (int i = 14; i <= Math.min(24, pre.size() - 1); i++) {
+            Instruction ins = pre.get(i);
+            Map<String, Object> ex = ins.getExtraInfoJSON();
+            double cum = num(ex.get("_cum_route_m"));
+            double cumNext = (i + 1 < pre.size()) ? num(pre.get(i + 1).getExtraInfoJSON().get("_cum_route_m")) : Double.NaN;
+            double[] rl = null;
+            for (double[] rec : remapLog) if ((int) rec[0] == i) { rl = rec; break; }
+            String remapStr = "-";
+            if (rl != null) {
+                int chosen = (int) rl[4];
+                remapStr = String.format(Locale.ROOT, "branch=%d chosen=%d (s=%.1f) coordErr=%.1fm",
+                        (int) rl[1], chosen, polyCum[Math.min(Math.max(chosen, 0), n - 1)], rl[5] * 90000.0);
+            }
+            System.out.printf(Locale.ROOT, "%-4d %-18s %9s %12s %11.1f %11.1f %11.1f  %s%n",
+                    i, signName(ins.getSign()),
+                    String.valueOf(ex.get("_gen_node_id")),
+                    fmt(num(ex.get("_gen_cum_synth_m"))),
+                    cum, cumNext - cum, ins.getDistance(), remapStr);
+        }
+
+        // ---------- (3) the boundary edge geometry: what the route actually traversed ----------
+        System.out.println("\n--- boundary-U-turn edge anatomy ---");
+        // Find the pre-PP U-turn instruction nearest 17 km by its remap-chosen index.
+        int uIdx = -1;
+        for (double[] rec : remapLog) {
+            int i = (int) rec[0];
+            if (i >= pre.size()) continue;
+            if (pre.get(i).getSign() != Instruction.U_TURN_UNKNOWN) continue;
+            double s = polyCum[Math.min(Math.max((int) rec[4], 0), n - 1)];
+            if (s > 16000 && s < 18500) uIdx = i;
+        }
+        System.out.println("pre-PP U-turn instruction index in the window: " + uIdx);
+        if (uIdx >= 0) {
+            Instruction u = pre.get(uIdx);
+            Object gn = u.getExtraInfoJSON().get("_gen_node_id");
+            Instruction prevI = pre.get(uIdx - 1);
+            Object pn = prevI.getExtraInfoJSON().get("_gen_node_id");
+            if (gn instanceof Number && pn instanceof Number) {
+                int uNode = ((Number) gn).intValue(), pNode = ((Number) pn).intValue();
+                System.out.printf(Locale.ROOT, "prev instr node %d = (%.7f, %.7f)%n",
+                        pNode, na.getLat(pNode), na.getLon(pNode));
+                System.out.printf(Locale.ROOT, "U-turn instr node %d = (%.7f, %.7f)%n",
+                        uNode, na.getLat(uNode), na.getLon(uNode));
+                // the edge that joins them (the boundary edge the waypoint snapped into)
+                EdgeExplorer exp = baseGraph.createEdgeExplorer();
+                EdgeIterator it = exp.setBaseNode(pNode);
+                while (it.next()) {
+                    if (it.getAdjNode() == uNode) {
+                        System.out.printf(Locale.ROOT,
+                                "boundary edge e%d %d->%d length=%.1f m%n",
+                                it.getEdge(), pNode, uNode, it.getDistance());
+                    }
+                }
+                // How far is the U-turn node's coordinate from the polyline anywhere?
+                double best = Double.MAX_VALUE; int bestIdx = -1;
+                for (int pi = 0; pi < n; pi++) {
+                    double d = DistanceCalcEarth.DIST_EARTH.calcDist(
+                            poly.getLat(pi), poly.getLon(pi), na.getLat(uNode), na.getLon(uNode));
+                    if (d < best) { best = d; bestIdx = pi; }
+                }
+                System.out.printf(Locale.ROOT,
+                        "closest polyline vertex to U-turn node %d: idx=%d s=%.1f m, distance=%.1f m%n"
+                                + "  => the route NEVER REACHES this node; it turns around %.1f m short of it.%n",
+                        uNode, bestIdx, polyCum[bestIdx], best, best);
+            }
+        }
+
+        // ---------- (4) faithful replay of matchInstructionStarts in the window ----------
+        new InstructionPostProcessor().process(result.instructions, request.getInstructionProfile());
+        InstructionList post = result.instructions;
+        List<Integer> starts = RouteInstructionGenerator.matchInstructionStarts(post, poly);
+
+        System.out.println("\n--- matchInstructionStarts replay, post-PP instructions 14..24 ---");
+        System.out.println("(anchor = last CONFIDENT placement; expectedCum = polyCum[anchor] + synthetic leg)");
+        System.out.printf(Locale.ROOT, "%-4s %-18s %9s %10s %10s %9s %6s %10s %10s  %s%n",
+                "i", "sign", "cumRouteM", "expected", "coordS", "cumErr", "#exact", "chosen", "sChosen", "verdict");
+        int anchorIdx = 0;
+        double anchorRouteM = num(post.get(0).getExtraInfoJSON().get("_cum_route_m"));
+        boolean anchorCalibrated = false;
+        for (int i = 0; i < post.size(); i++) {
+            Instruction ins = post.get(i);
+            if (i == 0 || ins.getSign() == Instruction.FINISH) {
+                if (i == 0) { anchorIdx = 0; anchorRouteM = num(ins.getExtraInfoJSON().get("_cum_route_m")); }
+                continue;
+            }
+            PointList pts = ins.getPoints();
+            if (pts.size() == 0) continue;
+            double tLat = pts.getLat(0), tLon = pts.getLon(0);
+            double cumThis = num(ins.getExtraInfoJSON().get("_cum_route_m"));
+            boolean haveKey = !Double.isNaN(cumThis) && !Double.isNaN(anchorRouteM);
+            double expectedCum = haveKey ? polyCum[anchorIdx] + (cumThis - anchorRouteM) : Double.NaN;
+
+            int exactCount = 0, firstExact = -1, distBest = -1;
+            double distBestErr = Double.MAX_VALUE;
+            for (int pi = anchorIdx; pi < n; pi++) {
+                double cd = Math.abs(poly.getLat(pi) - tLat) + Math.abs(poly.getLon(pi) - tLon);
+                if (cd < 5e-6) {
+                    exactCount++;
+                    if (firstExact < 0) firstExact = pi;
+                    double cumErr = haveKey ? Math.abs(polyCum[pi] - expectedCum) : 0.0;
+                    if (cumErr < distBestErr) { distBestErr = cumErr; distBest = pi; }
+                    if (!haveKey) break;
+                }
+            }
+            boolean accepted = exactCount >= 1 && (!haveKey || !anchorCalibrated || distBestErr <= 300.0);
+            int chosen = starts.get(i);
+            String verdict = exactCount == 0 ? "NO-EXACT -> recovery"
+                    : (accepted ? "accept coord match"
+                    : String.format(Locale.ROOT, "REJECTED by sanity band (%.0f > 300) -> recovery", distBestErr));
+
+            if (i >= 14 && i <= 24) {
+                System.out.printf(Locale.ROOT, "%-4d %-18s %9.1f %10s %10s %9s %6d %10d %10.1f  %s%n",
+                        i, signName(ins.getSign()), cumThis,
+                        haveKey ? String.format(Locale.ROOT, "%.1f", expectedCum) : "-",
+                        distBest >= 0 ? String.format(Locale.ROOT, "%.1f", polyCum[distBest]) : "-",
+                        distBestErr == Double.MAX_VALUE ? "-" : String.format(Locale.ROOT, "%.1f", distBestErr),
+                        exactCount, chosen, polyCum[Math.min(chosen, n - 1)], verdict);
+            }
+            if (accepted) {
+                anchorIdx = (haveKey ? distBest : firstExact);
+                if (anchorIdx < 0) anchorIdx = chosen;
+                anchorRouteM = cumThis;
+                Map<String, Object> ex = ins.getExtraInfoJSON();
+                anchorCalibrated = !Boolean.TRUE.equals(ex.get("tbt_resumed"))
+                        && !Boolean.FALSE.equals(ex.get("tbt_available"));
+            }
+        }
+
+        // ---------- (5) synthetic-vs-polyline leg drift accumulation ----------
+        System.out.println("\n--- where the distance key desyncs from the polyline (all legs, |drift| > 20 m) ---");
+        System.out.printf(Locale.ROOT, "%-4s %-18s %11s %11s %10s  %s%n",
+                "i", "sign", "synthLeg", "polyLeg", "legDrift", "cumulative");
+        double cumDrift = 0;
+        for (int i = 0; i + 1 < post.size(); i++) {
+            double a = num(post.get(i).getExtraInfoJSON().get("_cum_route_m"));
+            double b = num(post.get(i + 1).getExtraInfoJSON().get("_cum_route_m"));
+            if (Double.isNaN(a) || Double.isNaN(b)) continue;
+            double synthLeg = b - a;
+            double polyLeg = polyCum[Math.min(starts.get(i + 1), n - 1)] - polyCum[Math.min(starts.get(i), n - 1)];
+            double drift = synthLeg - polyLeg;
+            cumDrift += drift;
+            if (Math.abs(drift) > 20) {
+                System.out.printf(Locale.ROOT, "%-4d %-18s %11.1f %11.1f %10.1f  %10.1f%n",
+                        i, signName(post.get(i).getSign()), synthLeg, polyLeg, drift, cumDrift);
+            }
+        }
+
+        assertTrue(post.size() > 20);
+    }
+
+    // =====================================================================================
+    // DEEP DIVE on the same payload: WHY does matchInstructionStarts override remap, and what
+    // is the 300 m sanity band actually protecting? Controlled lever sweep, test-tree only.
+    //
+    // Variants, all scored by the independent placement oracle (InstructionPlacementOracle):
+    //   P  production matchInstructionStarts (baseline)
+    //   S  simulator replaying the production algorithm at band=300  -> must equal P (fidelity)
+    //   band sweep 300 / 700 / 1500 / 5000 / infinite
+    //   K  traversed-accurate _cum_route_m key at boundary-U-turn seams, band=300
+    //   C  boundary-U-turn instruction treated as an UNCALIBRATED seam anchor, band=300
+    //   KC both
+    // =====================================================================================
+    @Test
+    void diagUturnSanityBandLeverSweep_hameenlinna() throws Exception {
+        Assumptions.assumeTrue(hopper != null, "graph cache required");
+        BaseGraph baseGraph = hopper.getBaseGraph();
+
+        TrailmapInstructionRequest request =
+                InstructionPlacementValidationTest.parsePayload(UTURN_17KM_JSON);
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, baseGraph, hopper.getEncodingManager(), hopper.getTranslationMap());
+
+        RouteInstructionGenerator.PLACEMENT_TRACE_LOG.clear();
+        RouteInstructionGenerator.PLACEMENT_TRACE = true;
+        RouteInstructionGenerator.Result result;
+        List<RouteInstructionGenerator.PlacementTraceRecord> trace;
+        try {
+            result = generator.generate(request);
+            trace = new ArrayList<>(RouteInstructionGenerator.PLACEMENT_TRACE_LOG);
+        } finally {
+            RouteInstructionGenerator.PLACEMENT_TRACE = false;
+            RouteInstructionGenerator.PLACEMENT_TRACE_LOG.clear();
+        }
+        // Snapshot the PRE-post-processing synthetic distances (what feeds _cum_route_m).
+        List<String> preSnapshot = new ArrayList<>();
+        for (int i = 0; i < result.instructions.size(); i++) {
+            Instruction ins = result.instructions.get(i);
+            Map<String, Object> ex = ins.getExtraInfoJSON();
+            preSnapshot.add(String.format(Locale.ROOT, "prePP %2d %-18s node=%-9s synth=%-9s cum=%9.1f dist=%9.1f %s",
+                    i, signName(ins.getSign()), String.valueOf(ex.get("_gen_node_id")),
+                    fmt(num(ex.get("_gen_cum_synth_m"))), num(ex.get("_cum_route_m")), ins.getDistance(),
+                    ins.getName()));
+        }
+
+        new InstructionPostProcessor().process(result.instructions, request.getInstructionProfile());
+        InstructionList instrs = result.instructions;
+        PointList poly = result.polyline;
+        int n = poly.size();
+
+        // ---------- inventory every boundary U-turn seam and its untraversed remainder ----------
+        // A boundary U-turn seam: ROUTED record k's last edge == record k+1's first edge, and the
+        // two sections pivot on the SAME node of that edge (stitchEdgeChains' isUturn test).
+        // traversedM  = pivot node -> snap point, measured on the edge's own pillar geometry
+        // remainderM  = edge length - traversedM  = the part the route NEVER rides, yet which the
+        //               synthetic path charges to _cum_route_m twice (once in, once out).
+        System.out.println("\n=== boundary-U-turn seam inventory ===");
+        System.out.printf(Locale.ROOT, "%-6s %-10s %8s %8s %10s %10s %10s  %s%n",
+                "seam", "edge", "pivot", "farNode", "edgeLen", "traversed", "remainder", "seam s (m)");
+        double[] polyCum = new double[n];
+        for (int k = 1; k < n; k++)
+            polyCum[k] = polyCum[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    poly.getLat(k - 1), poly.getLon(k - 1), poly.getLat(k), poly.getLon(k));
+
+        // farNode -> {traversedM, remainderM, seamPolyIdx}
+        Map<Integer, double[]> uturnSeams = new LinkedHashMap<>();
+        RouteInstructionGenerator.PlacementTraceRecord prevRouted = null;
+        double totalRemainder = 0;
+        for (RouteInstructionGenerator.PlacementTraceRecord rec : trace) {
+            if (rec.type != RouteInstructionGenerator.PlacementTraceRecord.ROUTED) {
+                if (rec.type == RouteInstructionGenerator.PlacementTraceRecord.GAP) prevRouted = null;
+                continue;
+            }
+            if (prevRouted != null && prevRouted.edgeIds.size() >= 2 && rec.edgeIds.size() >= 2
+                    && prevRouted.edgeIds.get(prevRouted.edgeIds.size() - 1).equals(rec.edgeIds.get(0))) {
+                int sharedId = rec.edgeIds.get(0);
+                EdgeIteratorState shared = baseGraph.getEdgeIteratorState(sharedId, Integer.MIN_VALUE);
+                int sBase = shared.getBaseNode(), sAdj = shared.getAdjNode();
+                EdgeIteratorState pen = baseGraph.getEdgeIteratorState(
+                        prevRouted.edgeIds.get(prevRouted.edgeIds.size() - 2), Integer.MIN_VALUE);
+                EdgeIteratorState sec = baseGraph.getEdgeIteratorState(rec.edgeIds.get(1), Integer.MIN_VALUE);
+                int prevEntry = (pen.getBaseNode() == sBase || pen.getAdjNode() == sBase) ? sBase
+                        : ((pen.getBaseNode() == sAdj || pen.getAdjNode() == sAdj) ? sAdj : -1);
+                int currExit = (sec.getBaseNode() == sBase || sec.getAdjNode() == sBase) ? sBase
+                        : ((sec.getBaseNode() == sAdj || sec.getAdjNode() == sAdj) ? sAdj : -1);
+                if (prevEntry != -1 && prevEntry == currExit) {
+                    int pivot = prevEntry, far = (pivot == sBase) ? sAdj : sBase;
+                    // Project the seam snap point onto the shared edge's own geometry (independent
+                    // of the response polyline) to get the traversed length pivot -> snap.
+                    PointList geom = shared.fetchWayGeometry(FetchMode.ALL);
+                    boolean reverse = (shared.getBaseNode() != pivot);
+                    double gLen = 0;
+                    List<Double> cum = new ArrayList<>();
+                    cum.add(0.0);
+                    for (int gi = 1; gi < geom.size(); gi++) {
+                        gLen += DistanceCalcEarth.DIST_EARTH.calcDist(geom.getLat(gi - 1), geom.getLon(gi - 1),
+                                geom.getLat(gi), geom.getLon(gi));
+                        cum.add(gLen);
+                    }
+                    double bestD = Double.MAX_VALUE, bestCum = 0;
+                    for (int gi = 0; gi < geom.size(); gi++) {
+                        double d = DistanceCalcEarth.DIST_EARTH.calcDist(geom.getLat(gi), geom.getLon(gi),
+                                prevRouted.snapEndLat, prevRouted.snapEndLon);
+                        if (d < bestD) { bestD = d; bestCum = reverse ? gLen - cum.get(gi) : cum.get(gi); }
+                    }
+                    double scale = gLen > 0 ? shared.getDistance() / gLen : 1.0;
+                    double traversed = bestCum * scale;
+                    double remainder = shared.getDistance() - traversed;
+                    // commitPending stamps the U-turn hint as fullPolyline.size()-1 taken BEFORE
+                    // appendRoutePolyline, i.e. tracePolyBefore-1 = the seam vertex itself (the
+                    // next section's first point deduplicates against it).
+                    int seamIdx = Math.min(Math.max(rec.polyBefore - 1, 0), n - 1);
+                    uturnSeams.put(far, new double[]{traversed, remainder, seamIdx});
+                    totalRemainder += remainder;
+                    System.out.printf(Locale.ROOT, "%-6d %-10d %8d %8d %10.1f %10.1f %10.1f  %10.1f%n",
+                            uturnSeams.size(), sharedId, pivot, far, shared.getDistance(),
+                            traversed, remainder, polyCum[seamIdx]);
+                }
+            }
+            prevRouted = rec;
+        }
+        System.out.printf(Locale.ROOT,
+                "total untraversed remainder over %d U-turn seams = %.1f m; charged TWICE to the key = %.1f m%n",
+                uturnSeams.size(), totalRemainder, 2 * totalRemainder);
+        System.out.printf(Locale.ROOT,
+                "(BOUNDARY_UTURN_MAX_TRAVERSED_M = 15 m gates seam ERASURE on `traversed`, not on `remainder`)%n");
+
+        // ---------- build the corrected key + the seam-instruction set ----------
+        int m = instrs.size();
+        double[] baseKey = new double[m];
+        for (int i = 0; i < m; i++) baseKey[i] = num(instrs.get(i).getExtraInfoJSON().get("_cum_route_m"));
+
+        Set<Integer> seamInstrIdx = new LinkedHashSet<>();     // the U-turn instruction itself
+        double[] legFix = new double[m];                        // per-leg key correction (subtract)
+        for (int i = 0; i < m; i++) {
+            Object gn = instrs.get(i).getExtraInfoJSON().get("_gen_node_id");
+            if (!(gn instanceof Number)) continue;
+            double[] seam = uturnSeams.get(((Number) gn).intValue());
+            if (seam == null || instrs.get(i).getSign() != Instruction.U_TURN_UNKNOWN) continue;
+            seamInstrIdx.add(i);
+            // leg INTO the seam (previous instruction) and leg OUT of it are each charged the
+            // FULL shared edge; each must lose `remainder`.
+            if (i - 1 >= 0) legFix[i - 1] += seam[1];
+            legFix[i] += seam[1];
+        }
+        double[] fixedKey = new double[m];
+        double acc = 0;
+        for (int i = 0; i < m; i++) {
+            fixedKey[i] = baseKey[i] - acc;
+            acc += legFix[i];
+        }
+        System.out.println("boundary-U-turn instruction indices in the final list: " + seamInstrIdx);
+
+        // ---------- run the sweep ----------
+        List<Integer> production =
+                RouteInstructionGenerator.matchInstructionStarts(instrs, poly, result.seamIndices);
+        System.out.println("\n=== lever sweep (scored by the independent oracle) ===");
+        System.out.printf(Locale.ROOT, "%-42s %8s %10s %10s%n", "variant", "FAILs", "maxAbsDs", "firstFail");
+        scoreVariant("P  production matchInstructionStarts", baseGraph, trace, instrs, poly, production);
+        scoreVariant("S  simulator, band=300 (fidelity check)", baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, baseKey, 300, Set.of(), Map.of()));
+        for (double band : new double[]{700, 1500, 5000, Double.MAX_VALUE}) {
+            scoreVariant(String.format(Locale.ROOT, "   band=%s", band == Double.MAX_VALUE ? "inf" : (int) band),
+                    baseGraph, trace, instrs, poly,
+                    simulateMatcher(instrs, poly, polyCum, baseKey, band, Set.of(), Map.of()));
+        }
+        Map<Integer, Integer> forced = new LinkedHashMap<>();
+        for (int i : seamInstrIdx) {
+            Object gn = instrs.get(i).getExtraInfoJSON().get("_gen_node_id");
+            forced.put(i, (int) uturnSeams.get(((Number) gn).intValue())[2]);
+        }
+        double[] noKey = new double[m];
+        java.util.Arrays.fill(noKey, Double.NaN);
+        scoreVariant("N  no key at all (pre-2026-07-09 legacy)", baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, noKey, 300, Set.of(), Map.of()));
+        scoreVariant("K  traversed-accurate key, band=300", baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, fixedKey, 300, Set.of(), Map.of()));
+        scoreVariant("C  U-turn = uncalibrated seam anchor, band=300", baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, baseKey, 300, seamInstrIdx, forced));
+        scoreVariant("KC both", baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, fixedKey, 300, seamInstrIdx, forced));
+
+        // ---------- how large is the ordinary (non-U-turn) key noise the band must tolerate? ----------
+        // Measured against the oracle's ground-truth positions, leg by leg, excluding U-turn seams.
+        InstructionPlacementOracle.Report ref = InstructionPlacementOracle.validate(
+                baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, fixedKey, 300, seamInstrIdx, forced));
+        System.out.println("\n=== per-leg key error vs oracle truth (the noise the 300 m band must sit above) ===");
+        double maxOrdinary = 0; String maxWhere = "";
+        List<Double> ordinary = new ArrayList<>();
+        for (int i = 0; i + 1 < m; i++) {
+            Double a = ref.rows.get(i).sOracle, b = ref.rows.get(i + 1).sOracle;
+            if (a == null || b == null || Double.isNaN(baseKey[i]) || Double.isNaN(baseKey[i + 1])) continue;
+            double keyLeg = baseKey[i + 1] - baseKey[i];
+            double trueLeg = b - a;
+            double err = Math.abs(keyLeg - trueLeg);
+            boolean atSeam = seamInstrIdx.contains(i) || seamInstrIdx.contains(i + 1);
+            if (!atSeam) {
+                ordinary.add(err);
+                if (err > maxOrdinary) { maxOrdinary = err; maxWhere = "leg " + i + "->" + (i + 1); }
+            } else {
+                System.out.printf(Locale.ROOT, "  U-TURN SEAM  leg %2d->%2d: key %8.1f  true %8.1f  err %8.1f%n",
+                        i, i + 1, keyLeg, trueLeg, err);
+            }
+        }
+        Collections.sort(ordinary);
+        System.out.printf(Locale.ROOT,
+                "  ordinary legs: n=%d  median=%.1f m  p90=%.1f m  max=%.1f m (%s)%n",
+                ordinary.size(),
+                ordinary.isEmpty() ? 0 : ordinary.get(ordinary.size() / 2),
+                ordinary.isEmpty() ? 0 : ordinary.get((int) (ordinary.size() * 0.9)),
+                maxOrdinary, maxWhere);
+
+        // ---------- the worst ORDINARY legs: how close does normal operation get to the band? ----------
+        // Any section seam (ROUTED record start) that falls between two instructions' true positions
+        // is the candidate explanation; a leg with no seam between it should be near-zero.
+        List<double[]> ordRows = new ArrayList<>();   // {err, i, keyLeg, trueLeg}
+        for (int i = 0; i + 1 < m; i++) {
+            Double a = ref.rows.get(i).sOracle, b = ref.rows.get(i + 1).sOracle;
+            if (a == null || b == null || Double.isNaN(baseKey[i]) || Double.isNaN(baseKey[i + 1])) continue;
+            if (seamInstrIdx.contains(i) || seamInstrIdx.contains(i + 1)) continue;
+            ordRows.add(new double[]{Math.abs((baseKey[i + 1] - baseKey[i]) - (b - a)), i,
+                    baseKey[i + 1] - baseKey[i], b - a, a, b});
+        }
+        ordRows.sort((x, y) -> Double.compare(y[0], x[0]));
+        System.out.println("\n  worst ordinary legs (band headroom = 300 - err):");
+        System.out.printf(Locale.ROOT, "  %-10s %9s %9s %9s %9s  %s%n",
+                "leg", "keyLeg", "trueLeg", "err", "headroom", "section seams inside the leg");
+        for (int r = 0; r < Math.min(6, ordRows.size()); r++) {
+            double[] row = ordRows.get(r);
+            int i = (int) row[1];
+            StringBuilder seams = new StringBuilder();
+            for (RouteInstructionGenerator.PlacementTraceRecord rec : trace) {
+                int idx = Math.min(Math.max(rec.polyBefore, 0), n - 1);
+                if (polyCum[idx] > row[4] + 0.5 && polyCum[idx] < row[5] - 0.5) {
+                    seams.append(typeNameOf(rec.type)).append('@')
+                            .append(String.format(Locale.ROOT, "%.0f", polyCum[idx])).append(' ');
+                }
+            }
+            System.out.printf(Locale.ROOT, "  %-10s %9.1f %9.1f %9.1f %9.1f  %s%n",
+                    i + "->" + (i + 1), row[2], row[3], row[0], 300 - row[0],
+                    seams.length() == 0 ? "(none)" : seams.toString());
+        }
+
+        // ---------- zoom on the worst ORDINARY leg (the near-miss against the band) ----------
+        System.out.println("\n=== zoom: worst ordinary leg (two short back-to-back sections) ===");
+        for (RouteInstructionGenerator.PlacementTraceRecord rec : trace) {
+            int idx = Math.min(Math.max(rec.polyBefore, 0), n - 1);
+            if (polyCum[idx] < 42000 || polyCum[idx] > 45000) continue;
+            StringBuilder chain = new StringBuilder();
+            for (int e : rec.edgeIds) {
+                EdgeIteratorState es = baseGraph.getEdgeIteratorState(e, Integer.MIN_VALUE);
+                chain.append(String.format(Locale.ROOT, "e%d(%d-%d,%.0fm) ",
+                        e, es.getBaseNode(), es.getAdjNode(), es.getDistance()));
+            }
+            System.out.printf(Locale.ROOT, "%-6s polyBefore=%d (s=%.1f) polyAfter=%d  snapStart=(%.6f,%.6f) snapEnd=(%.6f,%.6f)%n    chain: %s%n",
+                    typeNameOf(rec.type), rec.polyBefore, polyCum[idx], rec.polyAfter,
+                    rec.snapStartLat, rec.snapStartLon, rec.snapEndLat, rec.snapEndLon, chain);
+        }
+        System.out.println("  pre-PP instructions 50..end:");
+        for (int i = 50; i < preSnapshot.size(); i++) System.out.println("    " + preSnapshot.get(i));
+
+        assertTrue(m > 20);
+    }
+
+    // =====================================================================================
+    // REGRESSION PRE-CHECK (no production change): would the candidate fixes hold on the
+    // payloads that are already standing regressions? Each payload is generated once through
+    // the real code path, then scored by the placement oracle under each variant.
+    //   P       production matchInstructionStarts (today's behaviour)
+    //   band700 raise MATCH_SANITY_M only
+    //   K       traversed-accurate _cum_route_m at boundary-U-turn seams (band stays 300)
+    //   C       boundary-U-turn instruction = uncalibrated seam anchor placed at the hint
+    //   KC      both
+    // =====================================================================================
+    @Test
+    void diagPlacementVariantMatrix_allStandingPayloads() throws Exception {
+        Assumptions.assumeTrue(hopper != null, "graph cache required");
+        Map<String, TrailmapInstructionRequest> payloads = new LinkedHashMap<>();
+        payloads.put("hameenlinna50 (NEW fail)", InstructionPlacementValidationTest.parsePayload(UTURN_17KM_JSON));
+        payloads.put("joensuu500", InstructionPlacementValidationTest.parsePayload(JOENSUU_500_JSON));
+        payloads.put("saariselka30wp",
+                InstructionPlacementValidationTest.loadPayloadResource("saariselka_misplaced_left_uturn.json"));
+        payloads.put("saariselka2seg",
+                InstructionPlacementValidationTest.loadPayloadResource("saariselka_2seg_presnap_sanity_band.json"));
+        payloads.put("drift152km", InstructionPlacementValidationTest.parsePayload(DRIFT_JSON));
+
+        System.out.printf(Locale.ROOT, "%n=== placement variant matrix (FAILs / max|Δs| m) ===%n");
+        System.out.printf(Locale.ROOT, "%-26s %6s %14s %14s %14s %14s %14s %14s%n",
+                "payload", "instrs", "P (today)", "no-key(pre13)", "band=inf", "K key-fix", "C seam-anch", "K+band=inf");
+        for (Map.Entry<String, TrailmapInstructionRequest> e : payloads.entrySet()) {
+            try {
+                System.out.printf(Locale.ROOT, "%-26s %s%n", e.getKey(), variantRow(e.getValue()));
+            } catch (RuntimeException ex) {
+                System.out.printf(Locale.ROOT, "%-26s  ERROR: %s%n", e.getKey(), ex);
+            }
+        }
+        assertTrue(true);
+    }
+
+    /** Generate once, then score every variant; returns the formatted row. */
+    private String variantRow(TrailmapInstructionRequest request) {
+        BaseGraph baseGraph = hopper.getBaseGraph();
+        RouteInstructionGenerator generator = new RouteInstructionGenerator(
+                hopper, baseGraph, hopper.getEncodingManager(), hopper.getTranslationMap());
+        RouteInstructionGenerator.PLACEMENT_TRACE_LOG.clear();
+        RouteInstructionGenerator.PLACEMENT_TRACE = true;
+        RouteInstructionGenerator.Result result;
+        List<RouteInstructionGenerator.PlacementTraceRecord> trace;
+        try {
+            result = generator.generate(request);
+            trace = new ArrayList<>(RouteInstructionGenerator.PLACEMENT_TRACE_LOG);
+        } finally {
+            RouteInstructionGenerator.PLACEMENT_TRACE = false;
+            RouteInstructionGenerator.PLACEMENT_TRACE_LOG.clear();
+        }
+        int productionSeamCount = result.seamIndices.size();
+        new InstructionPostProcessor().process(result.instructions, request.getInstructionProfile());
+        InstructionList instrs = result.instructions;
+        PointList poly = result.polyline;
+        int n = poly.size(), m = instrs.size();
+        double[] polyCum = new double[n];
+        for (int k = 1; k < n; k++)
+            polyCum[k] = polyCum[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    poly.getLat(k - 1), poly.getLon(k - 1), poly.getLat(k), poly.getLon(k));
+
+        Map<Integer, double[]> seams = findUturnSeams(baseGraph, trace, n);
+        double[] baseKey = new double[m];
+        for (int i = 0; i < m; i++) baseKey[i] = num(instrs.get(i).getExtraInfoJSON().get("_cum_route_m"));
+        Set<Integer> seamInstr = new LinkedHashSet<>();
+        Map<Integer, Integer> forced = new LinkedHashMap<>();
+        double[] legFix = new double[m];
+        for (int i = 0; i < m; i++) {
+            Object gn = instrs.get(i).getExtraInfoJSON().get("_gen_node_id");
+            if (!(gn instanceof Number)) continue;
+            double[] s = seams.get(((Number) gn).intValue());
+            if (s == null || instrs.get(i).getSign() != Instruction.U_TURN_UNKNOWN) continue;
+            seamInstr.add(i);
+            forced.put(i, (int) s[2]);
+            if (i - 1 >= 0) legFix[i - 1] += s[1];
+            legFix[i] += s[1];
+        }
+        double[] fixedKey = new double[m];
+        double acc = 0;
+        for (int i = 0; i < m; i++) { fixedKey[i] = baseKey[i] - acc; acc += legFix[i]; }
+
+        // Headroom census: worst NON-U-turn-seam leg key error vs the 300 m band.
+        InstructionPlacementOracle.Report truth = InstructionPlacementOracle.validate(
+                baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, fixedKey, 300, seamInstr, forced));
+        double worst = 0; int worstLeg = -1, over100 = 0, over200 = 0, over300 = 0;
+        for (int i = 0; i + 1 < m; i++) {
+            Double a = truth.rows.get(i).sOracle, b = truth.rows.get(i + 1).sOracle;
+            if (a == null || b == null || Double.isNaN(baseKey[i]) || Double.isNaN(baseKey[i + 1])) continue;
+            if (seamInstr.contains(i) || seamInstr.contains(i + 1)) continue;
+            double err = Math.abs((baseKey[i + 1] - baseKey[i]) - (b - a));
+            if (err > 100) over100++;
+            if (err > 200) over200++;
+            if (err > 300) over300++;
+            if (err > worst) { worst = err; worstLeg = i; }
+        }
+        System.out.printf(Locale.ROOT,
+                "   [headroom] worst non-uturn leg key error %7.1f m (leg %d)  headroom %7.1f m"
+                        + "   legs >100m:%d >200m:%d >300m:%d%n",
+                worst, worstLeg, 300 - worst, over100, over200, over300);
+
+        // Stress: shrink the band and compare today's rule against "skip the veto on legs that
+        // cross a section seam". If the seam rule is the right abstraction, it should be far less
+        // sensitive to the band's value than today's rule is.
+        List<Integer> seamList = new ArrayList<>();
+        for (RouteInstructionGenerator.PlacementTraceRecord rec : trace)
+            if (rec.type == RouteInstructionGenerator.PlacementTraceRecord.ROUTED && rec.polyBefore > 0)
+                seamList.add(rec.polyBefore - 1);
+        int[] seamArr = new int[seamList.size()];
+        for (int i = 0; i < seamArr.length; i++) seamArr[i] = seamList.get(i);
+        StringBuilder stress = new StringBuilder("   [stress] ");
+        for (double b : new double[]{300, 200, 100, 50, 25}) {
+            int pre = failCount(baseGraph, trace, instrs, poly,
+                    simulateMatcher(instrs, poly, polyCum, baseKey, b, seamInstr, forced, null));
+            int seamRule = failCount(baseGraph, trace, instrs, poly,
+                    simulateMatcher(instrs, poly, polyCum, baseKey, b, seamInstr, forced, seamArr));
+            stress.append(String.format(Locale.ROOT, "band%.0f pre=%d seam=%d   ", b, pre, seamRule));
+        }
+        System.out.println(stress);
+        // Sanity: the seam list the simulator uses must be the one production now ships.
+        System.out.printf(Locale.ROOT, "   [seams] production=%d simulated=%d%n",
+                productionSeamCount, seamArr.length);
+
+        StringBuilder sb = new StringBuilder(String.format(Locale.ROOT, "%6d", m));
+        sb.append(cell(baseGraph, trace, instrs, poly,
+                RouteInstructionGenerator.matchInstructionStarts(instrs, poly, result.seamIndices)));
+        double[] noKey = new double[m];
+        java.util.Arrays.fill(noKey, Double.NaN);
+        sb.append(cell(baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, noKey, 300, Set.of(), Map.of())));
+        sb.append(cell(baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, baseKey, Double.MAX_VALUE, Set.of(), Map.of())));
+        sb.append(cell(baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, fixedKey, 300, Set.of(), Map.of())));
+        sb.append(cell(baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, baseKey, 300, seamInstr, forced)));
+        sb.append(cell(baseGraph, trace, instrs, poly,
+                simulateMatcher(instrs, poly, polyCum, fixedKey, Double.MAX_VALUE, Set.of(), Map.of())));
+        return sb.toString();
+    }
+
+    private static String cell(BaseGraph g, List<RouteInstructionGenerator.PlacementTraceRecord> trace,
+                               InstructionList instrs, PointList poly, List<Integer> starts) {
+        InstructionPlacementOracle.Report rep =
+                InstructionPlacementOracle.validate(g, trace, instrs, poly, starts);
+        double maxAbs = 0;
+        for (InstructionPlacementOracle.Row r : rep.rows) {
+            if (r.sOracle == null || r.pass) continue;
+            maxAbs = Math.max(maxAbs, Math.abs(r.sReport - r.sOracle));
+        }
+        return String.format(Locale.ROOT, " %14s",
+                rep.check1Failures().size() + "/" + String.format(Locale.ROOT, "%.0f", maxAbs));
+    }
+
+    /** farNode -> {traversedM, untraversedRemainderM, seamPolyIdx} for every boundary-U-turn seam. */
+    private static Map<Integer, double[]> findUturnSeams(BaseGraph baseGraph,
+                                                        List<RouteInstructionGenerator.PlacementTraceRecord> trace,
+                                                        int n) {
+        Map<Integer, double[]> out = new LinkedHashMap<>();
+        RouteInstructionGenerator.PlacementTraceRecord prev = null;
+        for (RouteInstructionGenerator.PlacementTraceRecord rec : trace) {
+            if (rec.type != RouteInstructionGenerator.PlacementTraceRecord.ROUTED) {
+                if (rec.type == RouteInstructionGenerator.PlacementTraceRecord.GAP) prev = null;
+                continue;
+            }
+            if (prev != null && prev.edgeIds.size() >= 2 && rec.edgeIds.size() >= 2
+                    && prev.edgeIds.get(prev.edgeIds.size() - 1).equals(rec.edgeIds.get(0))) {
+                int sharedId = rec.edgeIds.get(0);
+                EdgeIteratorState shared = baseGraph.getEdgeIteratorState(sharedId, Integer.MIN_VALUE);
+                int sBase = shared.getBaseNode(), sAdj = shared.getAdjNode();
+                EdgeIteratorState pen = baseGraph.getEdgeIteratorState(
+                        prev.edgeIds.get(prev.edgeIds.size() - 2), Integer.MIN_VALUE);
+                EdgeIteratorState sec = baseGraph.getEdgeIteratorState(rec.edgeIds.get(1), Integer.MIN_VALUE);
+                int prevEntry = (pen.getBaseNode() == sBase || pen.getAdjNode() == sBase) ? sBase
+                        : ((pen.getBaseNode() == sAdj || pen.getAdjNode() == sAdj) ? sAdj : -1);
+                int currExit = (sec.getBaseNode() == sBase || sec.getAdjNode() == sBase) ? sBase
+                        : ((sec.getBaseNode() == sAdj || sec.getAdjNode() == sAdj) ? sAdj : -1);
+                if (prevEntry != -1 && prevEntry == currExit) {
+                    int pivot = prevEntry, far = (pivot == sBase) ? sAdj : sBase;
+                    PointList geom = shared.fetchWayGeometry(FetchMode.ALL);
+                    boolean reverse = (shared.getBaseNode() != pivot);
+                    double gLen = 0;
+                    double[] cum = new double[geom.size()];
+                    for (int gi = 1; gi < geom.size(); gi++) {
+                        gLen += DistanceCalcEarth.DIST_EARTH.calcDist(geom.getLat(gi - 1), geom.getLon(gi - 1),
+                                geom.getLat(gi), geom.getLon(gi));
+                        cum[gi] = gLen;
+                    }
+                    double bestD = Double.MAX_VALUE, bestCum = 0;
+                    for (int gi = 0; gi < geom.size(); gi++) {
+                        double d = DistanceCalcEarth.DIST_EARTH.calcDist(geom.getLat(gi), geom.getLon(gi),
+                                prev.snapEndLat, prev.snapEndLon);
+                        if (d < bestD) { bestD = d; bestCum = reverse ? gLen - cum[gi] : cum[gi]; }
+                    }
+                    double scale = gLen > 0 ? shared.getDistance() / gLen : 1.0;
+                    double traversed = bestCum * scale;
+                    out.put(far, new double[]{traversed, shared.getDistance() - traversed,
+                            Math.min(Math.max(rec.polyBefore - 1, 0), n - 1)});
+                }
+            }
+            prev = rec;
+        }
+        return out;
+    }
+
+    private static int failCount(BaseGraph g, List<RouteInstructionGenerator.PlacementTraceRecord> trace,
+                                 InstructionList instrs, PointList poly, List<Integer> starts) {
+        return InstructionPlacementOracle.validate(g, trace, instrs, poly, starts).check1Failures().size();
+    }
+
+    private static String typeNameOf(int t) {
+        return t == RouteInstructionGenerator.PlacementTraceRecord.ROUTED ? "ROUTED"
+                : t == RouteInstructionGenerator.PlacementTraceRecord.BRIDGE ? "BRIDGE" : "GAP";
+    }
+
+    /** Score one candidate interval-start list with the independent placement oracle. */
+    private static void scoreVariant(String label, BaseGraph graph,
+                                     List<RouteInstructionGenerator.PlacementTraceRecord> trace,
+                                     InstructionList instrs, PointList poly, List<Integer> starts) {
+        InstructionPlacementOracle.Report rep =
+                InstructionPlacementOracle.validate(graph, trace, instrs, poly, starts);
+        double maxAbs = 0; int first = -1;
+        for (InstructionPlacementOracle.Row r : rep.rows) {
+            if (r.sOracle == null) continue;
+            double ds = Math.abs(r.sReport - r.sOracle);
+            if (!r.pass) { if (first < 0) first = r.idx; if (ds > maxAbs) maxAbs = ds; }
+        }
+        System.out.printf(Locale.ROOT, "%-42s %8d %10.1f %10s%n",
+                label, rep.check1Failures().size(), maxAbs, first < 0 ? "-" : String.valueOf(first));
+    }
+
+    /**
+     * Faithful replay of {@link RouteInstructionGenerator#matchInstructionStarts} with three levers:
+     * the sanity band, an alternative distance key, and a set of instructions treated as
+     * seam-anchored (placed at a forced index and never calibrating the anchor).
+     */
+    private static List<Integer> simulateMatcher(InstructionList instrs, PointList poly, double[] polyCum,
+                                                 double[] key, double band,
+                                                 Set<Integer> seamInstr, Map<Integer, Integer> forcedIdx) {
+        return simulateMatcher(instrs, poly, polyCum, key, band, seamInstr, forcedIdx, null);
+    }
+
+    /**
+     * @param seamPolyIdx when non-null, the polyline indices at which a routed section begins. A leg
+     *                    that CROSSES one of them has an unreliable expectation — the section's
+     *                    first/last edges are charged to the key whole but only partly ridden — so
+     *                    the sanity veto is skipped for it. This is the candidate fix for the
+     *                    section-boundary key error (the 282 m near-miss).
+     */
+    private static List<Integer> simulateMatcher(InstructionList instrs, PointList poly, double[] polyCum,
+                                                 double[] key, double band,
+                                                 Set<Integer> seamInstr, Map<Integer, Integer> forcedIdx,
+                                                 int[] seamPolyIdx) {
+        int n = poly.size();
+        List<Integer> starts = new ArrayList<>();
+        int anchorIdx = 0;
+        double anchorRouteM = key[0];
+        boolean anchorCalibrated = false;
+        for (int i = 0; i < instrs.size(); i++) {
+            Instruction ins = instrs.get(i);
+            if (ins.getSign() == Instruction.FINISH) { starts.add(n - 1); continue; }
+            if (i == 0) { starts.add(0); anchorIdx = 0; anchorRouteM = key[0]; anchorCalibrated = false; continue; }
+            PointList pts = ins.getPoints();
+            if (pts.size() == 0) { starts.add(Math.max(anchorIdx, starts.get(starts.size() - 1))); continue; }
+
+            if (forcedIdx.containsKey(i)) {
+                int idx = Math.max(forcedIdx.get(i), starts.get(starts.size() - 1));
+                starts.add(idx);
+                anchorIdx = idx;
+                anchorRouteM = key[i];
+                anchorCalibrated = false;   // seam anchor: its synthetic distance sits elsewhere
+                continue;
+            }
+
+            double tLat = pts.getLat(0), tLon = pts.getLon(0);
+            double cumThis = key[i];
+            boolean haveKey = !Double.isNaN(cumThis) && !Double.isNaN(anchorRouteM);
+            double expectedCum = haveKey ? polyCum[anchorIdx] + (cumThis - anchorRouteM) : Double.NaN;
+
+            int exactCount = 0, firstExact = -1, distBest = -1;
+            double distBestErr = Double.MAX_VALUE;
+            int closestIdx = anchorIdx; double closestCoord = Double.MAX_VALUE;
+            for (int pi = anchorIdx; pi < n; pi++) {
+                double cd = Math.abs(poly.getLat(pi) - tLat) + Math.abs(poly.getLon(pi) - tLon);
+                if (cd < closestCoord) { closestCoord = cd; closestIdx = pi; }
+                if (cd < 5e-6) {
+                    exactCount++;
+                    if (firstExact < 0) firstExact = pi;
+                    double cumErr = haveKey ? Math.abs(polyCum[pi] - expectedCum) : 0.0;
+                    if (cumErr < distBestErr) { distBestErr = cumErr; distBest = pi; }
+                    if (!haveKey) break;
+                }
+            }
+            boolean crossesSeam = false;
+            if (seamPolyIdx != null && distBest >= 0) {
+                for (int sp : seamPolyIdx) if (sp > anchorIdx && sp <= distBest) { crossesSeam = true; break; }
+            }
+            int idx; boolean confident;
+            if (exactCount >= 1 && (!haveKey || !anchorCalibrated || crossesSeam || distBestErr <= band)) {
+                idx = haveKey ? distBest : firstExact; confident = true;
+            } else if (exactCount >= 1) {
+                idx = nearestCum(polyCum, expectedCum, anchorIdx); confident = false;
+            } else {
+                idx = haveKey ? nearestCum(polyCum, expectedCum, anchorIdx) : closestIdx; confident = false;
+            }
+            int prev = starts.get(starts.size() - 1);
+            if (idx < prev) idx = prev;
+            starts.add(idx);
+            if (confident) {
+                anchorIdx = idx;
+                anchorRouteM = cumThis;
+                Map<String, Object> ex = ins.getExtraInfoJSON();
+                anchorCalibrated = !seamInstr.contains(i)
+                        && !Boolean.TRUE.equals(ex.get("tbt_resumed"))
+                        && !Boolean.FALSE.equals(ex.get("tbt_available"));
+            }
+        }
+        return starts;
+    }
+
+    private static int nearestCum(double[] polyCum, double target, int floor) {
+        int n = polyCum.length;
+        if (Double.isNaN(target)) return Math.min(Math.max(floor, 0), n - 1);
+        int best = Math.min(Math.max(floor, 0), n - 1); double bestErr = Double.MAX_VALUE;
+        for (int pi = Math.max(0, floor); pi < n; pi++) {
+            double err = Math.abs(polyCum[pi] - target);
+            if (err < bestErr) { bestErr = err; best = pi; }
+            if (polyCum[pi] >= target) break;
+        }
+        return best;
+    }
+
+    private static double num(Object o) {
+        return (o instanceof Number) ? ((Number) o).doubleValue() : Double.NaN;
+    }
+
+    private static String fmt(double d) {
+        return Double.isNaN(d) ? "-" : String.format(Locale.ROOT, "%.1f", d);
+    }
+
+    static final String UTURN_17KM_JSON = """
+{"waypoints":[{"id":"IDsvE_e5a49nOD2oZARvK","coordinates":{"lat":61.10753,"lng":24.866849}},{"id":"26TBRAo6RFWZbXsVmY3Di","coordinates":{"lat":61.108035,"lng":24.898023}},{"id":"lpaJBDm45dotVHCwBk2Xr","coordinates":{"lat":61.166207,"lng":24.952685}},{"id":"afp_7W4NM493HGtagIS0U","coordinates":{"lat":61.155095,"lng":24.883042}},{"id":"deSrY1O8zEo2_K73Ao76t","coordinates":{"lat":61.140735,"lng":24.94986}},{"id":"Xy1SvaMNXLOn9hKELakDH","coordinates":{"lat":61.122255,"lng":24.924548}},{"id":"bhtGcqfYP6aufvGbR2_7p","coordinates":{"lat":61.098961,"lng":24.939862}},{"id":"e3gnSlLY_6g8TVd4Je91q","coordinates":{"lat":61.105744,"lng":24.942011}},{"id":"rgxwTY30ywBjgxKrzgPF0","coordinates":{"lat":61.126849,"lng":24.896119}},{"id":"4mWLmSfPkpskv9Pp4fgCn","coordinates":{"lat":61.133833,"lng":24.89497}},{"id":"FYnP-qhNEJuRaTadt7nhN","coordinates":{"lat":61.144225,"lng":24.879415}},{"id":"lig37LqYyNFN1fX5fH5N2","coordinates":{"lat":61.144105,"lng":24.879325}},{"id":"z0rICtB3v9YoRhpNWtGZC","coordinates":{"lat":61.141188,"lng":24.867651}},{"id":"4gRlv6VhONU_WOoekSo5r","coordinates":{"lat":61.104671,"lng":24.868476}}],"segments":[{"start":"IDsvE_e5a49nOD2oZARvK","end":"26TBRAo6RFWZbXsVmY3Di","type":"followRoads","profile":"gravel"},{"start":"26TBRAo6RFWZbXsVmY3Di","end":"lpaJBDm45dotVHCwBk2Xr","type":"followRoads","profile":"gravel","initial_heading":163.0007631367679,"heading_penalty":60},{"start":"lpaJBDm45dotVHCwBk2Xr","end":"afp_7W4NM493HGtagIS0U","type":"followRoads","profile":"gravel","initial_heading":1.8735719900777918,"heading_penalty":60},{"start":"afp_7W4NM493HGtagIS0U","end":"deSrY1O8zEo2_K73Ao76t","type":"followRoads","profile":"gravel","initial_heading":348.8969197669635,"heading_penalty":60},{"start":"deSrY1O8zEo2_K73Ao76t","end":"Xy1SvaMNXLOn9hKELakDH","type":"followRoads","profile":"gravel"},{"start":"Xy1SvaMNXLOn9hKELakDH","end":"bhtGcqfYP6aufvGbR2_7p","type":"followRoads","profile":"gravel","initial_heading":150.31862203977857,"heading_penalty":60},{"start":"bhtGcqfYP6aufvGbR2_7p","end":"e3gnSlLY_6g8TVd4Je91q","type":"followRoads","profile":"gravel","initial_heading":90.84054599073579,"heading_penalty":60},{"start":"e3gnSlLY_6g8TVd4Je91q","end":"rgxwTY30ywBjgxKrzgPF0","type":"followRoads","profile":"gravel","initial_heading":217.0420258188106,"heading_penalty":60},{"start":"rgxwTY30ywBjgxKrzgPF0","end":"4mWLmSfPkpskv9Pp4fgCn","type":"followRoads","profile":"gravel","initial_heading":86.49377010298201,"heading_penalty":60},{"start":"4mWLmSfPkpskv9Pp4fgCn","end":"FYnP-qhNEJuRaTadt7nhN","type":"followRoads","profile":"gravel","initial_heading":63.85614626733025,"heading_penalty":60},{"start":"FYnP-qhNEJuRaTadt7nhN","end":"lig37LqYyNFN1fX5fH5N2","type":"followRoads","profile":"gravel","initial_heading":19.87017633513695,"heading_penalty":60},{"start":"lig37LqYyNFN1fX5fH5N2","end":"z0rICtB3v9YoRhpNWtGZC","type":"followRoads","profile":"gravel","initial_heading":199.87059725343636,"heading_penalty":60},{"start":"z0rICtB3v9YoRhpNWtGZC","end":"4gRlv6VhONU_WOoekSo5r","type":"followRoads","profile":"gravel","initial_heading":235.64553544777564,"heading_penalty":60}],"instruction_profile":"gravel","locale":"fi","snap_preventions":["ferry"]}
+""";
 }

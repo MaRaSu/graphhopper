@@ -3623,6 +3623,69 @@ public class InstructionValidationTest {
                 "without the distance key, falls back to legacy first-occurrence behavior");
     }
 
+    /**
+     * The {@code MATCH_SANITY_M} veto compares an instruction's synthetic route distance against the
+     * polyline. That comparison is only meaningful between two CALIBRATED positions. A boundary
+     * U-turn is seam-anchored: it sits at the turnaround point on the polyline while its synthetic
+     * distance sits at the far end of the shared boundary edge — a gap as large as that edge
+     * (1204.9 m on the Hämeenlinna route). Vetoing its correct, unique coordinate match on that
+     * basis is a false positive.
+     * <p>
+     * Geometry-only regression for the two matcher rules that fix it (no graph needed):
+     * a seam-anchored target is exempt from the veto, and a recovered placement clears anchor
+     * calibration so one bad match cannot cascade into every instruction after it.
+     */
+    @Test
+    void seamAnchoredUturn_exemptFromSanityBand_andRecoveryDoesNotCascade() {
+        Assumptions.assumeTrue(hopper != null, "translation needed");
+        Translation tr = hopper.getTranslationMap().getWithFallBack(Locale.ENGLISH);
+
+        // A straight north line: 0 / ~100 / ~200 / ~800 / ~1000 m.
+        PointList poly = new PointList(5, false);
+        poly.add(61.0000, 24.0); poly.add(61.0009, 24.0); poly.add(61.0018, 24.0);
+        poly.add(61.0072, 24.0); poly.add(61.0090, 24.0);
+        double[] pc = new double[5];
+        for (int k = 1; k < 5; k++)
+            pc[k] = pc[k - 1] + DistanceCalcEarth.DIST_EARTH.calcDist(
+                    poly.getLat(k - 1), poly.getLon(k - 1), poly.getLat(k), poly.getLon(k));
+
+        // Case 1: seam-anchored U-turn whose distance key is a full boundary edge off (5 km) must
+        // still be placed at its own coordinate, not distance-recovered to the end of the route.
+        InstructionList seam = new InstructionList(tr);
+        seam.add(cum(new Instruction(Instruction.CONTINUE_ON_STREET, "start", ptAt(poly, 0)), 0));
+        seam.add(cum(new Instruction(Instruction.TURN_LEFT, "calibrating-turn", ptAt(poly, 1)), pc[1]));
+        Instruction uturn = cum(new Instruction(Instruction.U_TURN_UNKNOWN, "", ptAt(poly, 2)), pc[2] + 5000);
+        uturn.setExtraInfo(RouteInstructionGenerator.SEAM_ANCHORED, true);
+        seam.add(uturn);
+        seam.add(new Instruction(Instruction.FINISH, "", ptAt(poly, 4)));
+        assertEquals(2, RouteInstructionGenerator.matchInstructionStarts(seam, poly).get(2),
+                "a seam-anchored boundary U-turn must take its coordinate match; the sanity band "
+                        + "cannot judge it, because its synthetic distance sits at the far end of the "
+                        + "shared boundary edge");
+
+        // Case 2: an ordinary instruction whose key is 350 m off (> the 300 m band) is recovered —
+        // that is the band working. The instruction AFTER it, carrying the same 350 m of inherited
+        // key error, must still land on its own turn vertex (index 3) rather than being vetoed too
+        // and recovered to index 4. This is what contains the damage to a single instruction.
+        InstructionList cascade = new InstructionList(tr);
+        cascade.add(cum(new Instruction(Instruction.CONTINUE_ON_STREET, "start", ptAt(poly, 0)), 0));
+        cascade.add(cum(new Instruction(Instruction.TURN_LEFT, "calibrating-turn", ptAt(poly, 1)), pc[1]));
+        cascade.add(cum(new Instruction(Instruction.TURN_RIGHT, "key-off-by-350", ptAt(poly, 2)), pc[2] + 350));
+        cascade.add(cum(new Instruction(Instruction.TURN_LEFT, "must-not-cascade", ptAt(poly, 3)), pc[3] + 350));
+        cascade.add(new Instruction(Instruction.FINISH, "", ptAt(poly, 4)));
+        List<Integer> starts = RouteInstructionGenerator.matchInstructionStarts(cascade, poly);
+        assertEquals(3, starts.get(3),
+                "a recovered placement must not leave the anchor calibrated: the next instruction "
+                        + "inherits the same key error and would be vetoed too, cascading down the "
+                        + "whole route (37 instructions / 3.5 km observed). starts=" + starts);
+    }
+
+    private static PointList ptAt(PointList src, int idx) {
+        PointList p = new PointList(1, false);
+        p.add(src.getLat(idx), src.getLon(idx));
+        return p;
+    }
+
     private static Instruction cum(Instruction instr, double cumRouteM) {
         instr.setExtraInfo("_cum_route_m", cumRouteM);
         return instr;

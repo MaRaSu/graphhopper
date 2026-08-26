@@ -168,8 +168,8 @@ class InstructionPlacementOracle {
             RouteInstructionGenerator.PLACEMENT_TRACE_LOG.clear();
         }
         postProcessor.process(result.instructions, request.getInstructionProfile());
-        List<Integer> intervalStarts =
-                RouteInstructionGenerator.matchInstructionStarts(result.instructions, result.polyline);
+        List<Integer> intervalStarts = RouteInstructionGenerator.matchInstructionStarts(
+                result.instructions, result.polyline, result.seamIndices);
         return validate(graph, records, result.instructions, result.polyline, intervalStarts);
     }
 
