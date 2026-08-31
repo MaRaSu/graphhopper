@@ -16,6 +16,7 @@
  * - UNKNOWN_PATH: highway=path without mtb:scale and no good indicators
  * - UNKNOWN_TRACK: highway=track without mtb:scale/name and no good indicators
  * - FERRY: route=ferry
+ * - DRIVEWAY: highway=service + service=driveway
  */
 package com.graphhopper.trailmap.shared;
 
@@ -45,6 +46,7 @@ public class RouteIssuesParser implements TagParser {
     private final BooleanEncodedValue unknownPathEnc;
     private final BooleanEncodedValue unknownTrackEnc;
     private final BooleanEncodedValue ferryEnc;
+    private final BooleanEncodedValue drivewayEnc;
 
     // Good surfaces that indicate a path/track is likely safe
     private static final Set<String> GOOD_SURFACES = new HashSet<>(
@@ -81,7 +83,8 @@ public class RouteIssuesParser implements TagParser {
             BooleanEncodedValue mudEnc,
             BooleanEncodedValue unknownPathEnc,
             BooleanEncodedValue unknownTrackEnc,
-            BooleanEncodedValue ferryEnc) {
+            BooleanEncodedValue ferryEnc,
+            BooleanEncodedValue drivewayEnc) {
         this.bikingBlockedEnc = bikingBlockedEnc;
         this.bikingBlockedRiskEnc = bikingBlockedRiskEnc;
         this.footBlockedEnc = footBlockedEnc;
@@ -92,6 +95,7 @@ public class RouteIssuesParser implements TagParser {
         this.unknownPathEnc = unknownPathEnc;
         this.unknownTrackEnc = unknownTrackEnc;
         this.ferryEnc = ferryEnc;
+        this.drivewayEnc = drivewayEnc;
     }
 
     @Override
@@ -108,6 +112,7 @@ public class RouteIssuesParser implements TagParser {
         unknownPathEnc.setBool(false, edgeId, edgeIntAccess, checkUnknownPath(way));
         unknownTrackEnc.setBool(false, edgeId, edgeIntAccess, checkUnknownTrack(way));
         ferryEnc.setBool(false, edgeId, edgeIntAccess, checkFerry(way));
+        drivewayEnc.setBool(false, edgeId, edgeIntAccess, checkDriveway(way));
     }
 
     // =========================================================================
@@ -329,6 +334,18 @@ public class RouteIssuesParser implements TagParser {
     // =========================================================================
     private boolean checkFerry(ReaderWay way) {
         return "ferry".equals(way.getTag("route"));
+    }
+
+    // =========================================================================
+    // DRIVEWAY
+    // =========================================================================
+
+    /**
+     * Delegates to the shared definition so this flag and the SERVICE_DRIVEWAY routing
+     * category always describe the same set of ways.
+     */
+    private boolean checkDriveway(ReaderWay way) {
+        return PredictedHighwayParser.isDriveway(way);
     }
 
     // =========================================================================

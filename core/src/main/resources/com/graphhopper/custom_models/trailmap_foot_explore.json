@@ -13,6 +13,7 @@
     { "if": "predicted_highway == ROUGH_TRACK", "multiply_by": "0.9" },
     { "if": "predicted_highway == MINOR_ROAD", "multiply_by": "0.5" },
     { "if": "predicted_highway == SERVICE_ROAD", "multiply_by": "0.5" },
+    { "if": "predicted_highway == SERVICE_DRIVEWAY", "multiply_by": "0.3" },
     { "if": "predicted_highway == MAJOR_ROAD", "multiply_by": "0.2" },
     { "if": "predicted_highway == MOTORWAY", "multiply_by": "0" },
 

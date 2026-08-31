@@ -17,6 +17,7 @@ import com.graphhopper.routing.util.OSMParsers;
 import com.graphhopper.trailmap.areas.AreaAccessParser;
 import com.graphhopper.trailmap.areas.AreaRoutingRules;
 import com.graphhopper.trailmap.areas.TrailmapAreaWayFilter;
+import com.graphhopper.trailmap.shared.TrailmapPathDetailsBuilderFactory;
 import com.graphhopper.util.PMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +33,7 @@ import java.util.Map;
  * <p>
  * Use this class instead of GraphHopper to enable:
  * - Area routing through parking lots, pedestrian plazas, parks, etc.
+ * - Trailmap path details (predicted_highway projected to its client-facing value)
  * <p>
  * Configuration:
  * <pre>
@@ -44,6 +46,12 @@ public class TrailmapGraphHopper extends GraphHopper {
 
     private TrailmapAreaWayFilter areaWayFilter;
     private AreaRoutingRules areaRoutingRules;
+
+    public TrailmapGraphHopper() {
+        // predicted_highway must cross the wire as its coarse, client-facing value; the
+        // stock factory would emit internal-only refinements (e.g. SERVICE_DRIVEWAY).
+        setPathDetailsBuilderFactory(new TrailmapPathDetailsBuilderFactory());
+    }
 
     @Override
     protected AreaWayFilter createAreaWayFilter(OSMReaderConfig config) {

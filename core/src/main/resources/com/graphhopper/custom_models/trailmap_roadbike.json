@@ -21,6 +21,7 @@
     { "if": "road_class == TRUNK", "multiply_by": "0.85" },
     { "if": "road_class == STEPS", "multiply_by": "0.2" },
     { "if": "predicted_highway == SERVICE_ROAD", "multiply_by": "0.8" },
+    { "if": "predicted_highway == SERVICE_DRIVEWAY", "multiply_by": "0.4" },
 
     { "if": "predicted_highway == GOOD_TRACK", "multiply_by": "0.3" },
     { "if": "predicted_highway == ROUGH_TRACK", "multiply_by": "0.1" },

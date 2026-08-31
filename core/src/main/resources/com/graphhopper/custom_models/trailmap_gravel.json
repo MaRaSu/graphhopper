@@ -30,6 +30,7 @@
 
     { "if": "predicted_highway == OUTDOOR_WAY", "multiply_by": "1.1" },
     { "if": "predicted_highway == MAJOR_ROAD", "multiply_by": "0.65" },
+    { "if": "predicted_highway == SERVICE_DRIVEWAY", "multiply_by": "0.35" },
     { "if": "road_class == TRUNK", "multiply_by": "0.85" },
     { "if": "road_class == STEPS", "multiply_by": "0.2" }
   ],

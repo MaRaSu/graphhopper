@@ -143,6 +143,29 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     }
 
     /**
+     * The ONLY way this class reads predicted_highway off an edge — always the external
+     * (coarse) value.
+     * <p>
+     * Instruction generation reasons about road types at the coarse level throughout: it
+     * asks "did the type change?", "is the alternative a different type?", "which type is
+     * more prominent?". Internal-only refinements (e.g. SERVICE_DRIVEWAY, which exists so
+     * custom models can weight driveways) must not answer those questions differently
+     * than their coarse parent, or a driveway turn-off starts producing instructions that
+     * a service-road turn-off does not.
+     * <p>
+     * Projecting here rather than at each comparison means no call site can reintroduce
+     * the distinction by accident. The classification helpers below still project
+     * defensively; {@code toExternal()} is idempotent, so that costs nothing.
+     *
+     * @return null if the graph has no predicted_highway or {@code edge} is null
+     */
+    private PredictedHighway phOf(EdgeIteratorState edge) {
+        if (predictedHighwayEnc == null || edge == null)
+            return null;
+        return edge.get(predictedHighwayEnc).toExternal();
+    }
+
+    /**
      * Generate instructions for the given path. Drop-in replacement for
      * {@link com.graphhopper.routing.InstructionsFromEdges#calcInstructions}.
      */
@@ -192,7 +215,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         final RoadEnvironment roadEnv = edge.get(roadEnvEnc);
 
         // Read Trailmap properties for this edge
-        PredictedHighway currentPH = predictedHighwayEnc != null ? edge.get(predictedHighwayEnc) : null;
+        PredictedHighway currentPH = phOf(edge);
         PredictedSurface currentPS = predictedSurfaceEnc != null ? edge.get(predictedSurfaceEnc) : null;
         RouteNetwork currentBN = bikeNetworkEnc != null ? edge.get(bikeNetworkEnc) : null;
 
@@ -482,7 +505,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         // Read Trailmap edge properties
         RoadClass currentRC = edge.get(roadClassEnc);
         RoadClass prevRC = prevEdge.get(roadClassEnc);
-        PredictedHighway currentPH = predictedHighwayEnc != null ? edge.get(predictedHighwayEnc) : null;
+        PredictedHighway currentPH = phOf(edge);
         // prevPredictedHighway is the state field, updated at end of next()
         PredictedHighway prevPH = prevPredictedHighway;
         PredictedSurface currentSurface = predictedSurfaceEnc != null ? edge.get(predictedSurfaceEnc) : null;
@@ -755,8 +778,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                         && (otherRoadClass != prevRC || otherLink != prevLink)) {
                     // On trails, only suppress if the alternative is visibly different type
                     if (currentPH != null) {
-                        PredictedHighway otherPH = predictedHighwayEnc != null
-                                ? otherContinue.get(predictedHighwayEnc) : null;
+                        PredictedHighway otherPH = phOf(otherContinue);
                         if (otherPH != null && otherPH != currentPH) {
                             return Instruction.IGNORE;
                         }
@@ -786,8 +808,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                 // (e.g., cycleway → path), the rider needs guidance even if geometry is straight.
                 if (Math.abs(delta) < .1 && Math.abs(otherDelta) > .15
                         && currentPH != null && currentPH == prevPH) {
-                    PredictedHighway otherPH = predictedHighwayEnc != null
-                            ? otherContinue.get(predictedHighwayEnc) : null;
+                    PredictedHighway otherPH = phOf(otherContinue);
                     boolean phDistinguishable = currentPH != null && otherPH != null && otherPH != currentPH;
                     boolean surfaceDistinguishable = false;
                     if (predictedSurfaceEnc != null) {
@@ -899,7 +920,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         if (predictedHighwayEnc == null || currentPH == null) return false;
         PredictedSurface currentSurface = predictedSurfaceEnc != null ? routeEdge.get(predictedSurfaceEnc) : null;
         for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
-            PredictedHighway altPH = alt.get(predictedHighwayEnc);
+            PredictedHighway altPH = phOf(alt);
             if (isConfusableFrom(currentPH, altPH)) return false;
             if (predictedSurfaceEnc != null) {
                 PredictedSurface altSurface = alt.get(predictedSurfaceEnc);
@@ -942,7 +963,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         double routeDeviation = Math.abs(routeDelta);
 
         for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
-            PredictedHighway altPH = alt.get(predictedHighwayEnc);
+            PredictedHighway altPH = phOf(alt);
 
             // Type proximity: alternative must also be non-road-infrastructure
             if (altPH == null || isRoadInfrastructure(altPH)) continue;
@@ -1012,7 +1033,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             if (iter.getEdge() == routeEdge.getEdge()) continue;
             if (prevEdge != null && iter.getEdge() == prevEdge.getEdge()) continue;
 
-            if (iter.get(predictedHighwayEnc) != PredictedHighway.FOOTWAY) continue;
+            if (phOf(iter) != PredictedHighway.FOOTWAY) continue;
 
             if (predictedSurfaceEnc != null) {
                 PredictedSurface altSurface = iter.get(predictedSurfaceEnc);
@@ -1042,7 +1063,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         int currentProm = phProminence(currentPH);
         if (currentProm <= 1) return false; // can't be lower than the bottom
         for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
-            if (phProminence(alt.get(predictedHighwayEnc)) >= currentProm) return false;
+            if (phProminence(phOf(alt)) >= currentProm) return false;
         }
         return true;
     }
@@ -1063,7 +1084,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                 ? routeEdge.get(predictedSurfaceEnc) : null;
 
         for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
-            PredictedHighway altPH = alt.get(predictedHighwayEnc);
+            PredictedHighway altPH = phOf(alt);
 
             // Gate 1: asymmetric type confusability
             if (!isConfusableFrom(currentPH, altPH)) continue;
@@ -1120,7 +1141,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
         final double STRAIGHTER_THRESHOLD = 0.35; // ~20°
         for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
             // (a) PH bucket — alt must be confusable per layer-2 table
-            PredictedHighway altPH = alt.get(predictedHighwayEnc);
+            PredictedHighway altPH = phOf(alt);
             if (!isConfusableFrom(currentPH, altPH)) continue;
 
             // (b) surface — must not clearly differ
@@ -1197,7 +1218,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
 
         for (EdgeIteratorState alt : outgoing.getAllowedAlternativeTurns()) {
             // (a) PH bucket
-            PredictedHighway altPH = alt.get(predictedHighwayEnc);
+            PredictedHighway altPH = phOf(alt);
             if (!isConfusableFrom(currentPH, altPH)) continue;
 
             // (b) surface
@@ -2144,8 +2165,8 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
      */
     private boolean bothNonRoadAtJunction(EdgeIteratorState routeEdge) {
         if (predictedHighwayEnc == null || prevEdge == null) return true;
-        PredictedHighway prevPH = prevEdge.get(predictedHighwayEnc);
-        PredictedHighway currentPH = routeEdge.get(predictedHighwayEnc);
+        PredictedHighway prevPH = phOf(prevEdge);
+        PredictedHighway currentPH = phOf(routeEdge);
         if (prevPH == null || currentPH == null) return true;
         return !isReframerHardRoad(prevPH) && !isReframerHardRoad(currentPH);
     }
@@ -2158,8 +2179,8 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     private boolean isTypeChangeAtJunction(EdgeIteratorState routeEdge) {
         if (prevEdge == null) return false;
         if (predictedHighwayEnc != null) {
-            PredictedHighway prevPH = prevEdge.get(predictedHighwayEnc);
-            PredictedHighway currentPH = routeEdge.get(predictedHighwayEnc);
+            PredictedHighway prevPH = phOf(prevEdge);
+            PredictedHighway currentPH = phOf(routeEdge);
             if (prevPH != null && currentPH != null && prevPH != currentPH) return true;
         }
         if (predictedSurfaceEnc != null) {
@@ -2184,8 +2205,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
     private List<Double> collectVisualAltDeltas(int baseNode, EdgeIteratorState routeEdge,
                                                  PredictedSurface routeSurface) {
         List<Double> deltas = new ArrayList<>();
-        PredictedHighway routePH = predictedHighwayEnc != null
-                ? routeEdge.get(predictedHighwayEnc) : null;
+        PredictedHighway routePH = phOf(routeEdge);
         PredictedSurface prevSurface = (prevEdge != null && predictedSurfaceEnc != null)
                 ? prevEdge.get(predictedSurfaceEnc) : null;
         EdgeIterator iter = allExplorer.setBaseNode(baseNode);
@@ -2223,7 +2243,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             if (absAlt > REFRAMER_FORWARD_CONE) {
                 if (absAlt > REFRAMER_VISUAL_SIMILAR_CONE) continue;
                 if (predictedHighwayEnc == null || routePH == null) continue;
-                PredictedHighway altPH = iter.get(predictedHighwayEnc);
+                PredictedHighway altPH = phOf(iter);
                 if (altPH == null || !isConfusableFrom(routePH, altPH)) continue;
             }
 
@@ -2256,8 +2276,8 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
                                                     PredictedSurface routeSurface) {
         List<Double> deltas = new ArrayList<>();
         if (predictedHighwayEnc == null) return deltas;
-        PredictedHighway routePH = routeEdge.get(predictedHighwayEnc);
-        PredictedHighway prevPH = prevEdge != null ? prevEdge.get(predictedHighwayEnc) : null;
+        PredictedHighway routePH = phOf(routeEdge);
+        PredictedHighway prevPH = phOf(prevEdge);
         PredictedSurface prevSurface = (prevEdge != null && predictedSurfaceEnc != null)
                 ? prevEdge.get(predictedSurfaceEnc) : null;
         EdgeIterator iter = allExplorer.setBaseNode(baseNode);
@@ -2266,7 +2286,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             if (prevEdge != null && iter.getEdge() == prevEdge.getEdge()) continue;
 
             // PH-confusable against either anchor (route or incoming).
-            PredictedHighway altPH = iter.get(predictedHighwayEnc);
+            PredictedHighway altPH = phOf(iter);
             boolean phConfusable = (routePH != null && isConfusableFrom(routePH, altPH))
                     || (prevPH != null && isConfusableFrom(prevPH, altPH));
             if (!phConfusable) continue;
@@ -2310,15 +2330,13 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             instruction.setExtraInfo("road_class_changed", roadClass != prevRoadClass);
         }
 
-        // PredictedHighway. Emit the external (coarse) value: this string is both the
-        // client-facing wire value and the channel InstructionPostProcessor reads, neither
-        // of which distinguishes internal-only refinements (e.g. SERVICE_DRIVEWAY).
+        // PredictedHighway. phOf() already yields the external (coarse) value: this string
+        // is both the client-facing wire value and the channel InstructionPostProcessor
+        // reads, neither of which distinguishes internal-only refinements.
         if (predictedHighwayEnc != null) {
-            PredictedHighway ph = edge.get(predictedHighwayEnc);
-            instruction.setExtraInfo("predicted_highway", ph.toExternal().name());
+            instruction.setExtraInfo("predicted_highway", phOf(edge).name());
             if (prevEdge != null) {
-                PredictedHighway prevPh = prevEdge.get(predictedHighwayEnc);
-                instruction.setExtraInfo("prev_predicted_highway", prevPh.toExternal().name());
+                instruction.setExtraInfo("prev_predicted_highway", phOf(prevEdge).name());
             }
         }
 
@@ -2362,13 +2380,13 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             instruction.setExtraInfo("junction_alternatives", alts.size());
 
             if (!alts.isEmpty() && predictedHighwayEnc != null) {
-                PredictedHighway currentPH = edge.get(predictedHighwayEnc);
+                PredictedHighway currentPH = phOf(edge);
                 StringBuilder altPHs = new StringBuilder();
                 boolean hasHigherRoad = false;
                 for (int i = 0; i < alts.size(); i++) {
-                    PredictedHighway altPH = alts.get(i).get(predictedHighwayEnc);
+                    PredictedHighway altPH = phOf(alts.get(i));
                     if (i > 0) altPHs.append(",");
-                    altPHs.append(altPH.toExternal().name());   // coarse value over the wire
+                    altPHs.append(altPH.name());   // already the coarse value
                     if (phProminence(altPH) > phProminence(currentPH)) {
                         hasHigherRoad = true;
                     }
@@ -2383,7 +2401,7 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             // Pass 2 C1 (preserve from continuity suppression) and the client app
             // (treat as meaningful fork, not a generic CONTINUE that may be suppressed).
             if (predictedHighwayEnc != null) {
-                PredictedHighway phForFork = edge.get(predictedHighwayEnc);
+                PredictedHighway phForFork = phOf(edge);
                 String nameForFork = instruction.getName();
                 if (phForFork != null
                         && !isRoadInfrastructure(phForFork)
@@ -2397,10 +2415,10 @@ public class TrailmapInstructionsFromEdges implements Path.EdgeVisitor {
             // True when an alternative has the same PredictedHighway as the previous edge
             // AND goes roughly straight (|sign| <= 1). Used by Stage 2 M1 join-side-path.
             if (prevEdge != null && predictedHighwayEnc != null) {
-                PredictedHighway prevPH = prevEdge.get(predictedHighwayEnc);
+                PredictedHighway prevPH = phOf(prevEdge);
                 boolean sourceRoadContinues = false;
                 for (EdgeIteratorState alt : alts) {
-                    if (alt.get(predictedHighwayEnc) == prevPH) {
+                    if (phOf(alt) == prevPH) {
                         GHPoint altPoint = InstructionsHelper.getPointForOrientationCalculation(alt, nodeAccess);
                         int altSign = InstructionsHelper.calculateSign(prevLat, prevLon,
                                 altPoint.getLat(), altPoint.getLon(), prevOrientation);

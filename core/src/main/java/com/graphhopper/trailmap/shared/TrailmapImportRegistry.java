@@ -159,7 +159,8 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
                     lookup.getBooleanEncodedValue(RouteIssues.KEY_MUD),
                     lookup.getBooleanEncodedValue(RouteIssues.KEY_UNKNOWN_PATH),
                     lookup.getBooleanEncodedValue(RouteIssues.KEY_UNKNOWN_TRACK),
-                    lookup.getBooleanEncodedValue(RouteIssues.KEY_FERRY)),
+                    lookup.getBooleanEncodedValue(RouteIssues.KEY_FERRY),
+                    lookup.getBooleanEncodedValue(RouteIssues.KEY_DRIVEWAY)),
                 // Declare dependencies so ImportUnitSorter processes these first
                 RouteIssues.KEY_BIKING_BLOCKED_RISK,
                 RouteIssues.KEY_FOOT_BLOCKED,
@@ -169,7 +170,8 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
                 RouteIssues.KEY_MUD,
                 RouteIssues.KEY_UNKNOWN_PATH,
                 RouteIssues.KEY_UNKNOWN_TRACK,
-                RouteIssues.KEY_FERRY
+                RouteIssues.KEY_FERRY,
+                RouteIssues.KEY_DRIVEWAY
             );
         }
 
@@ -232,6 +234,13 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
         if (RouteIssues.KEY_FERRY.equals(name)) {
             return ImportUnit.create(name,
                 props -> RouteIssues.createFerry(),
+                null
+            );
+        }
+
+        if (RouteIssues.KEY_DRIVEWAY.equals(name)) {
+            return ImportUnit.create(name,
+                props -> RouteIssues.createDriveway(),
                 null
             );
         }

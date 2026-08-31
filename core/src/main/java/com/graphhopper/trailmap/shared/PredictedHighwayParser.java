@@ -35,6 +35,21 @@ public class PredictedHighwayParser implements TagParser {
     }
 
     /**
+     * Single definition of "this way is a driveway": {@code highway=service} +
+     * {@code service=driveway}. Other service values (parking_aisle, alley,
+     * drive-through, ...) are not driveways.
+     *
+     * <p>Shared so the routing category (SERVICE_DRIVEWAY, RULE 6 below) and the
+     * client-facing issue flag ({@code issue_driveway}, set by RouteIssuesParser) can
+     * never drift apart — the two run as independent tag parsers and are never
+     * compared at runtime.</p>
+     */
+    public static boolean isDriveway(ReaderWay way) {
+        return "service".equals(way.getTag("highway"))
+                && "driveway".equals(way.getTag("service"));
+    }
+
+    /**
      * Compute PredictedHighway from OSM tags.
      * Full port of predictedHighwayRules from route-profile-rules.ts
      */
@@ -78,9 +93,16 @@ public class PredictedHighwayParser implements TagParser {
         }
 
         // =================================================================
-        // RULE 6: Service roads -> SERVICE_ROAD
+        // RULE 6: Service roads -> SERVICE_ROAD, driveways split out as an
+        // internal-only refinement (highway=service + service=driveway).
+        // SERVICE_DRIVEWAY lets routing profiles weight driveways separately; it
+        // projects back to SERVICE_ROAD for clients and TbT classification via
+        // PredictedHighway.toExternal().
         // =================================================================
         if ("service".equals(highway)) {
+            if (isDriveway(way)) {
+                return PredictedHighway.SERVICE_DRIVEWAY;
+            }
             return PredictedHighway.SERVICE_ROAD;
         }
 

@@ -29,6 +29,7 @@ public class RouteIssues {
     public static final String KEY_UNKNOWN_PATH = "issue_unknown_path";
     public static final String KEY_UNKNOWN_TRACK = "issue_unknown_track";
     public static final String KEY_FERRY = "issue_ferry";
+    public static final String KEY_DRIVEWAY = "issue_driveway";
 
     /**
      * Biking not permitted: bicycle=no/private or access=no/private without bicycle override.
@@ -102,6 +103,17 @@ public class RouteIssues {
     }
 
     /**
+     * Driveway: highway=service + service=driveway.
+     * <p>
+     * The client-facing counterpart of the internal-only SERVICE_DRIVEWAY routing
+     * category — in path details and TbT instructions, predicted_highway reports these
+     * ways as SERVICE_ROAD, so this flag is how a client learns it is on a driveway.
+     */
+    public static BooleanEncodedValue createDriveway() {
+        return new SimpleBooleanEncodedValue(KEY_DRIVEWAY);
+    }
+
+    /**
      * Check if a key is a route issue key.
      */
     public static boolean isRouteIssueKey(String key) {
@@ -114,6 +126,7 @@ public class RouteIssues {
                KEY_MUD.equals(key) ||
                KEY_UNKNOWN_PATH.equals(key) ||
                KEY_UNKNOWN_TRACK.equals(key) ||
-               KEY_FERRY.equals(key);
+               KEY_FERRY.equals(key) ||
+               KEY_DRIVEWAY.equals(key);
     }
 }
