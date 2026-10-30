@@ -1,0 +1,234 @@
+package com.graphhopper.resources;
+
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.graphhopper.GHRequest;
+import com.graphhopper.GHResponse;
+import com.graphhopper.GraphHopper;
+import com.graphhopper.GraphHopperConfig;
+import com.graphhopper.http.GHRequestTransformer;
+import com.graphhopper.http.ProfileResolver;
+import com.graphhopper.jackson.MultiException;
+import com.graphhopper.jackson.ResponsePathSerializer;
+import com.graphhopper.trailmap.personal.PersonalCellGrid;
+import com.graphhopper.trailmap.personal.PersonalCells;
+import com.graphhopper.trailmap.personal.PersonalFamiliarity;
+import com.graphhopper.trailmap.personal.PersonalParams;
+import com.graphhopper.trailmap.personal.PersonalRouter;
+import com.graphhopper.trailmap.personal.PersonalStore;
+import com.graphhopper.util.Helper;
+import com.graphhopper.util.PMap;
+import com.graphhopper.util.StopWatch;
+import jakarta.inject.Inject;
+import jakarta.validation.constraints.NotNull;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static com.graphhopper.util.Parameters.Routing.CALC_POINTS;
+import static com.graphhopper.util.Parameters.Routing.INSTRUCTIONS;
+
+/**
+ * Trailmap prototype: personalised A→B routing ({@code POST /personal_route}), separate from
+ * {@code /route}, which it does not change. Same request and response as {@code POST /route}, plus
+ * {@code personal_*} fields (see {@link PersonalParams}). The user's cells come from
+ * {@code <personal_routing.cells_dir>/<personal_user>/<personal_cells>.csv}.
+ *
+ * <p>{@code algorithm=bit_of_new} adds "bit of new" variations of the route as further paths (see
+ * {@link TrailmapBitOfNew}); without it nothing changes.
+ *
+ * <p>{@code GET /personal_route/cells} returns a user's cells in a bounding box, for the previewer.
+ *
+ * <p>Config ({@code graphhopper:} section): {@code personal_routing.cells_dir} (required to enable; without it every
+ * endpoint here answers 404, which is how production keeps it off),
+ * {@code personal_routing.cache_minutes} (30), {@code personal_routing.max_users} (8).
+ */
+@Path("personal_route")
+public class TrailmapPersonalRouteResource {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(TrailmapPersonalRouteResource.class);
+    private static final int MAX_CELLS_RESPONSE = 80_000;
+
+    /** One store per GraphHopper instance; resources are created per request. */
+    private static volatile PersonalStore store;
+    private static volatile GraphHopper storeOwner;
+
+    private final GraphHopperConfig config;
+    private final GraphHopper graphHopper;
+    private final ProfileResolver profileResolver;
+    private final GHRequestTransformer ghRequestTransformer;
+    private final String osmDate;
+    private final List<String> snapPreventionsDefault;
+
+    @Inject
+    public TrailmapPersonalRouteResource(GraphHopperConfig config, GraphHopper graphHopper, ProfileResolver profileResolver,
+                                         GHRequestTransformer ghRequestTransformer) {
+        this.config = config;
+        this.graphHopper = graphHopper;
+        this.profileResolver = profileResolver;
+        this.ghRequestTransformer = ghRequestTransformer;
+        this.osmDate = graphHopper.getProperties().getAll().get("datareader.data.date");
+        // same default as RouteResource, so neutral requests snap exactly as /route does
+        this.snapPreventionsDefault = Arrays.stream(config.getString("routing.snap_preventions_default", "")
+                .split(",")).map(String::trim).filter(s -> !s.isEmpty()).toList();
+    }
+
+    /**
+     * Off switch: without {@code personal_routing.cells_dir} in the config (as in production) every endpoint of this
+     * resource answers 404, so neither neutral routing nor bit_of_new is reachable.
+     */
+    private void requireEnabled() {
+        if (Helper.isEmpty(config.getString("personal_routing.cells_dir", "")))
+            throw new NotFoundException("personal_route is not enabled on this server");
+    }
+
+    private PersonalStore store() {
+        PersonalStore s = store;
+        if (s != null && storeOwner == graphHopper) return s;
+        synchronized (TrailmapPersonalRouteResource.class) {
+            if (store == null || storeOwner != graphHopper) {
+                String dir = config.getString("personal_routing.cells_dir", "");
+                if (Helper.isEmpty(dir))
+                    throw new IllegalArgumentException("Personal routing is not enabled: set personal_routing.cells_dir in the config");
+                long ttl = config.asPMap().getLong("personal_routing.cache_minutes", 30) * 60_000L;
+                int maxUsers = config.asPMap().getInt("personal_routing.max_users", 8);
+                store = new PersonalStore(Paths.get(dir).toAbsolutePath(), graphHopper.getBaseGraph(), ttl, maxUsers);
+                storeOwner = graphHopper;
+            }
+            return store;
+        }
+    }
+
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response doPost(@NotNull GHRequest request) throws IOException {
+        requireEnabled();
+        if (!request.hasSnapPreventions())
+            request.setSnapPreventions(snapPreventionsDefault);
+        StopWatch sw = new StopWatch().start();
+        request = ghRequestTransformer.transformRequest(request);
+        PersonalParams params = PersonalParams.from(request.getHints());
+
+        PMap profileResolverHints = new PMap(request.getHints());
+        profileResolverHints.putObject("profile", request.getProfile());
+        profileResolverHints.putObject("has_curbsides", !request.getCurbsides().isEmpty());
+        request.setProfile(profileResolver.resolveProfile(profileResolverHints));
+        RouteResource.removeLegacyParameters(request.getHints());
+        // algorithm=bit_of_new: the main route is this same request routed as usual; variations follow it
+        TrailmapBitOfNew bitOfNew = TrailmapBitOfNew.take(request);
+
+        PersonalFamiliarity familiarity = null;
+        PersonalStore.Lookup lookup = null;
+        if (params.isActive()) {
+            // a user without this data set routes exactly as /route
+            lookup = store().get(params.user, params.cells);
+            if (lookup != null) familiarity = lookup.familiarity;
+        }
+        long computedBefore = familiarity == null ? 0 : familiarity.getComputedEdges();
+
+        GHResponse ghResponse = new PersonalRouter(graphHopper, familiarity, params).route(request);
+        double took = sw.stop().getMillisDouble();
+        if (ghResponse.hasErrors())
+            throw new MultiException(ghResponse.getErrors());
+        if (bitOfNew != null) {
+            sw.start();
+            PersonalFamiliarity mainFamiliarity = familiarity;
+            bitOfNew.apply(graphHopper, request, ghResponse, r -> new PersonalRouter(graphHopper, mainFamiliarity, params).route(r), cells -> {
+                PersonalStore.Lookup l = params.user.isEmpty() ? null : store().get(params.user, cells);
+                return l == null ? null : l.familiarity;
+            });
+            took = sw.stop().getMillisDouble();
+        }
+
+        Map<String, Object> info = new LinkedHashMap<>(params.toMap());
+        info.put("active", familiarity != null);
+        if (params.mode != PersonalParams.Mode.NEUTRAL && familiarity == null)
+            info.put("history", "none");
+        info.put("turn_costs", graphHopper.getProfile(request.getProfile()).hasTurnCosts());
+        if (familiarity != null) {
+            info.put("cells", familiarity.getCells().size());
+            info.put("cached", lookup.cached);
+            info.put("load_ms", lookup.loadMillis);
+            info.put("edges_measured_now", familiarity.getComputedEdges() - computedBefore);
+            info.put("edges_measured_total", familiarity.getComputedEdges());
+        }
+        ghResponse.getHints().putObject("personal", info);
+        LOGGER.info("personal_route: mode={} strength={} switch={} profile={} took={} ms measured_now={} distance={}",
+                info.get("mode"), params.strength, params.switchPenalty, request.getProfile(), Math.round(took),
+                info.getOrDefault("edges_measured_now", 0), Math.round(ghResponse.getBest().getDistance()));
+
+        boolean instructions = request.getHints().getBool(INSTRUCTIONS, true);
+        boolean enableElevation = request.getHints().getBool("elevation", false);
+        boolean calcPoints = request.getHints().getBool(CALC_POINTS, true);
+        boolean pointsEncoded = request.getHints().getBool("points_encoded", true);
+        double pointsEncodedMultiplier = request.getHints().getDouble("points_encoded_multiplier", 1e5);
+        ObjectNode json = ResponsePathSerializer.jsonObject(ghResponse,
+                new ResponsePathSerializer.Info(config.getCopyrights(), Math.round(took), osmDate),
+                instructions, calcPoints, enableElevation, pointsEncoded, pointsEncodedMultiplier);
+        if (bitOfNew != null) bitOfNew.decorate(json, ghResponse.getBest().getDistance());
+        return Response.ok(json).
+                header("X-GH-Took", "" + Math.round(took)).
+                type(MediaType.APPLICATION_JSON).
+                build();
+    }
+
+    /** The data sets the user has, for the previewer's data-set choice. */
+    @GET
+    @Path("datasets")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Map<String, Object> dataSets(@QueryParam("user") String user) throws IOException {
+        requireEnabled();
+        PMap hints = new PMap();
+        hints.putObject(PersonalParams.USER, user == null ? "" : user);
+        PersonalParams params = PersonalParams.from(hints); // validates the name
+        if (params.user.isEmpty()) throw new IllegalArgumentException("user is required");
+        return Map.of("user", params.user, "datasets", store().dataSets(params.user));
+    }
+
+    /** A user's cells inside {@code bbox=minLon,minLat,maxLon,maxLat}, as {@code [x, y, rides]} rows. */
+    @GET
+    @Path("cells")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Map<String, Object> cells(@QueryParam("user") String user, @QueryParam("cells") String cells,
+                                     @QueryParam("bbox") String bbox) throws IOException {
+        requireEnabled();
+        PMap hints = new PMap();
+        hints.putObject(PersonalParams.MODE, "explore");
+        hints.putObject(PersonalParams.USER, user == null ? "" : user);
+        hints.putObject(PersonalParams.CELLS, cells == null ? "" : cells);
+        PersonalParams params = PersonalParams.from(hints); // validates the names
+        String[] b = bbox == null ? new String[0] : bbox.split(",");
+        if (b.length != 4) throw new IllegalArgumentException("bbox must be minLon,minLat,maxLon,maxLat");
+        double minLon = Double.parseDouble(b[0]), minLat = Double.parseDouble(b[1]);
+        double maxLon = Double.parseDouble(b[2]), maxLat = Double.parseDouble(b[3]);
+
+        PersonalCells c = store().cells(params.user, params.cells);
+        PersonalCellGrid g = c.getGrid();
+        List<long[]> rows = new ArrayList<>();
+        boolean[] truncated = {false};
+        c.forEachIn(g.cellX(minLon), g.cellX(maxLon), g.cellY(maxLat), g.cellY(minLat), (id, rides) -> {
+            if (rows.size() >= MAX_CELLS_RESPONSE) {
+                truncated[0] = true;
+                return;
+            }
+            rows.add(new long[]{g.xOf(id), g.yOf(id), rides});
+        });
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("zoom", g.getZoom());
+        out.put("total_cells", c.size());
+        out.put("max_rides", c.getMaxRides());
+        out.put("truncated", truncated[0]);
+        out.put("cells", rows);
+        return out;
+    }
+}
