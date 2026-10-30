@@ -10,6 +10,7 @@ import com.graphhopper.routing.weighting.Weighting;
 import com.graphhopper.trailmap.personal.PersonalFamiliarity;
 import com.graphhopper.trailmap.personal.variations.BitOfNew;
 import com.graphhopper.trailmap.personal.variations.MainPath;
+import com.graphhopper.util.CustomModel;
 import com.graphhopper.util.Helper;
 import com.graphhopper.util.InstructionList;
 import com.graphhopper.util.PMap;
@@ -134,7 +135,11 @@ final class TrailmapBitOfNew {
                 request.setPathDetails(asked);
             }
         }
-        Weighting profileW = hopper.createWeighting(hopper.getProfile(request.getProfile()), new PMap());
+        // the variations follow the request's own custom_model (e.g. the app's ferry exclusion), as the main route does
+        PMap weightingHints = new PMap();
+        if (request.getCustomModel() != null)
+            weightingHints.putObject(CustomModel.KEY, request.getCustomModel());
+        Weighting profileW = hopper.createWeighting(hopper.getProfile(request.getProfile()), weightingHints);
         result = BitOfNew.compute(hopper.getBaseGraph(), hopper.getEncodingManager(), hopper.getLocationIndex(), profileW,
                 base, history, lifetime, last12);
         boolean ele = main.getPoints().is3D();

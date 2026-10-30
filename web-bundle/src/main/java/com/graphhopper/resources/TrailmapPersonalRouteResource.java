@@ -9,18 +9,24 @@ import com.graphhopper.http.GHRequestTransformer;
 import com.graphhopper.http.ProfileResolver;
 import com.graphhopper.jackson.MultiException;
 import com.graphhopper.jackson.ResponsePathSerializer;
+import com.graphhopper.trailmap.personal.DirCellSource;
+import com.graphhopper.trailmap.personal.FirebaseTokenVerifier;
 import com.graphhopper.trailmap.personal.PersonalCellGrid;
+import com.graphhopper.trailmap.personal.PersonalCellSource;
 import com.graphhopper.trailmap.personal.PersonalCells;
 import com.graphhopper.trailmap.personal.PersonalFamiliarity;
 import com.graphhopper.trailmap.personal.PersonalParams;
 import com.graphhopper.trailmap.personal.PersonalRouter;
 import com.graphhopper.trailmap.personal.PersonalStore;
-import com.graphhopper.util.Helper;
+import com.graphhopper.trailmap.personal.RemoteCellSource;
+import com.graphhopper.trailmap.personal.variations.BitOfNew;
 import com.graphhopper.util.PMap;
 import com.graphhopper.util.StopWatch;
 import jakarta.inject.Inject;
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.constraints.NotNull;
 import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.slf4j.Logger;
@@ -28,39 +34,69 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static com.graphhopper.util.Parameters.Routing.CALC_POINTS;
 import static com.graphhopper.util.Parameters.Routing.INSTRUCTIONS;
 
 /**
- * Trailmap prototype: personalised A→B routing ({@code POST /personal_route}), separate from
+ * Trailmap: personalised A→B routing ({@code POST /personal_route}), separate from
  * {@code /route}, which it does not change. Same request and response as {@code POST /route}, plus
- * {@code personal_*} fields (see {@link PersonalParams}). The user's cells come from
- * {@code <personal_routing.cells_dir>/<personal_user>/<personal_cells>.csv}.
+ * {@code personal_*} fields (see {@link PersonalParams}).
+ *
+ * <p>Whose history: the user of the {@code Authorization: Bearer <Firebase ID token>} header (its {@code sub}); the
+ * request's {@code personal_user} is ignored unless the previewer mode is on. A request without a token routes as
+ * /route when it asks for nothing personal (mode neutral, no bit_of_new history) and gets 401 otherwise; a token that
+ * is present but not valid always gets 401.
  *
  * <p>{@code algorithm=bit_of_new} adds "bit of new" variations of the route as further paths (see
  * {@link TrailmapBitOfNew}); without it nothing changes.
  *
- * <p>{@code GET /personal_route/cells} returns a user's cells in a bounding box, for the previewer.
+ * <p>{@code GET /personal_route/cells} (a user's cells in a bounding box) and {@code GET /personal_route/datasets}
+ * serve the local previewer and exist only in the previewer mode.
  *
- * <p>Config ({@code graphhopper:} section): {@code personal_routing.cells_dir} (required to enable; without it every
- * endpoint here answers 404, which is how production keeps it off),
- * {@code personal_routing.cache_minutes} (30), {@code personal_routing.max_users} (8).
+ * <p>Config ({@code graphhopper:} section). Exactly one cells source enables the endpoints; with none, every endpoint
+ * here answers 404, which is the off switch:
+ * <ul>
+ * <li>{@code personal_routing.cells_source}: the activity service's internal cells URL (production), with the shared
+ * secret in the environment variable named by {@code personal_routing.cells_secret_env} ({@code GH_CELLS_SECRET});
+ * the disk copy in {@code personal_routing.cells_disk_dir} (none if unset), kept {@code personal_routing.cells_disk_days}
+ * (30) days after its last use; one fetch (headers and body) takes at most {@code personal_routing.cells_timeout_ms}
+ * (4000), after which the disk copy or plain routing answers; an empty secret answers 503 and logs an error;</li>
+ * <li>{@code personal_routing.cells_dir}: local files {@code <cells_dir>/<user>/<set>.csv} (previewer, tests).</li>
+ * </ul>
+ * {@code personal_routing.previewer} (default: true with cells_dir, false with cells_source),
+ * {@code personal_routing.firebase_project} ({@code trailmapv2}), {@code personal_routing.cache_minutes} (5: a user's
+ * cells are dropped after 5 idle minutes, even without further requests), {@code personal_routing.max_users} (8).
  */
 @Path("personal_route")
 public class TrailmapPersonalRouteResource {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(TrailmapPersonalRouteResource.class);
     private static final int MAX_CELLS_RESPONSE = 80_000;
+    /**
+     * Web origins that may send the Authorization header (CORS preflight): exactly the hosts the web app is served at
+     * (lead_web, 2026-10-30); trailmap.fi, www.trailmap.fi, trailmap.guide and global.trailmap.fi only redirect.
+     */
+    private static final Set<String> WEB_ORIGINS = Set.of("https://web.trailmap.fi", "https://beta.trailmap.fi",
+            "https://web.trailmap.guide", "https://ng-test.trailmap.fi", "http://localhost:3000");
+    private static final String ALLOW_HEADERS = "Origin,Accept,X-Requested-With,Content-Type,"
+            + "Access-Control-Request-Method,Access-Control-Request-Headers,Range,GH-Client";
 
     /** One store per GraphHopper instance; resources are created per request. */
     private static volatile PersonalStore store;
     private static volatile GraphHopper storeOwner;
+    /** The cells source settings the store was made for. */
+    private static volatile String storeKey;
+    /** One token check per Firebase project; tests may replace it. */
+    private static volatile FirebaseTokenVerifier verifier;
+    private static volatile String verifierProject;
 
     private final GraphHopperConfig config;
     private final GraphHopper graphHopper;
@@ -82,42 +118,159 @@ public class TrailmapPersonalRouteResource {
                 .split(",")).map(String::trim).filter(s -> !s.isEmpty()).toList();
     }
 
+    private String cellsDir() {
+        return config.getString("personal_routing.cells_dir", "").trim();
+    }
+
+    private String cellsSource() {
+        return config.getString("personal_routing.cells_source", "").trim();
+    }
+
     /**
-     * Off switch: without {@code personal_routing.cells_dir} in the config (as in production) every endpoint of this
-     * resource answers 404, so neither neutral routing nor bit_of_new is reachable.
+     * Off switch: without a cells source in the config every endpoint of this resource answers 404, so neither
+     * neutral routing nor bit_of_new is reachable.
      */
     private void requireEnabled() {
-        if (Helper.isEmpty(config.getString("personal_routing.cells_dir", "")))
+        if (cellsDir().isEmpty() && cellsSource().isEmpty())
             throw new NotFoundException("personal_route is not enabled on this server");
+    }
+
+    /** The local previewer mode: the GET endpoints and a request-chosen personal_user. Never on in production. */
+    private boolean previewer() {
+        return config.getBool("personal_routing.previewer", !cellsDir().isEmpty());
+    }
+
+    /** The previewer's GET endpoints: 404 unless enabled and in the previewer mode (they serve any user's cells). */
+    private void requirePreviewer() {
+        requireEnabled();
+        if (!previewer())
+            throw new NotFoundException("not available on this server");
     }
 
     private PersonalStore store() {
         PersonalStore s = store;
-        if (s != null && storeOwner == graphHopper) return s;
+        String key = String.join("|", cellsDir(), cellsSource(), config.getString("personal_routing.cells_disk_dir", ""),
+                config.getString("personal_routing.cells_secret_env", ""), config.getString("personal_routing.cells_timeout_ms", ""));
+        if (s != null && storeOwner == graphHopper && key.equals(storeKey)) return s;
         synchronized (TrailmapPersonalRouteResource.class) {
-            if (store == null || storeOwner != graphHopper) {
-                String dir = config.getString("personal_routing.cells_dir", "");
-                if (Helper.isEmpty(dir))
-                    throw new IllegalArgumentException("Personal routing is not enabled: set personal_routing.cells_dir in the config");
-                long ttl = config.asPMap().getLong("personal_routing.cache_minutes", 30) * 60_000L;
+            if (store == null || storeOwner != graphHopper || !key.equals(storeKey)) {
+                long ttl = config.asPMap().getLong("personal_routing.cache_minutes", 5) * 60_000L;
                 int maxUsers = config.asPMap().getInt("personal_routing.max_users", 8);
-                store = new PersonalStore(Paths.get(dir).toAbsolutePath(), graphHopper.getBaseGraph(), ttl, maxUsers);
+                PersonalCellSource source = cellSource();
+                if (store != null) store.close();
+                store = new PersonalStore(source, graphHopper.getBaseGraph(), ttl, maxUsers);
                 storeOwner = graphHopper;
+                storeKey = key;
             }
             return store;
         }
     }
 
+    private PersonalCellSource cellSource() {
+        String dir = cellsDir(), url = cellsSource();
+        if (!dir.isEmpty() && !url.isEmpty())
+            throw new IllegalStateException("set only one of personal_routing.cells_dir and personal_routing.cells_source");
+        if (!dir.isEmpty())
+            return new DirCellSource(Paths.get(dir));
+        String secretEnv = config.getString("personal_routing.cells_secret_env", "GH_CELLS_SECRET");
+        String secret = System.getenv(secretEnv);
+        if (secret == null || secret.isBlank()) {
+            // misconfigured server, not the client's fault: loud in the log, 503 to the client, retried per request
+            LOGGER.error("personal: personal_routing.cells_source is set but env {} is empty: personal routing is unavailable", secretEnv);
+            throw new WebApplicationException(Response.status(Response.Status.SERVICE_UNAVAILABLE)
+                    .entity(Map.of("message", "personal routing is not configured on this server"))
+                    .type(MediaType.APPLICATION_JSON).build());
+        }
+        String disk = config.getString("personal_routing.cells_disk_dir", "").trim();
+        long diskDays = config.asPMap().getLong("personal_routing.cells_disk_days", 30);
+        // well inside the web client's own 15 s route timeout, so a stalled service still lets the route answer
+        long timeoutMs = config.asPMap().getLong("personal_routing.cells_timeout_ms", 4_000);
+        LOGGER.info("personal: cells from {} (disk copy {}, {} days, timeout {} ms)", url, disk.isEmpty() ? "none" : disk, diskDays, timeoutMs);
+        return new RemoteCellSource(url, secret, disk.isEmpty() ? null : Paths.get(disk),
+                diskDays * 86_400_000L, Duration.ofMillis(Math.min(3_000, timeoutMs)), Duration.ofMillis(timeoutMs));
+    }
+
+    private FirebaseTokenVerifier verifier() {
+        String project = config.getString("personal_routing.firebase_project", "trailmapv2");
+        FirebaseTokenVerifier v = verifier;
+        if (v != null && project.equals(verifierProject)) return v;
+        synchronized (TrailmapPersonalRouteResource.class) {
+            if (verifier == null || !project.equals(verifierProject)) {
+                verifier = FirebaseTokenVerifier.forProject(project);
+                verifierProject = project;
+            }
+            return verifier;
+        }
+    }
+
+    /** Tests only: a token check with their own keys, for this project. */
+    static void setVerifierForTests(FirebaseTokenVerifier v, String project) {
+        synchronized (TrailmapPersonalRouteResource.class) {
+            verifier = v;
+            verifierProject = project;
+        }
+    }
+
+    private static WebApplicationException unauthorized(String message) {
+        return new WebApplicationException(Response.status(Response.Status.UNAUTHORIZED)
+                .header("WWW-Authenticate", "Bearer")
+                .entity(Map.of("message", message))
+                .type(MediaType.APPLICATION_JSON).build());
+    }
+
+    /**
+     * Whose history this request routes on: the token's user, else (previewer only) the request's personal_user, else
+     * nobody. Writes the answer into the hints' personal_user, which everything below reads.
+     */
+    private void bindUser(String authorization, PMap hints, boolean asksPersonal) {
+        String user = "";
+        if (authorization != null && !authorization.isBlank()) {
+            String a = authorization.trim();
+            if (!a.regionMatches(true, 0, "Bearer ", 0, 7))
+                throw unauthorized("Authorization must be 'Bearer <Firebase ID token>'");
+            try {
+                user = verifier().verify(a.substring(7).trim());
+            } catch (FirebaseTokenVerifier.KeysUnavailableException e) {
+                // Google's keys not reachable yet: transient, not the client's token (clients treat 401 as "turn off")
+                LOGGER.warn("personal_route: token not checked: {}", e.getMessage());
+                throw new WebApplicationException(Response.status(Response.Status.SERVICE_UNAVAILABLE)
+                        .header("Retry-After", "60")
+                        .entity(Map.of("message", "personal routing temporarily unavailable: " + e.getMessage()))
+                        .type(MediaType.APPLICATION_JSON).build());
+            } catch (FirebaseTokenVerifier.InvalidTokenException e) {
+                LOGGER.info("personal_route: token refused: {}", e.getMessage());
+                throw unauthorized("invalid token: " + e.getMessage());
+            }
+        } else if (previewer()) {
+            user = hints.getString(PersonalParams.USER, "");
+        } else if (asksPersonal) {
+            throw unauthorized("personal routing needs 'Authorization: Bearer <Firebase ID token>'");
+        }
+        hints.putObject(PersonalParams.USER, user);
+    }
+
+    /** CORS preflight: the web origins may send the Authorization header to this endpoint. */
+    @OPTIONS
+    public Response preflight(@HeaderParam("Origin") String origin, @Context HttpServletResponse rsp) {
+        if (origin != null && WEB_ORIGINS.contains(origin)) {
+            rsp.setHeader("Access-Control-Allow-Origin", origin);
+            rsp.setHeader("Access-Control-Allow-Headers", ALLOW_HEADERS + ",Authorization");
+            rsp.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+            rsp.setHeader("Access-Control-Max-Age", "600");
+            rsp.addHeader("Vary", "Origin");
+        }
+        return Response.noContent().build();
+    }
+
     @POST
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
-    public Response doPost(@NotNull GHRequest request) throws IOException {
+    public Response doPost(@NotNull GHRequest request, @HeaderParam("Authorization") String authorization) throws IOException {
         requireEnabled();
         if (!request.hasSnapPreventions())
             request.setSnapPreventions(snapPreventionsDefault);
         StopWatch sw = new StopWatch().start();
         request = ghRequestTransformer.transformRequest(request);
-        PersonalParams params = PersonalParams.from(request.getHints());
 
         PMap profileResolverHints = new PMap(request.getHints());
         profileResolverHints.putObject("profile", request.getProfile());
@@ -126,6 +279,10 @@ public class TrailmapPersonalRouteResource {
         RouteResource.removeLegacyParameters(request.getHints());
         // algorithm=bit_of_new: the main route is this same request routed as usual; variations follow it
         TrailmapBitOfNew bitOfNew = TrailmapBitOfNew.take(request);
+        String mode = request.getHints().getString(PersonalParams.MODE, "neutral").trim();
+        bindUser(authorization, request.getHints(),
+                !"neutral".equalsIgnoreCase(mode) || (bitOfNew != null && bitOfNew.history != BitOfNew.History.NONE));
+        PersonalParams params = PersonalParams.from(request.getHints());
 
         PersonalFamiliarity familiarity = null;
         PersonalStore.Lookup lookup = null;
@@ -187,7 +344,7 @@ public class TrailmapPersonalRouteResource {
     @Path("datasets")
     @Produces(MediaType.APPLICATION_JSON)
     public Map<String, Object> dataSets(@QueryParam("user") String user) throws IOException {
-        requireEnabled();
+        requirePreviewer();
         PMap hints = new PMap();
         hints.putObject(PersonalParams.USER, user == null ? "" : user);
         PersonalParams params = PersonalParams.from(hints); // validates the name
@@ -201,7 +358,7 @@ public class TrailmapPersonalRouteResource {
     @Produces(MediaType.APPLICATION_JSON)
     public Map<String, Object> cells(@QueryParam("user") String user, @QueryParam("cells") String cells,
                                      @QueryParam("bbox") String bbox) throws IOException {
-        requireEnabled();
+        requirePreviewer();
         PMap hints = new PMap();
         hints.putObject(PersonalParams.MODE, "explore");
         hints.putObject(PersonalParams.USER, user == null ? "" : user);

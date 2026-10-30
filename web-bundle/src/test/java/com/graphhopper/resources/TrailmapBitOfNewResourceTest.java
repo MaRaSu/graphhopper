@@ -84,7 +84,7 @@ public class TrailmapBitOfNewResourceTest {
         body.put("personal_rides_saturation", 10);
         body.putAll(extra);
         GHRequest req = om.readValue(om.writeValueAsString(body), GHRequest.class);
-        Response r = resource.doPost(req);
+        Response r = resource.doPost(req, null);
         assertEquals(200, r.getStatus());
         // through JSON text, as a client sees it (points and hints are POJOs in the response object)
         return (ObjectNode) om.readTree(om.writeValueAsString(r.getEntity()));
@@ -216,6 +216,50 @@ public class TrailmapBitOfNewResourceTest {
         assertTrue(bon.get("paths").size() >= 2);
     }
 
+    /**
+     * The variations follow the request's custom_model as the main route does: a small area blocked by the custom
+     * model, put on the point of a variation farthest from the main route, is not used by any variation any more.
+     */
+    @Test
+    void variationsFollowTheRequestsCustomModel() throws Exception {
+        int checked = 0;
+        for (JsonNode leg : legs) {
+            ObjectNode bon = post(leg, Map.of("algorithm", "bit_of_new"));
+            if (bon.get("paths").size() < 2) continue;
+            List<String> main = coords(bon.get("paths").get(0));
+            JsonNode alt = bon.get("paths").get(1).get("points").get("coordinates");
+            double bestD = -1, lon = 0, lat = 0;
+            for (JsonNode c : alt) {
+                double d = Double.MAX_VALUE;
+                for (String m : main) {
+                    String[] p = m.split(",");
+                    d = Math.min(d, Math.hypot(c.get(0).asDouble() - Double.parseDouble(p[0]), c.get(1).asDouble() - Double.parseDouble(p[1])));
+                }
+                if (d > bestD) {
+                    bestD = d;
+                    lon = c.get(0).asDouble();
+                    lat = c.get(1).asDouble();
+                }
+            }
+            if (bestD < 0.003) continue; // the variation must leave the main route clearly (~200 m)
+            double r = 0.0006;
+            List<List<Double>> ring = List.of(List.of(lon - r, lat - r), List.of(lon + r, lat - r), List.of(lon + r, lat + r),
+                    List.of(lon - r, lat + r), List.of(lon - r, lat - r));
+            Map<String, Object> cm = Map.of(
+                    "areas", Map.of("type", "FeatureCollection", "features", List.of(Map.of("type", "Feature", "id", "blk",
+                            "properties", Map.of(), "geometry", Map.of("type", "Polygon", "coordinates", List.of(ring))))),
+                    "priority", List.of(Map.of("if", "in_blk", "multiply_by", "0")));
+            ObjectNode with = post(leg, Map.of("algorithm", "bit_of_new", "custom_model", cm, "ch.disable", true));
+            String id = leg.get("id").asText();
+            for (int k = 1; k < with.get("paths").size(); k++)
+                for (JsonNode c : with.get("paths").get(k).get("points").get("coordinates"))
+                    assertFalse(Math.abs(c.get(0).asDouble() - lon) < r && Math.abs(c.get(1).asDouble() - lat) < r,
+                            id + ": variation " + k + " goes through the area the custom model blocks");
+            if (++checked == 5) break;
+        }
+        assertTrue(checked >= 3, "too few legs with a clear variation: " + checked);
+    }
+
     @Test
     void tooLongRouteGetsOnlyTheMainRoute() throws Exception {
         JsonNode leg = legs.get(0);
@@ -240,28 +284,46 @@ public class TrailmapBitOfNewResourceTest {
         }
     }
 
-    /** With the production config (no personal_routing.cells_dir) every endpoint is off: 404, bit_of_new included. */
+    /**
+     * The production config: cells from the activity service, no local files, no previewer. Without a token nothing
+     * personal is served (the body's personal_user is ignored, personal modes are 401), plain requests route as
+     * /route, and the previewer's GET endpoints are 404.
+     */
     @Test
-    void offWithTheProductionConfig() throws Exception {
+    void productionConfigIsTokenOnly() throws Exception {
         File prod = new File(System.getProperty("bon.prod_config", ROOT + "/gh-src/trailmap_prod_config.yml"));
         assumeTrue(prod.exists(), "production config not here");
         ObjectMapper yaml = Jackson.initObjectMapper(new ObjectMapper(new YAMLFactory()));
         GraphHopperConfig prodConfig = yaml.treeToValue(yaml.readTree(prod).get("graphhopper"), GraphHopperConfig.class);
-        assertEquals("", prodConfig.getString("personal_routing.cells_dir", ""), "production config enables personal routing");
-        TrailmapPersonalRouteResource off = new TrailmapPersonalRouteResource(prodConfig, hopper, new ProfileResolver(hopper.getProfiles()), r -> r);
+        assertEquals("", prodConfig.getString("personal_routing.cells_dir", ""), "no local cells in production");
+        assertFalse(prodConfig.getString("personal_routing.cells_source", "").isEmpty(), "production fetches cells");
+        assertFalse(prodConfig.getBool("personal_routing.previewer", false), "no previewer in production");
+        TrailmapPersonalRouteResource prodRes = new TrailmapPersonalRouteResource(prodConfig, hopper, new ProfileResolver(hopper.getProfiles()), r -> r);
         JsonNode leg = legs.get(0);
-        for (Map<String, Object> extra : List.<Map<String, Object>>of(Map.of("personal_mode", "neutral"),
-                Map.of("algorithm", "bit_of_new"), Map.of("algorithm", "bit_of_new", "personal_user", "owner"))) {
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("points", List.of(List.of(leg.get("from").get(1).asDouble(), leg.get("from").get(0).asDouble()),
-                    List.of(leg.get("to").get(1).asDouble(), leg.get("to").get(0).asDouble())));
-            body.put("profile", "gravel");
-            body.putAll(extra);
-            GHRequest req = om.readValue(om.writeValueAsString(body), GHRequest.class);
-            assertThrows(jakarta.ws.rs.NotFoundException.class, () -> off.doPost(req), extra.toString());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("points", List.of(List.of(leg.get("from").get(1).asDouble(), leg.get("from").get(0).asDouble()),
+                List.of(leg.get("to").get(1).asDouble(), leg.get("to").get(0).asDouble())));
+        body.put("profile", "gravel");
+        body.put("points_encoded", false);
+        body.put("instructions", false);
+        for (Map<String, Object> extra : List.<Map<String, Object>>of(Map.of("personal_mode", "favor", "personal_user", "owner", "personal_cells", "cycling_lifetime"),
+                Map.of("algorithm", "bit_of_new", "bit_of_new_history", "avoid", "personal_user", "owner"))) {
+            Map<String, Object> b = new LinkedHashMap<>(body);
+            b.putAll(extra);
+            GHRequest req = om.readValue(om.writeValueAsString(b), GHRequest.class);
+            jakarta.ws.rs.WebApplicationException e = assertThrows(jakarta.ws.rs.WebApplicationException.class, () -> prodRes.doPost(req, null), extra.toString());
+            assertEquals(401, e.getResponse().getStatus(), extra.toString());
         }
-        assertThrows(jakarta.ws.rs.NotFoundException.class, () -> off.dataSets("owner"));
-        assertThrows(jakarta.ws.rs.NotFoundException.class, () -> off.cells("owner", "cycling_lifetime", "23,61,24,62"));
+        // neutral without a token: exactly the route the previewer-mode resource gives for a plain request
+        Map<String, Object> b = new LinkedHashMap<>(body);
+        b.put("personal_user", "owner");
+        Response r = prodRes.doPost(om.readValue(om.writeValueAsString(b), GHRequest.class), null);
+        ObjectNode got = (ObjectNode) om.readTree(om.writeValueAsString(r.getEntity()));
+        assertFalse(got.get("hints").get("personal").get("active").asBoolean());
+        ObjectNode plain = post(leg, Map.of("personal_mode", "neutral"));
+        assertEquals(coords(plain.get("paths").get(0)), coords(got.get("paths").get(0)));
+        assertThrows(jakarta.ws.rs.NotFoundException.class, () -> prodRes.dataSets("owner"));
+        assertThrows(jakarta.ws.rs.NotFoundException.class, () -> prodRes.cells("owner", "cycling_lifetime", "23,61,24,62"));
     }
 
     @Test

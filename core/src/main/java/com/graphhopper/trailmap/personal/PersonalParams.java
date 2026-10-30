@@ -29,6 +29,8 @@ public final class PersonalParams {
     static final double MAX_SWITCH_PENALTY = 600;
 
     private static final Pattern NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+    /** User ids: Firebase uids are up to 128 characters. */
+    private static final Pattern USER_NAME = Pattern.compile("[A-Za-z0-9_-]{1,128}");
 
     public final String user;
     public final String cells;
@@ -63,8 +65,8 @@ public final class PersonalParams {
         String user = hints.getString(USER, "");
         String cells = hints.getString(CELLS, "");
         // Empty names mean "no history" (routes as /route); only malformed names are an error.
-        if (!user.isEmpty() && !NAME.matcher(user).matches())
-            throw new IllegalArgumentException(USER + " must be 1-64 characters of A-Z a-z 0-9 _ -");
+        if (!user.isEmpty() && !USER_NAME.matcher(user).matches())
+            throw new IllegalArgumentException(USER + " must be 1-128 characters of A-Z a-z 0-9 _ -");
         if (!cells.isEmpty() && !NAME.matcher(cells).matches())
             throw new IllegalArgumentException(CELLS + " must be 1-64 characters of A-Z a-z 0-9 _ -");
         double strength = clamp(hints.getDouble(STRENGTH, 0.5), 0, MAX_STRENGTH);

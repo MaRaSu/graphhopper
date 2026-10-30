@@ -1,17 +1,15 @@
 package com.graphhopper.resources;
 
-import com.graphhopper.ConvertRequest;
-import com.graphhopper.ConvertResponse;
 import com.graphhopper.GHRequest;
 import com.graphhopper.GHResponse;
 import com.graphhopper.GraphHopper;
 import com.graphhopper.GraphHopperConfig;
-import com.graphhopper.ResponsePath;
 import com.graphhopper.http.GHRequestTransformer;
 import com.graphhopper.http.ProfileResolver;
 import com.graphhopper.jackson.ResponsePathDeserializerHelper;
 import com.graphhopper.jackson.ResponsePathSerializer;
 import com.graphhopper.trailmap.roundtrip.loop.LoopAutoRoute;
+import com.graphhopper.trailmap.roundtrip.loop.LoopHandover;
 import com.graphhopper.util.PMap;
 import com.graphhopper.util.PointList;
 import com.graphhopper.util.StopWatch;
@@ -27,9 +25,6 @@ import org.slf4j.LoggerFactory;
 import java.util.*;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-
-import static com.graphhopper.util.Parameters.Routing.CALC_POINTS;
-import static com.graphhopper.util.Parameters.Routing.INSTRUCTIONS;
 
 /**
  * Trailmap AutoRoute v2 ({@code POST /autoroute}): one press returns up to 3 round-trip loops from one start, made by
@@ -47,17 +42,20 @@ import static com.graphhopper.util.Parameters.Routing.INSTRUCTIONS;
  * Response: {@code /route} JSON with up to 3 paths in slot order. Each path's {@code snapped_waypoints} are the loop's
  * waypoints (snapped on {@code <profile>_explore}, as the exploration round_trip returns them), which go to
  * {@code /convert} as today; its geometry, distance and details are the route that /convert will give for them.
- * {@code hints.autoroute.roles} names each slot (guided / surprise).
+ * {@code hints.autoroute.roles} names each slot (guided / surprise), {@code added_waypoints} counts the waypoints added
+ * so that /convert follows the loop ({@link LoopHandover}); {@code autoroute.debug_loops=true} also returns the engine's
+ * own loops ({@code loops}: distance, [lat, lon] coords), for the harness.
  * <p>
  * Config ({@code graphhopper:} section): {@code autoroute.max_concurrent} (2), presses beyond it wait up to
- * {@code autoroute.queue_seconds} (60).
+ * {@code autoroute.queue_seconds} (60); {@code autoroute.max_distance} (120000 m), longer requests get a 400;
+ * {@code autoroute.max_inserts} (4), the most waypoints added per loop (a request may override it; 0 = none).
  */
 @Path("autoroute")
 public class TrailmapAutoRouteResource {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(TrailmapAutoRouteResource.class);
     static final String DISTANCE = "autoroute.distance", HEADING = "autoroute.heading", SEED = "autoroute.seed",
-            SHOWN = "autoroute.shown";
+            SHOWN = "autoroute.shown", DEBUG_LOOPS = "autoroute.debug_loops", MAX_INSERTS = "autoroute.max_inserts";
     static final int MAX_SHOWN = 60;
 
     /** One engine (its start cache) and one press limit per GraphHopper instance; resources are created per request. */
@@ -108,8 +106,9 @@ public class TrailmapAutoRouteResource {
             throw new IllegalArgumentException("autoroute needs exactly one point (the start), got " + request.getPoints().size());
         PMap hints = request.getHints();
         double targetM = hints.getDouble(DISTANCE, -1);
-        if (!(targetM >= 1000 && targetM <= 300_000))
-            throw new IllegalArgumentException(DISTANCE + " must be between 1000 and 300000 metres");
+        double maxM = config.asPMap().getDouble("autoroute.max_distance", 120_000);
+        if (!(targetM >= 1000 && targetM <= maxM))
+            throw new IllegalArgumentException(DISTANCE + " must be between 1000 and " + Math.round(maxM) + " metres");
         double heading = hints.has(HEADING) ? hints.getDouble(HEADING, Double.NaN) : Double.NaN;
         long seed = hints.getLong(SEED, new Random().nextInt(10_000));
         boolean enableElevation = hints.getBool("elevation", false);
@@ -138,30 +137,26 @@ public class TrailmapAutoRouteResource {
             permits.release();
         }
 
-        // each loop's waypoints snapped and routed on _explore (as the exploration round_trip returns them), then shown
-        // as /convert will route them
+        // each loop as the client will rebuild it (explore via-route, then /convert), with waypoints added where /convert
+        // would leave the loop
         GHResponse ghResponse = new GHResponse();
         List<String> roles = new ArrayList<>(), labels = new ArrayList<>();
+        List<Integer> added = new ArrayList<>();
+        List<Map<String, Object>> loops = new ArrayList<>();
+        // a request may lower the configured cap (the harness's 0 = no fix), never raise it: this work runs outside permits
+        int maxInserts = config.asPMap().getInt(MAX_INSERTS, LoopHandover.MAX_INSERTS);
+        LoopHandover handover = new LoopHandover(graphHopper, Math.max(0, Math.min(maxInserts, hints.getInt(MAX_INSERTS, maxInserts))));
         for (LoopAutoRoute.Route r : routes) {
-            GHRequest leg = new GHRequest();
-            leg.addPoint(start);
-            for (double[] p : r.waypoints) leg.addPoint(new GHPoint(p[0], p[1]));
-            leg.addPoint(start);
-            leg.setProfile(exploreProfile);
-            leg.setCustomModel(request.getCustomModel());
-            leg.setPathDetails(request.getPathDetails());
-            leg.setSnapPreventions(request.getSnapPreventions());
-            leg.setLocale(request.getLocale());
-            leg.getHints().putObject(INSTRUCTIONS, false);
-            leg.getHints().putObject(CALC_POINTS, true);
-            GHResponse rsp = graphHopper.route(leg);
-            if (rsp.hasErrors()) {
-                LOGGER.warn("autoroute: dropping a {} loop, routing its waypoints failed: {}", r.source, rsp.getErrors());
+            LoopHandover.Result h = handover.handOver(profile, start, r, request);
+            if (h == null) {
+                LOGGER.warn("autoroute: dropping a {} loop, routing its waypoints failed", r.source);
                 continue;
             }
-            ghResponse.add(asConverted(rsp.getBest(), profile, request));
+            ghResponse.add(h.path);
             roles.add(r.role);
             labels.add(r.source + " " + r.label);
+            added.add(h.inserted);
+            loops.add(Map.of("distance", r.distance, "coords", r.coords));
         }
         double took = sw.stop().getMillisDouble();
         if (ghResponse.getAll().isEmpty())
@@ -173,6 +168,9 @@ public class TrailmapAutoRouteResource {
         info.put("preview", "convert");
         info.put("roles", roles);
         info.put("labels", labels);
+        info.put("added_waypoints", added);
+        if (hints.getBool(DEBUG_LOOPS, false))
+            info.put("loops", loops);
         info.put("seed", seed);
         info.put("shown", shown.size());
         info.put("engine_ms", engineMs);
@@ -189,50 +187,6 @@ public class TrailmapAutoRouteResource {
                 header("X-GH-Took", "" + Math.round(took)).
                 type(MediaType.APPLICATION_JSON).
                 build();
-    }
-
-    /**
-     * The loop as the user will get it: the client sends {@code snapped_waypoints} to {@code /convert}, which re-routes
-     * them with the x5 avoid-reuse penalty (Stage A), normalises them and routes the result on the standard profile
-     * (Stage C). A plain via-route through the waypoints differs from that on about one route in five, so the preview is
-     * /convert's own final route (same call, same inputs), with this request's details; {@code snapped_waypoints}
-     * stay the loop's waypoints, so the client's /convert gives exactly this route. Falls back to the via-route when
-     * the conversion fails.
-     */
-    private ResponsePath asConverted(ResponsePath via, String profile, GHRequest request) {
-        PointList wps = via.getWaypoints();
-        List<GHPoint> waypoints = new ArrayList<>(wps.size());
-        for (int i = 0; i < wps.size(); i++) waypoints.add(new GHPoint(wps.getLat(i), wps.getLon(i)));
-        ConvertRequest convertRequest = new ConvertRequest(profile, waypoints);
-        if (request.getCustomModel() != null) convertRequest.setCustomModel(request.getCustomModel());
-        ConvertResponse converted = graphHopper.convert(convertRequest);
-        if (converted.hasErrors()) {
-            LOGGER.warn("autoroute: /convert of a loop failed, showing the via-route: {}", converted.getErrors());
-            return via;
-        }
-        // the same final request as RouteConversionService's Stage C, plus the details the client asked for
-        GHRequest finalReq = new GHRequest(new ArrayList<>(converted.getNormalizedWaypoints()));
-        finalReq.setProfile(profile);
-        if (request.getCustomModel() != null) finalReq.setCustomModel(request.getCustomModel());
-        finalReq.setPathDetails(request.getPathDetails());
-        finalReq.putHint(INSTRUCTIONS, false);
-        finalReq.putHint(CALC_POINTS, true);
-        GHResponse finalRsp = graphHopper.route(finalReq);
-        if (finalRsp.hasErrors()) {
-            LOGGER.warn("autoroute: final route of a converted loop failed, showing the via-route: {}", finalRsp.getErrors());
-            return via;
-        }
-        ResponsePath f = finalRsp.getBest();
-        ResponsePath out = new ResponsePath();
-        out.setWaypoints(wps);
-        out.setPoints(f.getPoints());
-        out.setDistance(f.getDistance());
-        out.setTime(f.getTime());
-        out.setAscend(f.getAscend());
-        out.setDescend(f.getDescend());
-        out.setRouteWeight(f.getRouteWeight());
-        out.addPathDetails(f.getPathDetails());
-        return out;
     }
 
     /** The session's shown routes: encoded polylines (as this endpoint returned them) to [lat, lon] lists. */
