@@ -7,6 +7,7 @@ import com.graphhopper.GHResponse;
 import com.graphhopper.GraphHopper;
 import com.graphhopper.ResponsePath;
 import com.graphhopper.util.PointList;
+import com.graphhopper.util.exceptions.DetailedIllegalArgumentException;
 import com.graphhopper.util.shapes.GHPoint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,12 +76,15 @@ public class LoopHandover {
     /**
      * @param request carries the custom model, path details, snap preventions and locale of the press
      * @return null when routing the loop's waypoints on the explore profile fails (the loop is dropped)
+     * @throws IllegalArgumentException when that routing fails because of the request itself (e.g. a path detail the
+     *                                  graph lacks): every loop of the press would fail the same way, so the caller gets
+     *                                  the real reason instead of "no loop"
      */
     public Result handOver(String profile, GHPoint start, LoopAutoRoute.Route route, GHRequest request) {
         List<double[]> waypoints = new ArrayList<>(route.waypoints);
         Result best = null;
         for (int inserts = 0; ; inserts++) {
-            ResponsePath via = viaRoute(profile, start, waypoints, request);
+            ResponsePath via = viaRoute(profile, start, waypoints, request, best == null);
             if (via == null) {
                 if (best == null) return null;
                 LOGGER.warn("autoroute: routing a loop with {} added waypoints failed, keeping {}", inserts, best.inserted);
@@ -104,8 +108,12 @@ public class LoopHandover {
         }
     }
 
-    /** The client's exploration result: start, waypoints, start, snapped and routed on the explore profile. */
-    private ResponsePath viaRoute(String profile, GHPoint start, List<double[]> waypoints, GHRequest request) {
+    /**
+     * The client's exploration result: start, waypoints, start, snapped and routed on the explore profile. Null when
+     * the routing fails; with throwRequestError, a failure caused by the request itself is thrown instead.
+     */
+    private ResponsePath viaRoute(String profile, GHPoint start, List<double[]> waypoints, GHRequest request,
+                                  boolean throwRequestError) {
         GHRequest leg = new GHRequest();
         leg.addPoint(start);
         for (double[] p : waypoints) leg.addPoint(new GHPoint(p[0], p[1]));
@@ -119,10 +127,25 @@ public class LoopHandover {
         leg.getHints().putObject(CALC_POINTS, true);
         GHResponse rsp = hopper.route(leg);
         if (rsp.hasErrors()) {
+            IllegalArgumentException requestError = throwRequestError ? requestError(rsp.getErrors()) : null;
+            if (requestError != null) throw requestError;
             LOGGER.warn("autoroute: routing the waypoints of a loop failed: {}", rsp.getErrors());
             return null;
         }
         return rsp.getBest();
+    }
+
+    /**
+     * The first error that comes from the request rather than from this loop's waypoints. GraphHopper reports a
+     * waypoint it can't snap or connect, or a search that grew too large, as a {@link DetailedIllegalArgumentException};
+     * a request it can't serve at all (a path detail the graph lacks, an invalid parameter) as a plain
+     * IllegalArgumentException.
+     */
+    static IllegalArgumentException requestError(List<Throwable> errors) {
+        for (Throwable t : errors)
+            if (t instanceof IllegalArgumentException e && !(e instanceof DetailedIllegalArgumentException))
+                return e;
+        return null;
     }
 
     /**

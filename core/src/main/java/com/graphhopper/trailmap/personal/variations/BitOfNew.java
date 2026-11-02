@@ -12,9 +12,13 @@ import com.graphhopper.trailmap.personal.PersonalFamiliarity;
 import com.graphhopper.trailmap.personal.PersonalParams;
 import com.graphhopper.trailmap.personal.PersonalWeighting;
 import com.graphhopper.util.DistanceCalcEarth;
+import com.graphhopper.util.EdgeIteratorState;
+import com.graphhopper.util.FetchMode;
 import com.graphhopper.util.PMap;
+import com.graphhopper.util.details.PathDetail;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 
@@ -60,6 +64,16 @@ public final class BitOfNew {
         public List<double[]> coords;
         public List<Deviation> deviations = new ArrayList<>();
         public double lengthM;
+        /**
+         * The variation's edges in travel order as an {@code edge_id} path detail over {@link #coords}: the main route's
+         * entries outside the deviations, the deviations' edges inside them. null when the indices don't add up to
+         * the coordinates (then nothing is claimed about the variation's edges).
+         */
+        public List<PathDetail> edgeIds;
+    }
+
+    /** A deviation as both generators splice it: main node i to main node j over edge keys. */
+    private record Detour(int i, int j, int[] keys) {
     }
 
     public static final class Result {
@@ -109,6 +123,9 @@ public final class BitOfNew {
             v.source = "round4";
             v.coords = a.coords;
             for (R4Generator.Ear e : a.ears) v.deviations.add(dev(e.a0, e.a1, e.len, e.span, e.maxD, L4));
+            List<Detour> ds = new ArrayList<>();
+            for (R4Generator.Ear e : a.ears) ds.add(new Detour(e.i, e.j, e.keys));
+            v.edgeIds = spliceEdgeIds(g, main, mp, ds, v.coords.size());
             res.round4.add(v);
         }
         long t2 = System.nanoTime();
@@ -122,6 +139,9 @@ public final class BitOfNew {
             List<A3Generator.Cand> ch = new ArrayList<>(p.chosen);
             ch.sort((x, y) -> Double.compare(x.a0, y.a0));
             for (A3Generator.Cand c : ch) v.deviations.add(dev(c.a0, c.a1, c.len, c.span, c.maxD, ar.L));
+            List<Detour> ds = new ArrayList<>();
+            for (A3Generator.Cand c : ch) ds.add(new Detour(c.i, c.j, c.keys));
+            v.edgeIds = spliceEdgeIds(g, main, mp, ds, v.coords.size());
             res.a3.add(v);
         }
         long t3 = System.nanoTime();
@@ -161,6 +181,47 @@ public final class BitOfNew {
         h.putObject(PersonalParams.SWITCH_PENALTY, 0.0);
         h.putObject(PersonalParams.RIDES_SATURATION, 10.0);
         return PersonalParams.from(h);
+    }
+
+    /**
+     * The edge_id path detail of a variation spliced as R4Generator.splice / A3Generator.splice splice its points:
+     * main points up to node i, then each deviation edge's pillar and adjacent points (the last edge's adjacent point
+     * is main node j's point), then the main points from node j on. Main entry k ends at node k, so entries 0..i stay,
+     * the deviation's edges follow, and entries j+1.. continue shifted. null when the result does not end at the last
+     * of {@code nPoints}.
+     */
+    static List<PathDetail> spliceEdgeIds(BaseGraph g, ResponsePath main, MainPath mp, List<Detour> detours, int nPoints) {
+        List<PathDetail> det = main.getPathDetails().get(MainPath.EDGE_ID);
+        List<Detour> s = new ArrayList<>(detours);
+        s.sort(Comparator.comparingInt(Detour::i));
+        List<PathDetail> out = new ArrayList<>();
+        int k = 0, shift = 0;
+        for (Detour d : s) {
+            if (d.i < k - 1 || d.j < d.i || d.j + 1 > det.size()) return null;
+            for (; k <= d.i; k++) out.add(shifted(det.get(k), shift));
+            int at = mp.ptIdx[d.i] + shift;
+            for (int key : d.keys) {
+                EdgeIteratorState e = g.getEdgeIteratorStateForKey(key);
+                int n = e.fetchWayGeometry(FetchMode.PILLAR_AND_ADJ).size();
+                PathDetail pd = new PathDetail(e.getEdge());
+                pd.setFirst(at);
+                pd.setLast(at + n);
+                out.add(pd);
+                at += n;
+            }
+            shift = at - mp.ptIdx[d.j];
+            k = d.j + 1;
+        }
+        for (; k < det.size(); k++) out.add(shifted(det.get(k), shift));
+        if (out.isEmpty() || out.get(out.size() - 1).getLast() != nPoints - 1) return null;
+        return out;
+    }
+
+    private static PathDetail shifted(PathDetail d, int shift) {
+        PathDetail pd = new PathDetail(d.getValue());
+        pd.setFirst(d.getFirst() + shift);
+        pd.setLast(d.getLast() + shift);
+        return pd;
     }
 
     static Deviation dev(double a0, double a1, double len, double span, double maxD, double L) {

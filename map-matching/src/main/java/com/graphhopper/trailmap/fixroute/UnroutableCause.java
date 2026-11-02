@@ -34,8 +34,9 @@ public class UnroutableCause {
             PMap hints = new PMap();
             if (s.customModel() != null) hints.putObject(CustomModel.KEY, s.customModel());
             Weighting w = hopper.createWeighting(hopper.getProfile(s.profile()), hints);
-            EdgeFilter usable = new DefaultSnapFilter(w,
-                    hopper.getEncodingManager().getBooleanEncodedValue(Subnetwork.key(s.profile())));
+            EdgeFilter usable = new DefaultSnapFilter(w, s.barriers()
+                    ? com.graphhopper.trailmap.barrier.BarrierProfiles.subnetworkEnc(hopper.getEncodingManager(), s.profile())
+                    : hopper.getEncodingManager().getBooleanEncodedValue(Subnetwork.key(s.profile())));
             int samples = 0, noRoad = 0, noUsable = 0;
             for (double arc = from + CAUSE_SAMPLE_M / 2; arc < to; arc += CAUSE_SAMPLE_M) {
                 double[] p = ref.pointAt(arc);

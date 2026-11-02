@@ -21,9 +21,10 @@ import java.io.FileInputStream;
  */
 final class FixRouteTestGraph {
 
-    static final String GRAPH_LOCATION = "../../data/graph-cache";
+    // barrier/impl experiment: -Dfix.graph / -Dfix.config point the tests at the S1 graph (read-only)
+    static final String GRAPH_LOCATION = System.getProperty("fix.graph", "../../data/graph-cache");
     static final String OSM_FILE = "../../data/finland_4.osm.pbf";
-    static final String CONFIG_FILE = "../trailmap-config.yml";
+    static final String CONFIG_FILE = System.getProperty("fix.config", "../trailmap-config.yml");
 
     private static final ObjectMapper GH_JSON = Jackson.newObjectMapper();
 

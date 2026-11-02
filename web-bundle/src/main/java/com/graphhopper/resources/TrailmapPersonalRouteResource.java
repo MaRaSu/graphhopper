@@ -1,14 +1,17 @@
 package com.graphhopper.resources;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.carrotsearch.hppc.IntArrayList;
 import com.graphhopper.GHRequest;
 import com.graphhopper.GHResponse;
 import com.graphhopper.GraphHopper;
 import com.graphhopper.GraphHopperConfig;
+import com.graphhopper.ResponsePath;
 import com.graphhopper.http.GHRequestTransformer;
 import com.graphhopper.http.ProfileResolver;
 import com.graphhopper.jackson.MultiException;
 import com.graphhopper.jackson.ResponsePathSerializer;
+import com.graphhopper.trailmap.personal.AltRouteVias;
 import com.graphhopper.trailmap.personal.DirCellSource;
 import com.graphhopper.trailmap.personal.FirebaseTokenVerifier;
 import com.graphhopper.trailmap.personal.PersonalCellGrid;
@@ -18,6 +21,7 @@ import com.graphhopper.trailmap.personal.PersonalFamiliarity;
 import com.graphhopper.trailmap.personal.PersonalParams;
 import com.graphhopper.trailmap.personal.PersonalRouter;
 import com.graphhopper.trailmap.personal.PersonalStore;
+import com.graphhopper.trailmap.personal.RecreateVias;
 import com.graphhopper.trailmap.personal.RemoteCellSource;
 import com.graphhopper.trailmap.personal.variations.BitOfNew;
 import com.graphhopper.util.PMap;
@@ -74,6 +78,13 @@ import static com.graphhopper.util.Parameters.Routing.INSTRUCTIONS;
  * {@code personal_routing.previewer} (default: true with cells_dir, false with cells_source),
  * {@code personal_routing.firebase_project} ({@code trailmapv2}), {@code personal_routing.cache_minutes} (5: a user's
  * cells are dropped after 5 idle minutes, even without further requests), {@code personal_routing.max_users} (8).
+ *
+ * <p>Re-create via points: every path the user's history or bit_of_new generated carries {@code via_points} such that
+ * plain {@code /route} [A, ...via_points, B] rides it again, as the app rebuilds a saved segment
+ * ({@link RecreateVias}); {@code hints.personal.recreate} says per path whether that holds. Levers:
+ * {@code personal_routing.recreate_max_vias} (30 per path, 0 = off) and {@code personal_routing.recreate_budget_ms}
+ * (2000 per request; paths not started by then are left as they are). Paths longer than {@link AltRouteVias#MAX_KM}
+ * are not pinned (one check route alone costs seconds there); their hint says {@code stopped: "too long"}.
  */
 @Path("personal_route")
 public class TrailmapPersonalRouteResource {
@@ -277,12 +288,16 @@ public class TrailmapPersonalRouteResource {
         profileResolverHints.putObject("has_curbsides", !request.getCurbsides().isEmpty());
         request.setProfile(profileResolver.resolveProfile(profileResolverHints));
         RouteResource.removeLegacyParameters(request.getHints());
+        // the re-create via points need every path's edges; asking for them here would change the points (GraphHopper
+        // keeps a point at every path-detail boundary when it simplifies), so without them the paths are routed again
+        boolean askedEdgeId = request.getPathDetails().contains(RecreateVias.EDGE_ID);
         // algorithm=bit_of_new: the main route is this same request routed as usual; variations follow it
         TrailmapBitOfNew bitOfNew = TrailmapBitOfNew.take(request);
         String mode = request.getHints().getString(PersonalParams.MODE, "neutral").trim();
         bindUser(authorization, request.getHints(),
                 !"neutral".equalsIgnoreCase(mode) || (bitOfNew != null && bitOfNew.history != BitOfNew.History.NONE));
         PersonalParams params = PersonalParams.from(request.getHints());
+        GHRequest plainRequest = RecreateVias.plainRequest(request);
 
         PersonalFamiliarity familiarity = null;
         PersonalStore.Lookup lookup = null;
@@ -293,19 +308,58 @@ public class TrailmapPersonalRouteResource {
         }
         long computedBefore = familiarity == null ? 0 : familiarity.getComputedEdges();
 
-        GHResponse ghResponse = new PersonalRouter(graphHopper, familiarity, params).route(request);
+        PersonalRouter router = new PersonalRouter(graphHopper, familiarity, params);
+        GHResponse ghResponse = router.route(request);
         double took = sw.stop().getMillisDouble();
         if (ghResponse.hasErrors())
             throw new MultiException(ghResponse.getErrors());
-        if (bitOfNew != null) {
+        int routedPaths = ghResponse.getAll().size();
+        // W26 (flag): a main path that crosses a barrier comes alone (BarrierRouter routes it without alternatives);
+        // bit_of_new variations are not added to it either: a generated route never crosses a gate on its own initiative
+        boolean crossing = hasBarrierCrossing(ghResponse);
+        boolean skippedForCrossing = crossing && (bitOfNew != null || "alternative_route".equalsIgnoreCase(request.getAlgorithm()));
+        if (crossing && bitOfNew != null) {
+            bitOfNew.skipForBarrierCrossing(ghResponse);
+        } else if (bitOfNew != null) {
             sw.start();
             PersonalFamiliarity mainFamiliarity = familiarity;
             bitOfNew.apply(graphHopper, request, ghResponse, r -> new PersonalRouter(graphHopper, mainFamiliarity, params).route(r), cells -> {
                 PersonalStore.Lookup l = params.user.isEmpty() ? null : store().get(params.user, cells);
                 return l == null ? null : l.familiarity;
             });
+            // W26 (flag only): every variation gets its hints.barriers.paths entry (its opening-hours notices)
+            router.addNoticesForAddedPaths(request, ghResponse);
             took = sw.stop().getMillisDouble();
         }
+
+        boolean pointsEncoded = request.getHints().getBool("points_encoded", true);
+        double pointsEncodedMultiplier = request.getHints().getDouble("points_encoded_multiplier", 1e5);
+        sw.start();
+        // the paths to pin, with their edges: the response's own when it has them; alternatives as the router computed
+        // them; else (one route) the same request routed again, unless it is too long to be pinned anyway
+        List<ResponsePath> withEdges = new ArrayList<>(ghResponse.getAll());
+        List<ResponsePath> alternatives = router.getAlternativesWithEdges();
+        if (familiarity != null && !askedEdgeId && alternatives != null && alternatives.size() == routedPaths) {
+            for (int i = 0; i < routedPaths; i++) withEdges.set(i, alternatives.get(i));
+        } else if (familiarity != null && !askedEdgeId && plainRequest != null && recreateMaxVias() > 0
+                && ghResponse.getBest().getDistance() <= AltRouteVias.MAX_KM * 1000) {
+            List<String> asked = request.getPathDetails();
+            List<String> pd = new ArrayList<>(asked);
+            pd.add(RecreateVias.EDGE_ID);
+            request.setPathDetails(pd);
+            try {
+                GHResponse again = new PersonalRouter(graphHopper, familiarity, params).route(request);
+                for (int i = 0; i < routedPaths; i++)
+                    withEdges.set(i, !again.hasErrors() && again.getAll().size() == routedPaths ? again.getAll().get(i) : null);
+            } finally {
+                request.setPathDetails(asked);
+            }
+        }
+        List<Map<String, Object>> recreate = recreateVias(plainRequest, ghResponse, withEdges, routedPaths,
+                familiarity != null, pointsEncoded ? pointsEncodedMultiplier : 0);
+        took = sw.stop().getMillisDouble();
+        if (!askedEdgeId)
+            for (ResponsePath p : ghResponse.getAll()) p.getPathDetails().remove(RecreateVias.EDGE_ID);
 
         Map<String, Object> info = new LinkedHashMap<>(params.toMap());
         info.put("active", familiarity != null);
@@ -319,6 +373,8 @@ public class TrailmapPersonalRouteResource {
             info.put("edges_measured_now", familiarity.getComputedEdges() - computedBefore);
             info.put("edges_measured_total", familiarity.getComputedEdges());
         }
+        if (!recreate.isEmpty()) info.put("recreate", recreate);
+        if (skippedForCrossing) info.put("alternatives_skipped", "barrier_crossing");
         ghResponse.getHints().putObject("personal", info);
         LOGGER.info("personal_route: mode={} strength={} switch={} profile={} took={} ms measured_now={} distance={}",
                 info.get("mode"), params.strength, params.switchPenalty, request.getProfile(), Math.round(took),
@@ -327,8 +383,6 @@ public class TrailmapPersonalRouteResource {
         boolean instructions = request.getHints().getBool(INSTRUCTIONS, true);
         boolean enableElevation = request.getHints().getBool("elevation", false);
         boolean calcPoints = request.getHints().getBool(CALC_POINTS, true);
-        boolean pointsEncoded = request.getHints().getBool("points_encoded", true);
-        double pointsEncodedMultiplier = request.getHints().getDouble("points_encoded_multiplier", 1e5);
         ObjectNode json = ResponsePathSerializer.jsonObject(ghResponse,
                 new ResponsePathSerializer.Info(config.getCopyrights(), Math.round(took), osmDate),
                 instructions, calcPoints, enableElevation, pointsEncoded, pointsEncodedMultiplier);
@@ -337,6 +391,64 @@ public class TrailmapPersonalRouteResource {
                 header("X-GH-Took", "" + Math.round(took)).
                 type(MediaType.APPLICATION_JSON).
                 build();
+    }
+
+    /** W26: the response's main path crosses a barrier (hints.barriers.paths[0].crossings not empty; flag only). */
+    @SuppressWarnings("unchecked")
+    static boolean hasBarrierCrossing(GHResponse rsp) {
+        Object b = rsp.getHints().getObject(com.graphhopper.trailmap.barrier.BarrierRouter.HINT, null);
+        if (!(b instanceof Map)) return false;
+        Object paths = ((Map<String, Object>) b).get("paths");
+        if (!(paths instanceof List) || ((List<?>) paths).isEmpty()) return false;
+        Object c = ((Map<String, Object>) ((List<?>) paths).get(0)).get("crossings");
+        return c instanceof List && !((List<?>) c).isEmpty();
+    }
+
+    /**
+     * Re-create via points ({@link RecreateVias}): sets each generated path's via_points so that plain /route
+     * [A, ...via_points, B] rides it again, as the app rebuilds a saved segment. Generated = the routed paths when the
+     * user's history weighted them (else they are /route's own answer and stay untouched) and every bit_of_new
+     * variation. withEdges: each path as routed with the edge_id detail (null when not known). One entry per pinned
+     * path for hints.personal.recreate.
+     */
+    /** Vias per path at most; 0 turns the re-create via points off (and the work for them). */
+    private int recreateMaxVias() {
+        return config.asPMap().getInt("personal_routing.recreate_max_vias", 30);
+    }
+
+    private List<Map<String, Object>> recreateVias(GHRequest plain, GHResponse rsp, List<ResponsePath> withEdges,
+                                                   int routedPaths, boolean personal, double multiplier) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        int maxVias = recreateMaxVias();
+        long budgetMs = config.asPMap().getLong("personal_routing.recreate_budget_ms", 2_000);
+        List<ResponsePath> paths = rsp.getAll();
+        if (maxVias <= 0 || (!personal && paths.size() == routedPaths)) return out;
+        long deadline = System.nanoTime() + budgetMs * 1_000_000L;
+        for (int i = personal ? 0 : routedPaths; i < paths.size(); i++) {
+            ResponsePath p = paths.get(i);
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("path", i);
+            ResponsePath routed = withEdges.get(i);
+            if (p.getDistance() > AltRouteVias.MAX_KM * 1000) {
+                // one plain route alone costs seconds there and can't be stopped once started (the app's 15 s)
+                m.put("identical", false);
+                m.put("stopped", "too long");
+            } else if (System.nanoTime() > deadline) {
+                m.put("identical", false);
+                m.put("stopped", "time budget");
+            } else if (plain == null || routed == null || RecreateVias.edgeIds(routed) == null) {
+                m.put("identical", false);
+                m.put("stopped", plain == null ? "not two points, or curbsides or point hints" : "no edges known");
+            } else {
+                RecreateVias.Result r = new RecreateVias(graphHopper, plain, maxVias, multiplier, deadline).pin(routed);
+                p.setAltRouteViaPoints(r.vias);
+                m.putAll(r.toMap());
+                if (!r.identical)
+                    LOGGER.info("personal_route: path {} not re-created by plain /route: {}", i, r.toMap());
+            }
+            out.add(m);
+        }
+        return out;
     }
 
     /** The data sets the user has, for the previewer's data-set choice. */

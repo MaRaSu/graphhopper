@@ -22,6 +22,7 @@ import com.graphhopper.routing.ev.BooleanEncodedValue;
 import com.graphhopper.routing.ev.DecimalEncodedValue;
 import com.graphhopper.routing.ev.DefaultImportRegistry;
 import com.graphhopper.routing.ev.ImportUnit;
+import com.graphhopper.trailmap.mtk.MtkWayAttrsParser;
 
 /**
  * Import registry that extends DefaultImportRegistry with Trailmap-specific encoders.
@@ -242,6 +243,17 @@ public class TrailmapImportRegistry extends DefaultImportRegistry {
             return ImportUnit.create(name,
                 props -> RouteIssues.createDriveway(),
                 null
+            );
+        }
+
+        // === MTK overlay (mtk_way_attrs|file=...) ===
+        // No encoded value of its own: overwrites the values of the units it requires, which run first,
+        // where the MTK sidecar and the per-case selector say OSM is ambiguous. No file = no change.
+        if (MtkWayAttrsParser.KEY.equals(name)) {
+            return ImportUnit.create(name,
+                null,
+                MtkWayAttrsParser::create,
+                MtkWayAttrsParser.REQUIRED
             );
         }
 

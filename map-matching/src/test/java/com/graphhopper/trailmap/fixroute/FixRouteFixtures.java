@@ -18,7 +18,7 @@ import java.util.List;
 public final class FixRouteFixtures {
 
     /** Relative to map-matching/ (Maven working directory). */
-    public static final String DIR = "../../data/fix-route-fixtures";
+    public static final String DIR = System.getProperty("fix.fixtures", "../../data/fix-route-fixtures");
 
     /** Boundary mis-anchoring cases the client's windowed alignment gets wrong. */
     public static final List<Long> ALIGNMENT_CASES = List.of(11286L, 42017L, 42831L, 45039L, 116370L);

@@ -36,6 +36,7 @@ import com.graphhopper.routing.util.*;
 import com.graphhopper.routing.weighting.Weighting;
 import com.graphhopper.routing.weighting.custom.CustomWeighting;
 import com.graphhopper.routing.weighting.custom.FindMinMax;
+import com.graphhopper.trailmap.personal.AltRouteVias;
 import com.graphhopper.trailmap.roundtrip.EnhancedRoundTripRouting;
 import com.graphhopper.trailmap.roundtrip.EnhancedRoundTripResult;
 import com.graphhopper.trailmap.roundtrip.exploration.ExplorationRoundTripRouting;
@@ -461,6 +462,16 @@ public class Router {
         );
     }
 
+    /**
+     * Trailmap: via points that let plain /route [A, ...via_points, B] ride each alternative again
+     * ({@link AltRouteVias}). A subclass whose routing is not plain /route turns this off.
+     */
+    protected void recreateAltRouteVias(GHRequest request, List<Path> paths, List<ResponsePath> responsePaths,
+                                        Weighting weighting, Graph queryGraph) {
+        AltRouteVias.apply(graph, locationIndex, encodingManager, pathDetailsBuilderFactory, this::route, request, paths,
+                responsePaths, weighting, queryGraph);
+    }
+
     protected GHResponse routeAlt(GHRequest request, Solver solver) {
         if (request.getPoints().size() > 2)
             throw new IllegalArgumentException("Currently alternative routes work only with start and end point. You tried to use: " + request.getPoints().size() + " points");
@@ -494,6 +505,7 @@ public class Router {
             }
             ghRsp.add(responsePath);
         }
+        recreateAltRouteVias(request, result.paths, ghRsp.getAll(), solver.weighting, queryGraph);
         ghRsp.getHints().putObject("visited_nodes.sum", result.visitedNodes);
         ghRsp.getHints().putObject("visited_nodes.average", (float) result.visitedNodes / (snaps.size() - 1));
         return ghRsp;

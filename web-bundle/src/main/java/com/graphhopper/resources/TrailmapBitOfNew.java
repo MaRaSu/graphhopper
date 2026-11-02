@@ -155,6 +155,8 @@ final class TrailmapBitOfNew {
             // travel time estimated from the main route's average speed (the generators work on geometry and cost)
             p.setTime(main.getDistance() > 0 ? Math.round(main.getTime() * v.lengthM / main.getDistance()) : 0);
             p.setWaypoints(main.getWaypoints());
+            // its edges, which the re-create via points pin plain /route onto
+            if (v.edgeIds != null) p.addPathDetails(Map.of(MainPath.EDGE_ID, v.edgeIds));
             p.setInstructions(new InstructionList(0, hopper.getTranslationMap().getWithFallBack(request.getLocale())));
             if (ele) {
                 double up = 0, down = 0;
@@ -180,6 +182,11 @@ final class TrailmapBitOfNew {
     }
 
     /** No variations: the main route only, with the reason in {@code hints.bit_of_new.skipped}. */
+    /** W26 (flag): no variations for a main route that crosses a barrier; the main route alone, with the reason */
+    void skipForBarrierCrossing(GHResponse rsp) {
+        skip(rsp, "barrier_crossing: the main route crosses a closed barrier");
+    }
+
     private void skip(GHResponse rsp, String why) {
         Map<String, Object> info = new LinkedHashMap<>();
         info.put("history", history.key());

@@ -8,6 +8,8 @@
 package com.graphhopper.trailmap.areas;
 
 import com.graphhopper.reader.ReaderWay;
+import com.graphhopper.trailmap.barrier.BarrierAccess;
+import com.graphhopper.trailmap.barrier.BarrierClass;
 import com.graphhopper.routing.ev.BooleanEncodedValue;
 import com.graphhopper.routing.ev.EdgeIntAccess;
 import com.graphhopper.routing.util.parsers.TagParser;
@@ -208,6 +210,12 @@ public class AreaAccessParser implements TagParser {
                 LOGGER.debug("Foot access restricted by OSM tags on way {}", way.getId());
             }
         }
+
+        // W26: a barrier on an area way keeps its ask/refuse closure (trailmap/barrier/BarrierClassRule)
+        if (bikeAccessEnc != null)
+            BarrierAccess.apply(bikeAccessEnc, edgeId, edgeIntAccess, way, BarrierClass.Mode.BIKE);
+        if (footAccessEnc != null)
+            BarrierAccess.apply(footAccessEnc, edgeId, edgeIntAccess, way, BarrierClass.Mode.FOOT);
     }
 
     /**

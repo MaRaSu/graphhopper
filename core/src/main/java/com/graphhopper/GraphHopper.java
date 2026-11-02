@@ -977,7 +977,7 @@ public class GraphHopper {
         }
 
         logger.info("start creating graph from " + osmFile);
-        OSMReader reader = new OSMReader(baseGraph.getBaseGraph(), osmParsers, osmReaderConfig).setFile(_getOSMFile()).
+        OSMReader reader = createOSMReader(baseGraph.getBaseGraph(), osmParsers, osmReaderConfig).setFile(_getOSMFile()).
                 setAreaIndex(areaIndex).
                 setElevationProvider(eleProvider).
                 setCountryRuleFactory(countryRuleFactory);
@@ -994,6 +994,10 @@ public class GraphHopper {
         properties.put("datareader.import.date", f.format(new Date()));
         if (reader.getDataDate() != null)
             properties.put("datareader.data.date", f.format(reader.getDataDate()));
+    }
+
+    protected OSMReader createOSMReader(BaseGraph baseGraph, OSMParsers osmParsers, OSMReaderConfig osmReaderConfig) {
+        return new OSMReader(baseGraph, osmParsers, osmReaderConfig);
     }
 
     protected void createBaseGraphAndProperties() {

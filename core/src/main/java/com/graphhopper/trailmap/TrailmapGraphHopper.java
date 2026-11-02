@@ -14,11 +14,30 @@ import com.graphhopper.routing.ev.ImportUnit;
 import com.graphhopper.routing.ev.VehicleAccess;
 import com.graphhopper.routing.util.AreaWayFilter;
 import com.graphhopper.routing.util.OSMParsers;
+import com.graphhopper.routing.util.parsers.TagParser;
 import com.graphhopper.trailmap.areas.AreaAccessParser;
 import com.graphhopper.trailmap.areas.AreaRoutingRules;
 import com.graphhopper.trailmap.areas.TrailmapAreaWayFilter;
+import com.graphhopper.trailmap.mtk.MtkWayAttrsParser;
 import com.graphhopper.trailmap.shared.TrailmapPathDetailsBuilderFactory;
 import com.graphhopper.util.PMap;
+import com.graphhopper.GraphHopperConfig;
+import com.graphhopper.config.Profile;
+import com.graphhopper.reader.osm.OSMReader;
+import com.graphhopper.routing.Router;
+import com.graphhopper.routing.RouterConfig;
+import com.graphhopper.routing.WeightingFactory;
+import com.graphhopper.routing.ev.DefaultImportRegistry;
+import com.graphhopper.routing.ev.ImportRegistry;
+import com.graphhopper.routing.lm.LandmarkStorage;
+import com.graphhopper.routing.util.EncodingManager;
+import com.graphhopper.storage.BaseGraph;
+import com.graphhopper.storage.RoutingCHGraph;
+import com.graphhopper.storage.index.LocationIndex;
+import com.graphhopper.trailmap.barrier.*;
+import com.graphhopper.util.TranslationMap;
+import com.graphhopper.util.details.PathDetailsBuilderFactory;
+import java.util.ArrayList;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,6 +70,98 @@ public class TrailmapGraphHopper extends GraphHopper {
         // predicted_highway must cross the wire as its coarse, client-facing value; the
         // stock factory would emit internal-only refinements (e.g. SERVICE_DRIVEWAY).
         setPathDetailsBuilderFactory(new TrailmapPathDetailsBuilderFactory());
+        setImportRegistry(new DefaultImportRegistry());
+    }
+
+    // ---- W26 barrier classes (trailmap/barrier, docs/gh_barrier_gate_implementation.md) ----
+
+    private final BarrierTable barrierTable = new BarrierTable();
+    private int barrierMinNetworkSize = 200, barrierSubnetworkThreads = 1;
+
+    @Override
+    public GraphHopper init(GraphHopperConfig ghConfig) {
+        super.init(ghConfig);
+        barrierMinNetworkSize = ghConfig.getInt("prepare.min_network_size", barrierMinNetworkSize);
+        barrierSubnetworkThreads = ghConfig.getInt("prepare.subnetworks.threads", barrierSubnetworkThreads);
+        return this;
+    }
+
+    /** bike_barrier / foot_barrier come from the barrier registry, everything else from the given one. */
+    @Override
+    public GraphHopper setImportRegistry(ImportRegistry importRegistry) {
+        return super.setImportRegistry(importRegistry instanceof BarrierImportRegistry ? importRegistry
+                : new BarrierImportRegistry(importRegistry, barrierTable));
+    }
+
+    @Override
+    protected OSMReader createOSMReader(BaseGraph baseGraph, OSMParsers osmParsers, OSMReaderConfig osmReaderConfig) {
+        return new TrailmapOSMReader(baseGraph, osmParsers, osmReaderConfig);
+    }
+
+    /** Adds {@code <profile>_subnetwork_b} for every profile; the stock {@code <profile>_subnetwork} is unchanged. */
+    @Override
+    protected List<BooleanEncodedValue> createSubnetworkEncodedValues() {
+        List<BooleanEncodedValue> evs = new ArrayList<>(super.createSubnetworkEncodedValues());
+        for (Profile profile : getProfiles())
+            evs.add(BarrierProfiles.createSubnetworkEV(profile.getName()));
+        return evs;
+    }
+
+    @Override
+    protected void cleanUp() {
+        super.cleanUp();
+        BarrierSubnetworks.prepare(this, barrierMinNetworkSize, barrierSubnetworkThreads);
+        if (getEncodingManager().hasEncodedValue(BarrierClass.KEY_BIKE) || getEncodingManager().hasEncodedValue(BarrierClass.KEY_FOOT)) {
+            try {
+                barrierTable.write(new File(getGraphHopperLocation()));
+                loadedBarrierTable = barrierTable; // the table just built: never re-read after an import
+                LOGGER.info("barrier table: {} barriers with a class other than none", barrierTable.size());
+            } catch (IOException e) {
+                throw new IllegalStateException("cannot write the barrier table", e);
+            }
+        }
+    }
+
+    @Override
+    protected Router doCreateRouter(BaseGraph baseGraph, EncodingManager encodingManager, LocationIndex locationIndex,
+                                    Map<String, Profile> profilesByName, PathDetailsBuilderFactory pathBuilderFactory,
+                                    TranslationMap trMap, RouterConfig routerConfig, WeightingFactory weightingFactory,
+                                    Map<String, RoutingCHGraph> chGraphs, Map<String, LandmarkStorage> landmarks) {
+        return new BarrierRouter(baseGraph, encodingManager, locationIndex, profilesByName, pathBuilderFactory, trMap,
+                routerConfig, weightingFactory, chGraphs, landmarks, loadedBarrierTable());
+    }
+
+    private volatile BarrierTable loadedBarrierTable;
+
+    /**
+     * Reads the barrier table once, when the graph loads. A malformed or truncated trailmap_barriers.json fails the load,
+     * so the server doesn't start, instead of every request failing later (a rollout's health check then keeps the old
+     * pod serving). A missing file is an empty table (a graph imported without barrier classes).
+     */
+    @Override
+    public boolean load() {
+        boolean loaded = super.load();
+        if (loaded)
+            loadedBarrierTable = BarrierTable.read(new File(getGraphHopperLocation()));
+        return loaded;
+    }
+
+    /** The graph's barrier table, the same one every router of this instance uses; empty without barrier classes. */
+    public BarrierTable barrierTable() {
+        return loadedBarrierTable();
+    }
+
+    /** The graph's barrier table, read once (a router is created for every request). */
+    private BarrierTable loadedBarrierTable() {
+        BarrierTable t = loadedBarrierTable;
+        if (t == null) {
+            synchronized (this) {
+                if (loadedBarrierTable == null)
+                    loadedBarrierTable = BarrierTable.read(new File(getGraphHopperLocation()));
+                t = loadedBarrierTable;
+            }
+        }
+        return t;
     }
 
     @Override
@@ -88,6 +199,15 @@ public class TrailmapGraphHopper extends GraphHopper {
         }
 
         return osmParsers;
+    }
+
+    @Override
+    protected void postImportOSM() {
+        // the MTK overlay keeps per-import counters (applied, stale, hazard skips); log them once
+        for (TagParser parser : getOSMParsers().getWayTagParsers())
+            if (parser instanceof MtkWayAttrsParser)
+                ((MtkWayAttrsParser) parser).logSummary();
+        super.postImportOSM();
     }
 
     /**

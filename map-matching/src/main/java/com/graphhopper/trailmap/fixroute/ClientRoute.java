@@ -29,7 +29,23 @@ public final class ClientRoute {
     }
 
     /** Routing settings of one leg, as the client holds them. */
-    public record Settings(String profile, CustomModel customModel, List<String> snapPreventions) {
+    /**
+     * {@code barriers}: the W26 flag. {@code crossable}: the barriers ("lat,lon" at 1e-6) a probe may cross, those the
+     * leg's own route (the app's /route + flag answer) crosses; empty = none.
+     */
+    public record Settings(String profile, CustomModel customModel, List<String> snapPreventions, boolean barriers,
+                           java.util.Set<String> crossable) {
+        public Settings(String profile, CustomModel customModel, List<String> snapPreventions) {
+            this(profile, customModel, snapPreventions, false, java.util.Set.of());
+        }
+
+        public Settings(String profile, CustomModel customModel, List<String> snapPreventions, boolean barriers) {
+            this(profile, customModel, snapPreventions, barriers, java.util.Set.of());
+        }
+
+        public Settings withCrossable(java.util.Set<String> crossable) {
+            return new Settings(profile, customModel, snapPreventions, barriers, crossable);
+        }
     }
 
     /** One routed leg: geometry, directed edge keys, length, exit bearing. Null fields on failure. */
@@ -62,6 +78,8 @@ public final class ClientRoute {
         req.setPathDetails(List.of("edge_key"));
         req.putHint("instructions", false);
         req.putHint("calc_points", true);
+        // W26: as the app sends it with the flag (barrier-aware snapping, crossing search)
+        if (s.barriers()) req.putHint(com.graphhopper.trailmap.barrier.BarrierRouter.HINT, com.graphhopper.trailmap.barrier.BarrierRouter.VERSION);
         return req;
     }
 
@@ -84,8 +102,51 @@ public final class ClientRoute {
         return d;
     }
 
+    /** the barriers ("lat,lon") the response's main path crosses (hints.barriers.paths[0].crossings); empty if none */
+    @SuppressWarnings("unchecked")
+    private static java.util.Set<String> crossings(GHResponse rsp) {
+        java.util.Set<String> out = new java.util.TreeSet<>();
+        Object b = rsp.getHints().getObject(com.graphhopper.trailmap.barrier.BarrierRouter.HINT, null);
+        if (!(b instanceof java.util.Map)) return out;
+        Object paths = ((java.util.Map<String, Object>) b).get("paths");
+        if (!(paths instanceof List) || ((List<?>) paths).isEmpty()) return out;
+        Object c = ((java.util.Map<String, Object>) ((List<?>) paths).get(0)).get("crossings");
+        if (!(c instanceof List)) return out;
+        for (Object x : (List<?>) c)
+            for (Object bar : (List<?>) ((java.util.Map<String, Object>) x).get("barriers")) {
+                java.util.Map<String, Object> m = (java.util.Map<String, Object>) bar;
+                out.add(m.get("lat") + "," + m.get("lon"));
+            }
+        return out;
+    }
+
+    /** W26: the barriers the app's /route + flag answer crosses on this leg (empty if it needs none, or fails) */
+    public static java.util.Set<String> crossedBarriers(GraphHopper hopper, Settings s, GHPoint start, List<GHPoint> via, GHPoint end,
+                                                        Double heading, Double headingPenalty) {
+        try {
+            GHResponse rsp = hopper.route(request(s, start, via, end, heading, headingPenalty));
+            return rsp.hasErrors() ? java.util.Set.of() : crossings(rsp);
+        } catch (Exception e) {
+            return java.util.Set.of();
+        }
+    }
+
     public static Leg route(GraphHopper hopper, Settings s, GHPoint start, List<GHPoint> via, GHPoint end,
                             Double heading, Double headingPenalty) {
+        return route(hopper, s, start, via, end, heading, headingPenalty, false);
+    }
+
+    /**
+     * W26 (flag): the leg itself exactly as the app routes it with the flag, a crossing included (the app's
+     * /route + flag answer: its "cross here / don't cross" dialog). Only for the leg's own route, never a repair probe.
+     */
+    public static Leg routeAsApp(GraphHopper hopper, Settings s, GHPoint start, List<GHPoint> via, GHPoint end,
+                                 Double heading, Double headingPenalty) {
+        return route(hopper, s, start, via, end, heading, headingPenalty, true);
+    }
+
+    private static Leg route(GraphHopper hopper, Settings s, GHPoint start, List<GHPoint> via, GHPoint end,
+                             Double heading, Double headingPenalty, boolean acceptCrossing) {
         GHResponse rsp;
         try {
             rsp = hopper.route(request(s, start, via, end, heading, headingPenalty));
@@ -94,6 +155,14 @@ public final class ClientRoute {
         }
         if (rsp.hasErrors()) {
             return new Leg(false, rsp.getErrors().toString(), null, null, 0, Double.NaN);
+        }
+        // W26: a route that needs a barrier crossing is no followRoads leg (the app would have to split it and ask):
+        // not accepted, so the stretch gets the usual unroutable handling (unroutable_policy)
+        if (s.barriers() && !acceptCrossing) {
+            java.util.Set<String> c = crossings(rsp);
+            // a probe may cross only the ask barriers the leg's own route crosses (the app's dialog covers those)
+            if (!c.isEmpty() && !s.crossable().containsAll(c))
+                return new Leg(false, "needs a barrier crossing", null, null, 0, Double.NaN);
         }
         ResponsePath path = rsp.getBest();
         PointList pl = path.getPoints();

@@ -17,11 +17,14 @@
  */
 package com.graphhopper.routing.util.parsers;
 
+import com.graphhopper.reader.ReaderNode;
 import com.graphhopper.reader.ReaderWay;
 import com.graphhopper.routing.ev.*;
 import com.graphhopper.routing.util.FerrySpeedCalculator;
 import com.graphhopper.routing.util.TransportationMode;
 import com.graphhopper.routing.util.WayAccess;
+import com.graphhopper.trailmap.barrier.BarrierAccess;
+import com.graphhopper.trailmap.barrier.BarrierClass;
 import com.graphhopper.util.PMap;
 
 import java.util.*;
@@ -169,5 +172,13 @@ public class FootAccessParser extends AbstractAccessParser implements TagParser 
             List<Map<String, Object>> nodeTags = way.getTag("node_tags", Collections.emptyList());
             handleBarrierEdge(edgeId, edgeIntAccess, nodeTags.get(0));
         }
+        // Trailmap (W26): barrier nodes follow the allow/ask/refuse rule (trailmap/barrier/BarrierClassRule)
+        BarrierAccess.apply(getAccessEnc(), edgeId, edgeIntAccess, way, BarrierClass.Mode.FOOT);
+    }
+
+    // Trailmap (W26): the stock node rule decides only nodes without a barrier tag (fords)
+    @Override
+    public boolean isBarrier(ReaderNode node) {
+        return !BarrierAccess.decidedByTrailmapRule(node) && super.isBarrier(node);
     }
 }

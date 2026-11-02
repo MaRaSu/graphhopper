@@ -37,8 +37,20 @@ import java.util.concurrent.Executors;
  */
 public class FixRouteCorpusTest {
 
-    static final String OUT_DIR = "../../data/fix-route-out/fix" + (System.getProperty("fix.engine") == null ? "" : "-" + System.getProperty("fix.engine"));
-    private static GraphHopper hopper;
+    static final String OUT_DIR = System.getProperty("fix.out", "../../data/fix-route-out/fix" + (System.getProperty("fix.engine") == null ? "" : "-" + System.getProperty("fix.engine")));
+    /** barrier/impl experiment: per-route pass-1 / pass-2 responses, timings removed, for byte comparison */
+    static final com.fasterxml.jackson.databind.ObjectMapper DUMP = new com.fasterxml.jackson.databind.ObjectMapper();
+
+    static String dump(FixRouteResponse r) {
+        com.fasterxml.jackson.databind.node.ObjectNode n = DUMP.valueToTree(r);
+        n.remove("stats");
+        for (com.fasterxml.jackson.databind.JsonNode l : n.withArray("legs")) {
+            com.fasterxml.jackson.databind.JsonNode m = l.get("metrics");
+            if (m instanceof com.fasterxml.jackson.databind.node.ObjectNode) ((com.fasterxml.jackson.databind.node.ObjectNode) m).remove("ms");
+        }
+        return n.toString();
+    }
+    static GraphHopper hopper; // package-visible: BarrierFixRouteFlagDiffTest reuses applyAndReroute
     private static ExecutorService pool;
 
     @BeforeAll
@@ -82,6 +94,7 @@ public class FixRouteCorpusTest {
             q.segments.add(s);
         }
         q.snapPreventions = r.snapPreventions;
+        q.barriers = System.getProperty("fix.barriers"); // W26: "v1" = the app's flag
         if (System.getProperty("fix.longLeg") != null) {
             q.options = q.options == null ? new FixRouteRequest.Options() : q.options;
             q.options.fixLongLegM = Double.parseDouble(System.getProperty("fix.longLeg"));
@@ -93,6 +106,11 @@ public class FixRouteCorpusTest {
         return q;
     }
 
+    interface ClientRouteFn {
+        ClientRoute.Leg route(GraphHopper hopper, ClientRoute.Settings s, GHPoint start, List<GHPoint> via, GHPoint end,
+                              Double heading, Double headingPenalty);
+    }
+
     /** Client-side application of a response + the client's re-route snap overwrite. */
     static FixRouteRequest applyAndReroute(FixRouteRequest q, FixRouteResponse rsp) {
         FixRouteRequest n = new FixRouteRequest();
@@ -101,6 +119,7 @@ public class FixRouteCorpusTest {
         n.options = q.options;
         n.unroutablePolicy = q.unroutablePolicy;
         n.debug = q.debug;
+        n.barriers = q.barriers;
         Map<String, FixRouteRequest.Waypoint> byId = new LinkedHashMap<>();
         for (FixRouteRequest.Waypoint w : q.waypoints) byId.put(w.id, w);
         int minted = 0;
@@ -153,8 +172,9 @@ public class FixRouteCorpusTest {
             FixRouteRequest.Waypoint a = n.waypoints.get(i), b = n.waypoints.get(i + 1);
             List<GHPoint> via = new ArrayList<>();
             for (LatLng v : s.viaPoints) via.add(new GHPoint(v.lat, v.lng));
-            ClientRoute.Leg leg = ClientRoute.route(hopper,
-                    new ClientRoute.Settings(s.profile, s.customModel, n.snapPreventions),
+            // W26: an app with the flag re-routes with /route + flag, a crossing included (Codex review, 2026-11-02)
+            ClientRoute.Leg leg = (n.barriersV1() ? (ClientRouteFn) ClientRoute::routeAsApp : (ClientRouteFn) ClientRoute::route).route(hopper,
+                    new ClientRoute.Settings(s.profile, s.customModel, n.snapPreventions, n.barriersV1()),
                     new GHPoint(a.coordinates.lat, a.coordinates.lng), via,
                     new GHPoint(b.coordinates.lat, b.coordinates.lng), s.initialHeading, s.headingPenalty);
             if (!leg.ok()) continue;
@@ -373,7 +393,8 @@ public class FixRouteCorpusTest {
         StringBuilder bad = new StringBuilder();
         try (Writer w = new FileWriter(new File(OUT_DIR, "routes.csv"));
              Writer jsonl = new FileWriter(new File(OUT_DIR, "legs.jsonl"));
-             Writer qual = new FileWriter(new File(OUT_DIR, "quality.jsonl"))) {
+             Writer qual = new FileWriter(new File(OUT_DIR, "quality.jsonl"));
+             Writer dumps = new FileWriter(new File(OUT_DIR, "responses.jsonl"))) {
             w.write("route,legs,ok,fixed,unroutable,unaligned,skipped,not_processed,added,ms,second_ok,second_violations\n");
             for (long id : ids) {
                 FixRouteFixtures.Route r = FixRouteFixtures.load(id);
@@ -387,6 +408,8 @@ public class FixRouteCorpusTest {
                 FixRouteRequest q2 = applyAndReroute(q, r1);
                 List<double[][]> before = LAST_BEFORE.get();
                 FixRouteResponse r2 = FixRouteEngine.fix(hopper, pool, q2);
+                dumps.write("{\"route\":" + id + ",\"r1\":" + dump(r1) + ",\"r2\":" + dump(r2) + "}\n");
+                dumps.flush();
                 exportLegs(id, q, r1, q2, jsonl);
                 double[] dq = quality(id, hopper, q, r1, qual);
                 divBefore += dq[0];

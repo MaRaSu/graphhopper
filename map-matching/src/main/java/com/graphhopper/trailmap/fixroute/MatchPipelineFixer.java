@@ -226,7 +226,7 @@ public class MatchPipelineFixer {
             out.metrics.acceptedBy = "long_leg_has_vias";
             return out;
         }
-        ClientRoute.Settings settings = new ClientRoute.Settings(seg.profile, seg.customModel, req.snapPreventions);
+        ClientRoute.Settings settings = new ClientRoute.Settings(seg.profile, seg.customModel, req.snapPreventions, req.barriersV1());
         FixRouteRequest.Waypoint wa = req.waypoints.get(i), wb = req.waypoints.get(i + 1);
         GHPoint pa = new GHPoint(wa.coordinates.lat, wa.coordinates.lng), pb = new GHPoint(wb.coordinates.lat, wb.coordinates.lng);
         double penalty = seg.headingPenalty != null ? seg.headingPenalty : CLIENT_HEADING_PENALTY;
@@ -307,7 +307,7 @@ public class MatchPipelineFixer {
                             WaypointAligner.Result al, int first, int last, boolean ctxBefore, boolean ctxAfter,
                             long deadline, FixRouteResponse.Leg[] legs) {
         FixRouteRequest.Segment seg0 = req.segments.get(first);
-        ClientRoute.Settings settings = new ClientRoute.Settings(seg0.profile, seg0.customModel, req.snapPreventions);
+        ClientRoute.Settings settings = new ClientRoute.Settings(seg0.profile, seg0.customModel, req.snapPreventions, req.barriersV1());
         EdgeFilter usable = usableFilter(settings);
 
         // Waypoint observations lie ON the reference, at the point nearest to where the waypoint is
@@ -346,7 +346,10 @@ public class MatchPipelineFixer {
             hints.putObject("profile", settings.profile());
             // As TrailmapConvertResource: the matcher gets the profile only. The client's custom
             // model shapes the routes (probes), not the matching.
-            MapMatching.Router router = MapMatching.routerFromGraphHopper(hopper, hints);
+            // W26 flag: barriers stay closed, snapping on <profile>_subnetwork_b (a stretch behind a gate can match)
+            MapMatching.Router router = settings.barriers()
+                    ? com.graphhopper.trailmap.matching.BarrierMatchingRouter.create(hopper, hints, false)
+                    : MapMatching.routerFromGraphHopper(hopper, hints);
             TrailmapMapMatching mm = new TrailmapMapMatching(hopper.getBaseGraph(),
                     (LocationIndexTree) hopper.getLocationIndex(), router, productionMatcherConfig());
             long tMatch = System.nanoTime();
@@ -425,7 +428,7 @@ public class MatchPipelineFixer {
 
     private FixRouteResponse.Leg fixLeg(FixRouteRequest req, FixRouteRequest.Options opt, ReferenceTrack ref,
                                         WaypointAligner.Result al, int i, int woA, int woB, RunObservations obs,
-                                        List<TrackRegion> regions, ClientRoute.Settings settings) {
+                                        List<TrackRegion> regions, ClientRoute.Settings runSettings) {
         FixRouteRequest.Segment seg = req.segments.get(i);
         FixRouteRequest.Waypoint wa = req.waypoints.get(i), wb = req.waypoints.get(i + 1);
         GHPoint pa = new GHPoint(wa.coordinates.lat, wa.coordinates.lng), pb = new GHPoint(wb.coordinates.lat, wb.coordinates.lng);
@@ -442,8 +445,20 @@ public class MatchPipelineFixer {
         Deviation.Rule rule = rule(opt, seg);
         List<GHPoint> via = new ArrayList<>();
         if (seg.viaPoints != null) for (LatLng v : seg.viaPoints) via.add(new GHPoint(v.lat, v.lng));
-        ClientRoute.Leg q = ClientRoute.route(hopper, settings, pa, via, pb, seg.initialHeading, penalty);
+        ClientRoute.Leg q = ClientRoute.route(hopper, runSettings, pa, via, pb, seg.initialHeading, penalty);
         probes++;
+        // W26 (flag): a leg the app can only route through an ask barrier is the app's crossing dialog, not no_route;
+        // judged as the app draws it, and the repair probes may cross the same ask barriers (no others)
+        java.util.Set<String> crossed = java.util.Set.of();
+        if (!q.ok() && runSettings.barriers()) {
+            q = ClientRoute.routeAsApp(hopper, runSettings, pa, via, pb, seg.initialHeading, penalty);
+            probes++;
+            if (q.ok()) {
+                crossed = ClientRoute.crossedBarriers(hopper, runSettings, pa, via, pb, seg.initialHeading, penalty);
+                probes++;
+            }
+        }
+        final ClientRoute.Settings settings = crossed.isEmpty() ? runSettings : runSettings.withCrossable(crossed);
         if (!q.ok()) {
             // Not even the client's own route exists between the leg's waypoints (owner, 2026-09-25:
             // 116370's legs outside the routing map were reported as 531 km "removed"). Nothing to
@@ -708,6 +723,14 @@ public class MatchPipelineFixer {
             if (LEGACY_WHOLE_LEG_RULE && !same && !stretches.isEmpty() && assembled != null) {
                 double savedLen = PathSimilarity.length(savedLeg);
                 same = Math.abs(PathSimilarity.length(assembled) - savedLen) > Math.abs(q.distanceM() - savedLen) + 20.0;
+            }
+            // W26 (flag only): a fix whose pieces the app can't route (assembly fails) would break the saved route,
+            // e.g. pins inside an area sealed by a refuse barrier; owner A48: "the original route given to fix_route
+            // stays as-is i.e. does not get broken". The leg stays as the app has it; its stretches stay reported.
+            if (!same && assembled == null && settings.barriers()) {
+                added = 0;
+                reroute = new ArrayList<>(List.of(unchanged(seg)));
+                coords = reroute;
             }
             if (same) {
                 added = 0;
@@ -1304,8 +1327,9 @@ public class MatchPipelineFixer {
         PMap hints = new PMap();
         if (s.customModel() != null) hints.putObject(CustomModel.KEY, s.customModel());
         Weighting w = hopper.createWeighting(hopper.getProfile(s.profile()), hints);
-        EdgeFilter usable = new DefaultSnapFilter(w,
-                hopper.getEncodingManager().getBooleanEncodedValue(Subnetwork.key(s.profile())));
+        EdgeFilter usable = new DefaultSnapFilter(w, s.barriers()
+                ? com.graphhopper.trailmap.barrier.BarrierProfiles.subnetworkEnc(hopper.getEncodingManager(), s.profile())
+                : hopper.getEncodingManager().getBooleanEncodedValue(Subnetwork.key(s.profile())));
         if (s.snapPreventions() == null || s.snapPreventions().isEmpty()) return usable;
         EnumEncodedValue<RoadClass> rc = hopper.getEncodingManager().getEnumEncodedValue(RoadClass.KEY, RoadClass.class);
         EnumEncodedValue<RoadEnvironment> re = hopper.getEncodingManager().getEnumEncodedValue(RoadEnvironment.KEY, RoadEnvironment.class);

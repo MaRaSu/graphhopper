@@ -23,6 +23,19 @@ public class FixRouteRequest {
     public static final String POLICY_COORDINATES = "coordinates";
     public static final String POLICY_BOTH = "both";
 
+    /**
+     * W26: {@code "v1"} = the app's barrier flag. Snapping then uses {@code <profile>_subnetwork_b}, so a waypoint
+     * behind a closed barrier is reachable and its leg gets the usual unroutable-stretch handling instead of
+     * {@code no_route}; probes that would need a barrier crossing are not accepted. Absent = as before.
+     */
+    @JsonProperty("barriers")
+    public String barriers;
+
+    /** the W26 barrier flag is set */
+    public boolean barriersV1() {
+        return com.graphhopper.trailmap.barrier.BarrierRouter.VERSION.equals(barriers);
+    }
+
     /** Saved track, {@code [[lat, lng], …]}. */
     @JsonProperty("reference")
     public List<double[]> reference = new ArrayList<>();
